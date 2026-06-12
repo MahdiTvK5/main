@@ -202,6 +202,23 @@ class AsyncXuiAPI:
             except Exception: pass
         return None
 
+    async def get_all_client_stats(self):
+        """با یک درخواست، آمار تمام کلاینت‌ها را برمی‌گرداند.
+        خروجی: dict با کلید ایمیلِ lowercase و مقدارِ دیکشنری آمار (مشابه get_client_stats)."""
+        result = {}
+        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=15.0, trust_env=False) as client:
+            try:
+                res = await client.get(f"{self.url}/panel/api/inbounds/list")
+                if res.status_code == 200 and res.json().get('success'):
+                    for inbound in res.json().get('obj', []):
+                        for cs in inbound.get('clientStats', []) or []:
+                            email = str(cs.get('email', '')).strip().lower()
+                            if email:
+                                result[email] = cs
+            except Exception:
+                return None
+        return result
+
     async def get_client_exact_info(self, email):
         target_email = str(email).strip().lower()
         async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
@@ -242,23 +259,27 @@ CANCEL_MARKUP = ReplyKeyboardMarkup([['لغو ❌']], resize_keyboard=True)
 async def generate_orders_keyboard(orders, xui_api):
     keyboard = [[InlineKeyboardButton("وضعیت 🔎", callback_data='ignore'), InlineKeyboardButton("عنوان 📋", callback_data='ignore')]]
     is_login, _ = await xui_api.login()
-    
+
+    # به‌جای یک درخواست به‌ازای هر سفارش (N+1)، یک‌بار آمار همه‌ی کلاینت‌ها گرفته می‌شود
+    stats_map = await xui_api.get_all_client_stats() if is_login else None
+
     for order_id, link, _ in orders[-30:]:
         email = unquote(link.split("#")[-1]) if "#" in link else f"سرویس {order_id}"
-        status_text = "فعال 🟢"
-        if is_login:
-            stats = await xui_api.get_client_stats(email)
+        if not is_login or stats_map is None:
+            status_text = "خطا ⚠️"
+        else:
+            stats = stats_map.get(email.strip().lower())
             if stats:
                 enable = stats.get('enable', False)
                 total = stats.get('total', 0)
                 used = stats.get('up', 0) + stats.get('down', 0)
                 expiry = stats.get('expiryTime', 0)
+                status_text = "فعال 🟢"
                 if not enable: status_text = "غیرفعال 🔴"
                 elif expiry > 0 and expiry < int(time.time() * 1000): status_text = "منقضی 🔴"
                 elif total > 0 and used >= total: status_text = "پایان حجم 🔴"
             else: status_text = "نامشخص ⚪️"
-        else: status_text = "خطا ⚠️"
-        
+
         cb_data = f"show_order_{order_id}"
         keyboard.append([InlineKeyboardButton(status_text, callback_data=cb_data), InlineKeyboardButton(email, callback_data=cb_data)])
     return InlineKeyboardMarkup(keyboard)
