@@ -16,6 +16,19 @@ def build_xui(panel):
     return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), CONFIG_IP
 
 
+def sub_link_for(panel, email):
+    """در صورتی که پنل آدرس اشتراک داشته باشد، لینک ساب را برمی‌گرداند؛ وگرنه None."""
+    if not panel:
+        return None
+    try:
+        sub = panel['sub_url']
+    except (KeyError, TypeError):
+        sub = None
+    if not sub:
+        return None
+    return sub.rstrip('/') + '/' + email
+
+
 # ================= پنل X-UI =================
 class AsyncXuiAPI:
     def __init__(self, panel_url, username, password):
@@ -51,7 +64,8 @@ class AsyncXuiAPI:
         client_uuid = str(uuid.uuid4())
         total_bytes = total_gb * 1024 * 1024 * 1024
         expire_time = int((time.time() + (expire_days * 86400)) * 1000)
-        settings = {"clients": [{"id": client_uuid, "email": client_email, "enable": True, "limitIp": limit_ip, "totalGB": total_bytes, "expiryTime": expire_time, "tgId": "", "subId": ""}]}
+        # subId برابر ایمیل قرار می‌گیرد تا لینک اشتراک (sub) به‌ازای هر کلاینت بسازیم
+        settings = {"clients": [{"id": client_uuid, "email": client_email, "enable": True, "limitIp": limit_ip, "totalGB": total_bytes, "expiryTime": expire_time, "tgId": "", "subId": client_email}]}
         payload = {"id": inbound_id, "settings": json.dumps(settings)}
 
         async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:

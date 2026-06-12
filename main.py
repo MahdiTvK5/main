@@ -24,7 +24,7 @@ from db import (
     update_balance, deduct_balance, credit_balance, get_balance, add_order,
     get_order_by_id, order_belongs_to,
 )
-from panel import AsyncXuiAPI, build_xui
+from panel import AsyncXuiAPI, build_xui, sub_link_for
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
 
@@ -62,6 +62,7 @@ PANEL_FIELDS = [
     ("user", "نام کاربری", "username"),
     ("pass", "رمز عبور", "password"),
     ("ip", "IP کانفیگ", "config_ip"),
+    ("sub", "لینک ساب (Sub URL)", "sub_url"),
 ]
 PANEL_FIELD_MAP = {f[0]: f for f in PANEL_FIELDS}
 
@@ -78,7 +79,8 @@ def panel_edit_text(panel):
         f"📋 نام: {panel['name']}\n"
         f"🔗 URL: {panel['url']}\n"
         f"👤 یوزر: {panel['username']}\n"
-        f"🌐 IP کانفیگ: {panel['config_ip']}\n\n"
+        f"🌐 IP کانفیگ: {panel['config_ip']}\n"
+        f"🔗 لینک ساب: {panel['sub_url'] or '—'}\n\n"
         f"برای تغییر هر مورد، دکمه‌اش را بزنید."
     )
 
@@ -641,7 +643,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("🌐 آی‌پی یا دامنه‌ای که در لینک کانفیگ (sni/host) استفاده شود را وارد کنید:", reply_markup=CANCEL_MARKUP)
         elif step == 'ip':
             np['config_ip'] = text.strip()
-            await db.add_panel(np['name'], np['url'], np['username'], np['password'], np['config_ip'])
+            context.user_data['state'] = 'panel_add_sub'
+            await update.message.reply_text("🔗 لینک ساب (Subscription URL) را وارد کنید.\nاگر ندارید، `-` بفرستید.\nمثال: `https://domain.com:2096/sub`", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+        elif step == 'sub':
+            sub_url = '' if text.strip() in ('-', '0', 'خیر', 'ندارد') else text.strip()
+            await db.add_panel(np['name'], np['url'], np['username'], np['password'], np['config_ip'], sub_url)
             context.user_data['state'] = 'none'
             await update.message.reply_text(f"✅ پنل «{np['name']}» با موفقیت اضافه شد.", reply_markup=await get_main_keyboard(user_id))
         return
@@ -1379,17 +1385,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = await get_order_by_id(order_id)
         if res:
             config_link = res[0]
-            encoded_url = urllib.parse.quote(config_link)
+            email = unquote(config_link.split("#")[-1]) if "#" in config_link else ""
+            panel = await db.get_panel(await db.get_order_panel_id(order_id))
+            sub = sub_link_for(panel, email)
+            # اگر پنل لینک ساب داشته باشد، آن را به‌عنوان لینک اصلی (که با تغییر UUID خراب نمی‌شود) می‌دهیم
+            primary = sub or config_link
+            caption = f"📥 **لینک اتصال شما:**\n\n`{primary}`"
+            if sub:
+                caption += f"\n\n🔗 *لینک ساب با تغییر UUID همچنان معتبر می‌ماند.*\n\nکانفیگ مستقیم:\n`{config_link}`"
+            caption += f"\n\n*(برای کپی، روی لینک ضربه بزنید)*{SECURITY_WARNING}"
+            encoded_url = urllib.parse.quote(primary)
             qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
             try:
-                await context.bot.send_photo(
-                    chat_id=user_id, 
-                    photo=qr_api_url, 
-                    caption=f"📥 **کانفیگ شما:**\n\n`{config_link}`\n\n*(برای کپی کردن، روی لینک بالا ضربه بزنید)*{SECURITY_WARNING}", 
-                    parse_mode='Markdown'
-                )
+                await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown')
             except Exception:
-                await context.bot.send_message(chat_id=user_id, text=f"📥 **کانفیگ شما:**\n\n`{config_link}`", parse_mode='Markdown')
+                await context.bot.send_message(chat_id=user_id, text=caption, parse_mode='Markdown')
 
     # بقیه هندلرهای خرید
     elif data.startswith("prebuy_"):
@@ -1437,16 +1447,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if new_uuid:
                 config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{final_name}"
                 await add_order(user_id, config_link, order_panel_id)
-                
-                # ====== ارسال بارکد برای خرید تکی ======
-                encoded_url = urllib.parse.quote(config_link)
+
+                # اگر پنل لینک ساب داشته باشد، آن را لینک اصلی قرار می‌دهیم
+                sub = sub_link_for(panel, final_name)
+                primary = sub or config_link
+                caption = f"✅ خرید موفق!\n\n`{primary}`"
+                if sub:
+                    caption += f"\n\nکانفیگ مستقیم:\n`{config_link}`"
+                caption += SECURITY_WARNING
+                encoded_url = urllib.parse.quote(primary)
                 qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
                 try:
-                    await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=f"✅ خرید موفق!\n\n`{config_link}`{SECURITY_WARNING}", parse_mode='Markdown')
+                    await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown')
                     await query.delete_message()
                 except:
-                    await query.edit_message_text(f"✅ خرید موفق!\n\n`{config_link}`{SECURITY_WARNING}", parse_mode='Markdown')
-                # ========================================
+                    await query.edit_message_text(caption, parse_mode='Markdown')
             else:
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه چون ساخت کانفیگ ناموفق بود
                 await query.edit_message_text(f"❌ سرور ساخت کانفیگ را رد کرد!\nارور: `{error_msg}`", parse_mode='Markdown')
