@@ -4,7 +4,7 @@ from urllib.parse import unquote
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 
 import db
-from db import get_user, is_admin
+from db import get_user, is_admin, get_setting, has_test
 from panel import build_xui
 from config import PANEL_URL
 
@@ -20,6 +20,9 @@ async def get_main_keyboard(user_id):
         menu.append(['محصولات 🛍'])
     menu.append(['کیف پول من 💰', 'پشتیبانی 📞'])
     menu.append(['سفارشات من 📦', 'شارژ حساب 💳'])
+    # اکانت تست رایگان: فقط وقتی ادمین فعالش کرده و کاربر قبلاً نگرفته
+    if (await get_setting('test_enabled')) == 'on' and not is_adm and not await has_test(user_id):
+        menu.append(['🎁 اکانت تست رایگان'])
     if is_adm:
         menu.append(['مدیریت ⚙️'])
     return ReplyKeyboardMarkup(menu, resize_keyboard=True)

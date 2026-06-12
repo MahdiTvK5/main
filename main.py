@@ -52,6 +52,35 @@ def plan_edit_markup(plan_id):
     return InlineKeyboardMarkup(rows)
 
 
+async def render_test_menu(query):
+    enabled = (await get_setting('test_enabled')) == 'on'
+    gb = await get_setting('test_gb')
+    days = await get_setting('test_days')
+    pid = await get_setting('test_panel_id')
+    inb = await get_setting('test_inbound_id')
+    panel = await db.get_panel(int(pid)) if pid else None
+    pname = panel['name'] if panel else "—"
+    status = "🟢 روشن" if enabled else "🔴 خاموش"
+    msg = (
+        f"🎁 **تنظیمات اکانت تست**\n\n"
+        f"وضعیت: {status}\n"
+        f"💾 حجم: {gb} GB\n"
+        f"📅 مدت: {days} روز\n"
+        f"🖥 پنل: {pname}\n"
+        f"⚙️ اینباند: {inb or '—'}\n\n"
+        f"برای فعال‌سازی، حتماً پنل و اینباند را تنظیم کنید."
+    )
+    kb = [
+        [InlineKeyboardButton(("🔴 خاموش کن" if enabled else "🟢 روشن کن"), callback_data='admin_test_toggle')],
+        [InlineKeyboardButton("حجم (GB)", callback_data='admin_test_set_gb'), InlineKeyboardButton("مدت (روز)", callback_data='admin_test_set_days')],
+        [InlineKeyboardButton("پنل", callback_data='admin_test_set_panel'), InlineKeyboardButton("اینباند", callback_data='admin_test_set_inbound')],
+    ]
+    try:
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+    except Exception:
+        pass
+
+
 async def plan_edit_text(plan):
     panel = await db.get_panel(plan['panel_id']) if plan['panel_id'] else None
     pname = panel['name'] if panel else "—"
@@ -185,7 +214,53 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['state'] = 'none'
         await update.message.reply_text("عملیات لغو شد.", reply_markup=await get_main_keyboard(user_id))
         return
-        
+
+    # ================= اکانت تست رایگان =================
+    if text == '🎁 اکانت تست رایگان':
+        context.user_data['state'] = 'none'
+        if (await get_setting('test_enabled')) != 'on':
+            return await update.message.reply_text("⛔️ اکانت تست در حال حاضر فعال نیست.", reply_markup=await get_main_keyboard(user_id))
+        if await db.has_test(user_id) and not admin_status:
+            return await update.message.reply_text("❌ شما قبلاً اکانت تست دریافت کرده‌اید.", reply_markup=await get_main_keyboard(user_id))
+        inbound_setting = await get_setting('test_inbound_id')
+        if not inbound_setting:
+            return await update.message.reply_text("⛔️ اکانت تست هنوز توسط مدیریت پیکربندی نشده است.", reply_markup=await get_main_keyboard(user_id))
+        test_gb = int(await get_setting('test_gb') or 1)
+        test_days = int(await get_setting('test_days') or 1)
+        panel_id_setting = await get_setting('test_panel_id')
+        panel = await db.get_panel(int(panel_id_setting)) if panel_id_setting else None
+        xui, cfg_ip = build_xui(panel)
+        opid = panel['id'] if panel else None
+
+        if context.user_data.get('processing'):
+            return await update.message.reply_text("⏳ یک عملیات در حال انجام است، صبر کنید.")
+        context.user_data['processing'] = True
+        try:
+            is_logged, _ = await xui.login()
+            if not is_logged:
+                return await update.message.reply_text("❌ خطا در اتصال به پنل.", reply_markup=await get_main_keyboard(user_id))
+            port = await xui.get_inbound_port(int(inbound_setting))
+            if not port:
+                return await update.message.reply_text("❌ اینباند اکانت تست پیدا نشد.", reply_markup=await get_main_keyboard(user_id))
+            test_name = f"{user_id}_test_{str(uuid.uuid4())[:4]}"
+            new_uuid, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, 1)
+            if not new_uuid:
+                return await update.message.reply_text(f"❌ ساخت اکانت تست ناموفق بود.\n{err}", reply_markup=await get_main_keyboard(user_id))
+            config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{test_name}"
+            await add_order(user_id, config_link, opid)
+            if not admin_status:
+                await db.mark_test_used(user_id)
+            encoded_url = urllib.parse.quote(config_link)
+            qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
+            caption = f"🎁 اکانت تست شما ({test_gb}GB / {test_days} روز):\n\n`{config_link}`{SECURITY_WARNING}"
+            try:
+                await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown', reply_markup=await get_main_keyboard(user_id))
+            except Exception:
+                await update.message.reply_text(caption, parse_mode='Markdown', reply_markup=await get_main_keyboard(user_id))
+        finally:
+            context.user_data['processing'] = False
+        return
+
     MAIN_BUTTONS = ['خرید عمده 📦', 'محصولات 🛍', 'کیف پول من 💰', 'پشتیبانی 📞', 'سفارشات من 📦', 'شارژ حساب 💳', 'مدیریت ⚙️']
     if text in MAIN_BUTTONS:
         context.user_data['state'] = 'none'
@@ -200,7 +275,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("مجوز عمده 📦", callback_data='admin_toggle_bulk'), InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip')],
                 [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
                 [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
-                [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels')],
+                [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
                 [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
             ]
             if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
@@ -264,14 +339,19 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ لطفاً مبلغ را فقط به صورت عدد (بدون حروف) وارد کنید:")
         return
 
-    # ================= ماشین وضعیت ایمپورت گروهی کانفیگ (اصلاح شده) =================
+    # ================= ماشین وضعیت ایمپورت گروهی کانفیگ =================
     if state == 'admin_waiting_import' and admin_status:
         parts = text.split()
         if len(parts) >= 2 and parts[0].isdigit():
             target_user_id = int(parts[0])
-            config_emails = parts[1:]
-            
-            await update.message.reply_text(f"در حال جستجو و ایمپورت {len(config_emails)} کانفیگ در سرور... ⏳")
+            # هر توکن می‌تواند نام کانفیگ (email) یا یک لینک کامل vless://...#email باشد
+            wanted = []
+            for tok in parts[1:]:
+                em = unquote(tok.split("#")[-1]).strip() if "#" in tok else tok.strip()
+                if em:
+                    wanted.append(em)
+
+            await update.message.reply_text(f"در حال جستجو و ایمپورت {len(wanted)} کانفیگ در سرور... ⏳")
             # کانفیگ در تمام پنل‌های موجود جستجو می‌شود
             panels = await db.get_panels()
             panel_clients = []  # (panel_row_or_None, xui, config_ip, is_logged)
@@ -288,11 +368,25 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not any(pc[3] for pc in panel_clients):
                 await update.message.reply_text("❌ خطا در اتصال به پنل X-UI.", reply_markup=await get_main_keyboard(user_id))
             else:
-                success_count = 0
-                failed_emails = []
                 await get_user(target_user_id)
+                # ایمیل‌های فعلی کاربر برای جلوگیری از ایمپورت تکراری
+                async with db.db_pool.acquire() as conn:
+                    rows = await conn.fetch("SELECT config_link FROM orders WHERE user_id = $1", target_user_id)
+                existing_emails = set()
+                for r in rows:
+                    l = r['config_link']
+                    if "#" in l:
+                        existing_emails.add(unquote(l.split("#")[-1]).strip().lower())
 
-                for email in config_emails:
+                success_count = 0
+                skipped = []
+                failed_emails = []
+                per_panel = {}
+
+                for email in wanted:
+                    if email.lower() in existing_emails:
+                        skipped.append(email)
+                        continue
                     found = False
                     for prow, x, ip, ok in panel_clients:
                         if not ok:
@@ -302,8 +396,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                             client_uuid = client_dict['id']
                             real_email_from_panel = client_dict.get('email', email)
                             pid = prow['id'] if prow else None
+                            pname = prow['name'] if prow else "پیش‌فرض"
                             config_link = f"vless://{client_uuid}@{ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={ip}#{real_email_from_panel}"
                             await add_order(target_user_id, config_link, pid)
+                            existing_emails.add(real_email_from_panel.strip().lower())
+                            per_panel[pname] = per_panel.get(pname, 0) + 1
                             success_count += 1
                             found = True
                             break
@@ -311,12 +408,16 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                         failed_emails.append(email)
 
                 context.user_data['state'] = 'none'
-                report = f"✅ عملیات ایمپورت پایان یافت.\n\n📦 تعداد موفق: {success_count}\n"
+                report = f"✅ عملیات ایمپورت پایان یافت.\n\n📦 موفق: {success_count}\n"
+                if per_panel:
+                    report += "🖥 بر اساس پنل: " + "، ".join([f"{k}: {v}" for k, v in per_panel.items()]) + "\n"
+                if skipped:
+                    report += f"↩️ تکراری (رد شد): {len(skipped)}\n"
                 if failed_emails:
-                    report += f"❌ یافت نشد (دقیقاً چک کنید): {', '.join(failed_emails)}"
+                    report += f"❌ یافت نشد: {', '.join(failed_emails)}"
                 await update.message.reply_text(report, reply_markup=await get_main_keyboard(user_id))
         else:
-            await update.message.reply_text("❌ فرمت اشتباه است! لطفاً اول آیدی عددی و سپس نام کانفیگ‌ها را بفرستید.")
+            await update.message.reply_text("❌ فرمت اشتباه! اول آیدی عددی کاربر، سپس نام کانفیگ‌ها یا لینک‌های کامل.")
         return
 
     # ================= ماشین وضعیت خرید عمده مرحله‌ای =================
@@ -541,6 +642,20 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         except ValueError: await update.message.reply_text("❌ لطفاً فقط عدد وارد کنید!")
         return
 
+    # ================= تنظیم پارامترهای اکانت تست =================
+    if admin_status and state in ('test_set_gb', 'test_set_days', 'test_set_panel', 'test_set_inbound'):
+        if not text.isdigit():
+            return await update.message.reply_text("❌ فقط عدد بفرستید.")
+        keymap = {'test_set_gb': 'test_gb', 'test_set_days': 'test_days', 'test_set_panel': 'test_panel_id', 'test_set_inbound': 'test_inbound_id'}
+        if state == 'test_set_panel':
+            panels = await db.get_panels()
+            if int(text) not in [pr['id'] for pr in panels]:
+                return await update.message.reply_text("❌ آیدی پنل نامعتبر است. دوباره بفرستید:")
+        await update_setting(keymap[state], text)
+        context.user_data['state'] = 'none'
+        await update.message.reply_text("✅ ثبت شد. از منوی «اکانت تست 🎁» می‌توانید ادامه دهید.", reply_markup=await get_main_keyboard(user_id))
+        return
+
     # بقیه هندلرهای ادمین
     if state == 'admin_waiting_del_panel' and admin_status:
         if text.isdigit():
@@ -676,7 +791,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("مجوز عمده 📦", callback_data='admin_toggle_bulk'), InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip')],
             [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
             [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
-            [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels')],
+            [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
             [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
         ]
         if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
@@ -741,7 +856,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'admin_import_config' and admin_status:
         context.user_data['state'] = 'admin_waiting_import'
-        msg = "🔗 **ایمپورت کانفیگ (تکی یا گروهی)**\n\nلطفاً آیدی عددی کاربر و نام کانفیگ‌ها (Email) در سرور را بفرستید.\nخط اول آیدی کاربر، و در ادامه نام کانفیگ‌ها را با فاصله یا خط جدید وارد کنید.\n\nمثال:\n`123456789 ali_1 ali_2 ali_3`"
+        msg = "🔗 **ایمپورت کانفیگ (تکی یا گروهی)**\n\nاول آیدی عددی کاربر، سپس نام کانفیگ‌ها (Email) یا **لینک‌های کامل** را با فاصله/خط‌جدید بفرستید.\nموارد تکراری به‌صورت خودکار رد می‌شوند و کانفیگ در همه‌ی پنل‌ها جستجو می‌شود.\n\nمثال:\n`123456789 ali_1 ali_2`\nیا\n`123456789 vless://...#ali_1`"
         await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
@@ -767,6 +882,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'admin_del_panel' and admin_status:
         context.user_data['state'] = 'admin_waiting_del_panel'
         await query.message.reply_text("🗑 آیدی (ID) پنلی که می‌خواهید حذف شود را بفرستید:", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_test_menu' and admin_status:
+        await render_test_menu(query)
+
+    elif data == 'admin_test_toggle' and admin_status:
+        cur = (await get_setting('test_enabled')) == 'on'
+        await update_setting('test_enabled', 'off' if cur else 'on')
+        await render_test_menu(query)
+
+    elif data == 'admin_test_set_gb' and admin_status:
+        context.user_data['state'] = 'test_set_gb'
+        await query.message.reply_text("💾 حجم اکانت تست را به گیگابایت بفرستید (فقط عدد):", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_test_set_days' and admin_status:
+        context.user_data['state'] = 'test_set_days'
+        await query.message.reply_text("📅 مدت اکانت تست را به روز بفرستید (فقط عدد):", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_test_set_panel' and admin_status:
+        context.user_data['state'] = 'test_set_panel'
+        panels = await db.get_panels()
+        lst = "\n".join([f"🆔 {pr['id']} - {pr['name']}" for pr in panels]) or "—"
+        await query.message.reply_text(f"🖥 آیدی پنل اکانت تست را بفرستید:\n\n{lst}", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_test_set_inbound' and admin_status:
+        context.user_data['state'] = 'test_set_inbound'
+        await query.message.reply_text("⚙️ آیدی اینباند اکانت تست را بفرستید (فقط عدد):", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
     elif data == 'admin_add_plan' and admin_status:
