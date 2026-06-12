@@ -1,149 +1,29 @@
-import os
-import asyncio
-import asyncpg
-import httpx
-import json
 import uuid
 import time
 import datetime
-import math
 import re
-import logging
-import random
 import io
 import urllib.parse
+import logging
 from urllib.parse import unquote
-from dotenv import load_dotenv
+
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+from config import (
+    TOKEN, PROXY_URL, SUPER_ADMIN_ID, PANEL_URL, PANEL_USER, PANEL_PASS,
+    CONFIG_IP, SECURITY_WARNING, format_size, clean_num,
+)
+import db
+from db import (
+    init_db, is_admin, get_all_admins, get_setting, update_setting, get_user,
+    update_balance, deduct_balance, credit_balance, get_balance, add_order,
+    get_order_by_id, order_belongs_to,
+)
+from panel import AsyncXuiAPI
+from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# ================= تنظیمات ثابت =================
-TOKEN = os.getenv("BOT_TOKEN")
-PROXY_URL = os.getenv("PROXY_URL")
-
-DB_USER = os.getenv("DB_USER", "overwall_user")
-DB_PASS = os.getenv("DB_PASS", "OverWall@12345")
-DB_NAME = os.getenv("DB_NAME", "overwall_db")
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-
-try: SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", 0))
-except ValueError: SUPER_ADMIN_ID = 0
-
-PANEL_URL = os.getenv("PANEL_URL")
-PANEL_USER = os.getenv("PANEL_USER")
-PANEL_PASS = os.getenv("PANEL_PASS")
-CONFIG_IP = os.getenv("CONFIG_IP")
-
-SECURITY_WARNING = "\n\n⚠️ **هشدار امنیتی بسیار مهم:**\nلطفاً از ارسال لینک در پیام‌رسان‌های داخلی جداً خودداری کنید."
-db_pool = None 
-
-def format_size(size_bytes):
-    if size_bytes <= 0: return "0 MB"
-    size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(math.floor(math.log(size_bytes, 1024)))
-    p = math.pow(1024, i)
-    return f"{round(size_bytes / p, 2)} {size_name[i]}"
-
-def clean_num(text):
-    return int(re.sub(r'\D', '', str(text)))
-
-# ================= توابع دیتابیس =================
-async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(user=DB_USER, password=DB_PASS, database=DB_NAME, host=DB_HOST, port=DB_PORT)
-    async with db_pool.acquire() as conn:
-        await conn.execute('''CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, balance BIGINT DEFAULT 0, nickname TEXT, role TEXT DEFAULT 'normal', can_bulk BOOLEAN DEFAULT FALSE)''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, user_id BIGINT, config_link TEXT, date TEXT)''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS admins (user_id BIGINT PRIMARY KEY, name TEXT)''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, status TEXT DEFAULT 'pending')''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS plans (id SERIAL PRIMARY KEY, name TEXT, gb INT, price BIGINT, vip_price BIGINT, bulk_price BIGINT, vip_bulk_price BIGINT, inbound_id INT, duration_days INT DEFAULT 30)''')
-        # مهاجرت برای دیتابیس‌های قدیمی که هنوز ستون مدت‌زمان را ندارند
-        await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS duration_days INT DEFAULT 30")
-        # جدول جدید برای قیمت‌های اختصاصی کاربران
-        await conn.execute('''CREATE TABLE IF NOT EXISTS custom_prices (user_id BIGINT, plan_id INT, price BIGINT, bulk_price BIGINT, PRIMARY KEY(user_id, plan_id))''')
-        
-        await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
-        await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
-        await conn.execute("INSERT INTO settings (key, value) VALUES ('support_id', '@khodehamed') ON CONFLICT DO NOTHING")
-
-async def is_admin(user_id):
-    if user_id == SUPER_ADMIN_ID: return True
-    async with db_pool.acquire() as conn: return bool(await conn.fetchval("SELECT user_id FROM admins WHERE user_id = $1", user_id))
-
-async def get_all_admins():
-    async with db_pool.acquire() as conn:
-        admins = [row['user_id'] for row in await conn.fetch("SELECT user_id FROM admins")]
-        admins.append(SUPER_ADMIN_ID)
-        return list(set(admins))
-
-async def get_setting(key):
-    async with db_pool.acquire() as conn: return await conn.fetchval("SELECT value FROM settings WHERE key = $1", key)
-
-async def update_setting(key, value):
-    async with db_pool.acquire() as conn: await conn.execute("UPDATE settings SET value = $1 WHERE key = $2", str(value), key)
-
-async def get_user(user_id):
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-        row = await conn.fetchrow("SELECT balance, nickname, role, can_bulk FROM users WHERE user_id = $1", user_id)
-        return row['balance'], row['nickname'], row['role'], row['can_bulk']
-
-async def update_balance(user_id, new_balance):
-    async with db_pool.acquire() as conn: await conn.execute("UPDATE users SET balance = $1 WHERE user_id = $2", new_balance, user_id)
-
-async def deduct_balance(user_id, amount):
-    """کسر اتمیک موجودی. فقط در صورتی کم می‌کند که موجودی کافی باشد.
-    خروجی: موجودی جدید در صورت موفقیت، یا None اگر موجودی کافی نبود."""
-    if amount <= 0:
-        return await get_balance(user_id)
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-        new_balance = await conn.fetchval(
-            "UPDATE users SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1 RETURNING balance",
-            amount, user_id,
-        )
-        return new_balance
-
-async def credit_balance(user_id, amount):
-    """افزودن اتمیک موجودی (برای شارژ/برگشت وجه). خروجی: موجودی جدید."""
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-        return await conn.fetchval(
-            "UPDATE users SET balance = balance + $1 WHERE user_id = $2 RETURNING balance",
-            amount, user_id,
-        )
-
-async def get_balance(user_id):
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval("SELECT balance FROM users WHERE user_id = $1", user_id) or 0
-
-async def add_order(user_id, config_link):
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO orders (user_id, config_link, date) VALUES ($1, $2, $3)", user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-
-async def get_order_by_id(order_id):
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT config_link, date FROM orders WHERE id = $1", int(order_id))
-        return (row['config_link'], row['date']) if row else None
-
-async def order_belongs_to(order_id, user_id):
-    """آیا این سفارش متعلق به همین کاربر است؟"""
-    try:
-        oid = int(order_id)
-    except (TypeError, ValueError):
-        return False
-    async with db_pool.acquire() as conn:
-        owner = await conn.fetchval("SELECT user_id FROM orders WHERE id = $1", oid)
-    return owner is not None and owner == user_id
 
 async def ensure_order_access(query, order_id, admin_status):
     """کنترل دسترسی به سفارش. ادمین‌ها به همه‌چیز دسترسی دارند؛ کاربر عادی فقط به سفارش خودش."""
@@ -152,145 +32,6 @@ async def ensure_order_access(query, order_id, admin_status):
     await query.answer("⛔️ این سفارش متعلق به شما نیست.", show_alert=True)
     return False
 
-# ================= پنل X-UI =================
-class AsyncXuiAPI:
-    def __init__(self, panel_url, username, password):
-        self.url = panel_url.rstrip('/')
-        self.username = username
-        self.password = password
-        self.cookies = None
-
-    async def login(self):
-        async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.post(f"{self.url}/login", data={"username": self.username, "password": self.password})
-                if res.status_code == 200 and res.json().get('success'):
-                    self.cookies = res.cookies
-                    return True, "OK"
-                return False, res.text
-            except Exception as e: return False, str(e)
-
-    async def get_inbound_port(self, inbound_id):
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/list")
-                if res.status_code == 200:
-                    for inbound in res.json().get('obj', []):
-                        if int(inbound.get('id')) == int(inbound_id): return inbound.get('port')
-            except Exception as e:
-                logging.warning("get_inbound_port failed: %s", e)
-        return None
-
-    async def add_client(self, inbound_id, client_email, total_gb, expire_days, limit_ip=1):
-        client_uuid = str(uuid.uuid4())
-        total_bytes = total_gb * 1024 * 1024 * 1024
-        expire_time = int((time.time() + (expire_days * 86400)) * 1000)
-        settings = {"clients": [{"id": client_uuid, "email": client_email, "enable": True, "limitIp": limit_ip, "totalGB": total_bytes, "expiryTime": expire_time, "tgId": "", "subId": ""}]}
-        payload = {"id": inbound_id, "settings": json.dumps(settings)}
-        
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.post(f"{self.url}/panel/api/inbounds/addClient", json=payload, headers={'Accept': 'application/json'})
-                data = res.json()
-                if res.status_code == 200 and data.get('success'): return client_uuid, None
-                else: return None, data.get('msg', res.text)
-            except Exception as e: return None, str(e)
-
-    async def get_client_stats(self, email):
-        target_email = str(email).strip().lower()
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/getClientTraffics/{email}")
-                if res.status_code == 200 and res.json().get('success'): return res.json().get('obj', {})
-            except Exception as e:
-                logging.warning("get_client_stats failed: %s", e)
-        return None
-
-    async def get_all_client_stats(self):
-        """با یک درخواست، آمار تمام کلاینت‌ها را برمی‌گرداند.
-        خروجی: dict با کلید ایمیلِ lowercase و مقدارِ دیکشنری آمار (مشابه get_client_stats)."""
-        result = {}
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=15.0, trust_env=False) as client:
-            try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/list")
-                if res.status_code == 200 and res.json().get('success'):
-                    for inbound in res.json().get('obj', []):
-                        for cs in inbound.get('clientStats', []) or []:
-                            email = str(cs.get('email', '')).strip().lower()
-                            if email:
-                                result[email] = cs
-            except Exception as e:
-                logging.warning("get_all_client_stats failed: %s", e)
-                return None
-        return result
-
-    async def get_client_exact_info(self, email):
-        target_email = str(email).strip().lower()
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/list")
-                if res.status_code == 200 and res.json().get('success'):
-                    for inbound in res.json().get('obj', []):
-                        settings = json.loads(inbound.get('settings', '{}'))
-                        for c in settings.get('clients', []):
-                            c_email = str(c.get('email', '')).strip().lower()
-                            if c_email == target_email: 
-                                return inbound.get('id'), inbound.get('port'), c
-            except Exception as e:
-                logging.warning("get_client_exact_info failed: %s", e)
-        return None, None, None
-
-    async def update_client(self, inbound_id, old_uuid, client_dict):
-        payload = {"id": inbound_id, "settings": json.dumps({"clients": [client_dict]})}
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.post(f"{self.url}/panel/api/inbounds/updateClient/{old_uuid}", json=payload, headers={'Accept': 'application/json'})
-                return res.status_code == 200 and res.json().get('success', False)
-            except Exception as e:
-                logging.warning("update_client failed: %s", e)
-                return False
-
-# ================= رابط کاربری =================
-async def get_main_keyboard(user_id):
-    _, _, _, can_bulk = await get_user(user_id)
-    is_adm = await is_admin(user_id)
-    menu = []
-    if can_bulk or is_adm: menu.append(['خرید عمده 📦', 'محصولات 🛍'])
-    else: menu.append(['محصولات 🛍'])
-    menu.append(['کیف پول من 💰', 'پشتیبانی 📞'])
-    menu.append(['سفارشات من 📦', 'شارژ حساب 💳'])
-    if is_adm: menu.append(['مدیریت ⚙️'])
-    return ReplyKeyboardMarkup(menu, resize_keyboard=True)
-
-CANCEL_MARKUP = ReplyKeyboardMarkup([['لغو ❌']], resize_keyboard=True)
-
-async def generate_orders_keyboard(orders, xui_api):
-    keyboard = [[InlineKeyboardButton("وضعیت 🔎", callback_data='ignore'), InlineKeyboardButton("عنوان 📋", callback_data='ignore')]]
-    is_login, _ = await xui_api.login()
-
-    # به‌جای یک درخواست به‌ازای هر سفارش (N+1)، یک‌بار آمار همه‌ی کلاینت‌ها گرفته می‌شود
-    stats_map = await xui_api.get_all_client_stats() if is_login else None
-
-    for order_id, link, _ in orders[-30:]:
-        email = unquote(link.split("#")[-1]) if "#" in link else f"سرویس {order_id}"
-        if not is_login or stats_map is None:
-            status_text = "خطا ⚠️"
-        else:
-            stats = stats_map.get(email.strip().lower())
-            if stats:
-                enable = stats.get('enable', False)
-                total = stats.get('total', 0)
-                used = stats.get('up', 0) + stats.get('down', 0)
-                expiry = stats.get('expiryTime', 0)
-                status_text = "فعال 🟢"
-                if not enable: status_text = "غیرفعال 🔴"
-                elif expiry > 0 and expiry < int(time.time() * 1000): status_text = "منقضی 🔴"
-                elif total > 0 and used >= total: status_text = "پایان حجم 🔴"
-            else: status_text = "نامشخص ⚪️"
-
-        cb_data = f"show_order_{order_id}"
-        keyboard.append([InlineKeyboardButton(status_text, callback_data=cb_data), InlineKeyboardButton(email, callback_data=cb_data)])
-    return InlineKeyboardMarkup(keyboard)
 
 async def render_order_details(query, order_id, alert_msg=None):
     if not await is_admin(query.from_user.id) and not await order_belongs_to(order_id, query.from_user.id):
@@ -357,7 +98,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # 📢 Broadcast
     if state == 'admin_waiting_broadcast' and admin_status:
-        async with db_pool.acquire() as conn: users = [r['user_id'] for r in await conn.fetch("SELECT user_id FROM users")]
+        async with db.db_pool.acquire() as conn: users = [r['user_id'] for r in await conn.fetch("SELECT user_id FROM users")]
         success = 0
         wait_msg = await update.message.reply_text("در حال ارسال پیام همگانی... ⏳")
         for u in users:
@@ -375,7 +116,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             return await update.message.reply_text("❌ لطفاً فقط **عکس رسید** واریزی را ارسال کنید.")
         amount = state.split('_')[2]
         receipt_id = str(uuid.uuid4())[:8]
-        async with db_pool.acquire() as conn: await conn.execute("INSERT INTO receipts (id, status) VALUES ($1, 'pending')", receipt_id)
+        async with db.db_pool.acquire() as conn: await conn.execute("INSERT INTO receipts (id, status) VALUES ($1, 'pending')", receipt_id)
             
         keyboard = [[InlineKeyboardButton(f"✅ تایید {int(amount):,}", callback_data=f"approve_{user_id}_{amount}_{receipt_id}")], [InlineKeyboardButton("❌ رد", callback_data=f"reject_{user_id}_{receipt_id}")]]
         admins = await get_all_admins()
@@ -428,7 +169,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             
         elif text == 'محصولات 🛍':
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
                 customs = await conn.fetch("SELECT plan_id, price FROM custom_prices WHERE user_id = $1", user_id)
             if not plans: return await update.message.reply_text("🛒 هنوز هیچ محصولی اضافه نشده است.")
@@ -442,7 +183,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         elif text == 'خرید عمده 📦' and (can_bulk or admin_status):
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 plans = await conn.fetch("SELECT * FROM plans ORDER BY bulk_price ASC")
                 customs = await conn.fetch("SELECT plan_id, bulk_price FROM custom_prices WHERE user_id = $1", user_id)
             if not plans: return await update.message.reply_text("🛒 هیچ محصولی برای عمده موجود نیست.")
@@ -455,7 +196,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("📦 لطفاً پلن خرید گروهی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'سفارشات من 📦':
-            async with db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date FROM orders WHERE user_id = $1", user_id)
+            async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date FROM orders WHERE user_id = $1", user_id)
             if not orders: return await update.message.reply_text("📦 شما سفارشی ندارید.")
             
             wait_msg = await update.message.reply_text("در حال دریافت وضعیت از سرور... ⏳")
@@ -556,7 +297,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['b_postfix'] = postfix
         context.user_data['b_count'] = count
 
-        async with db_pool.acquire() as conn:
+        async with db.db_pool.acquire() as conn:
             plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
             custom = await conn.fetchrow("SELECT bulk_price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, int(plan_id))
         
@@ -571,7 +312,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     # ================= ماشین وضعیت ویرایش پلن =================
     if state == 'admin_waiting_edit_plan_id' and admin_status:
         if text.isdigit():
-            async with db_pool.acquire() as conn: p = await conn.fetchrow("SELECT * FROM plans WHERE id=$1", int(text))
+            async with db.db_pool.acquire() as conn: p = await conn.fetchrow("SELECT * FROM plans WHERE id=$1", int(text))
             if not p:
                 return await update.message.reply_text("❌ پلنی با این آیدی یافت نشد.")
             context.user_data['edit_plan_id'] = int(text)
@@ -591,7 +332,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id = nums
             plan_id = context.user_data['edit_plan_id']
             
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 await conn.execute("UPDATE plans SET name=$1, gb=$2, duration_days=$3, price=$4, vip_price=$5, bulk_price=$6, vip_bulk_price=$7, inbound_id=$8 WHERE id=$9", name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, plan_id)
             context.user_data['state'] = 'none'
             await update.message.reply_text("✅ پلن با موفقیت ویرایش شد.", reply_markup=await get_main_keyboard(user_id))
@@ -604,7 +345,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             parts = text.split('|')
             if len(parts) != 4: raise ValueError
             target_uid, plan_id, c_price, c_bulk = [clean_num(x) for x in parts]
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 await conn.execute("INSERT INTO custom_prices (user_id, plan_id, price, bulk_price) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, plan_id) DO UPDATE SET price=$3, bulk_price=$4", target_uid, plan_id, c_price, c_bulk)
             context.user_data['state'] = 'none'
             await update.message.reply_text("✅ قیمت اختصاصی برای این کاربر با موفقیت ثبت شد.", reply_markup=await get_main_keyboard(user_id))
@@ -647,7 +388,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             elif step == 'inbound':
                 inbound = clean_num(text)
                 p = context.user_data['new_plan']
-                async with db_pool.acquire() as conn:
+                async with db.db_pool.acquire() as conn:
                     await conn.execute("INSERT INTO plans (name, gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id, duration_days) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", p['name'], p['gb'], p['price'], p['vip_price'], p['bulk_price'], p['vip_bulk_price'], inbound, p.get('duration_days', 30))
                 context.user_data['state'] = 'none'
                 await update.message.reply_text(f"✅ **پلن `{p['name']}` با موفقیت ذخیره شد!**", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
@@ -657,13 +398,13 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     # بقیه هندلرهای ادمین
     if state == 'admin_waiting_del_plan' and admin_status:
         if text.isdigit():
-            async with db_pool.acquire() as conn: await conn.execute("DELETE FROM plans WHERE id = $1", int(text))
+            async with db.db_pool.acquire() as conn: await conn.execute("DELETE FROM plans WHERE id = $1", int(text))
             context.user_data['state'] = 'none'
             await update.message.reply_text("✅ پلن حذف شد.", reply_markup=await get_main_keyboard(user_id))
             
     elif state == 'admin_waiting_bulk_id' and admin_status:
         if text.isdigit():
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 current = await conn.fetchval("SELECT can_bulk FROM users WHERE user_id = $1", int(text))
                 if current is not None:
                     await conn.execute("UPDATE users SET can_bulk = $1 WHERE user_id = $2", not current, int(text))
@@ -675,7 +416,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(parts) >= 1 and parts[0].isdigit():
             uid = int(parts[0])
             name = parts[1] if len(parts) > 1 else 'بدون نام'
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 await conn.execute("INSERT INTO users (user_id, nickname, role) VALUES ($1, $2, 'vip') ON CONFLICT (user_id) DO UPDATE SET role = 'vip', nickname = $2", uid, name)
             context.user_data['state'] = 'none'
             await update.message.reply_text(f"✅ کاربر {name} VIP شد.", reply_markup=await get_main_keyboard(user_id))
@@ -683,7 +424,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif state == 'admin_waiting_rem_vip' and admin_status:
         if text.isdigit():
-            async with db_pool.acquire() as conn: await conn.execute("UPDATE users SET role = 'normal' WHERE user_id = $1", int(text))
+            async with db.db_pool.acquire() as conn: await conn.execute("UPDATE users SET role = 'normal' WHERE user_id = $1", int(text))
             context.user_data['state'] = 'none'
             await update.message.reply_text(f"🔴 کاربر {text} عادی شد.", reply_markup=await get_main_keyboard(user_id))
 
@@ -702,14 +443,14 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(parts) >= 1 and parts[0].isdigit():
             uid = int(parts[0])
             name = parts[1] if len(parts) > 1 else 'بدون نام'
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 await conn.execute("INSERT INTO admins (user_id, name) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET name = $2", uid, name)
             context.user_data['state'] = 'none'
             await update.message.reply_text(f"✅ ادمین {name} اضافه شد.", reply_markup=await get_main_keyboard(user_id))
 
     elif state == 'superadmin_waiting_rem_admin' and user_id == SUPER_ADMIN_ID:
         if text.isdigit():
-            async with db_pool.acquire() as conn: await conn.execute("DELETE FROM admins WHERE user_id = $1", int(text))
+            async with db.db_pool.acquire() as conn: await conn.execute("DELETE FROM admins WHERE user_id = $1", int(text))
             context.user_data['state'] = 'none'
             await update.message.reply_text(f"✅ ادمین {text} حذف شد.", reply_markup=await get_main_keyboard(user_id))
 
@@ -735,7 +476,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                     client_dict['email'] = new_email
                     if await xui.update_client(inbound_id, client_dict['id'], client_dict):
                         new_link = old_link.replace(f"#{old_email}", f"#{new_email}")
-                        async with db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
+                        async with db.db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
                         await update.message.reply_text(f"✅ نام کانفیگ با موفقیت به `{new_email}` تغییر کرد!", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
                         context.user_data['state'] = 'none'
                     else: await update.message.reply_text("❌ سرور درخواست تغییر نام را رد کرد.")
@@ -746,7 +487,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif state.startswith('waiting_for_nick_'):
         plan_id = int(state.split('_')[-1])
         if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) < 20:
-            async with db_pool.acquire() as conn:
+            async with db.db_pool.acquire() as conn:
                 plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
                 custom = await conn.fetchrow("SELECT price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, plan_id)
             if not plan: return
@@ -790,7 +531,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ افزودن پلن جدید", callback_data='admin_add_plan'), InlineKeyboardButton("🗑 حذف پلن", callback_data='admin_del_plan')],
             [InlineKeyboardButton("✏️ ویرایش پلن", callback_data='admin_edit_plan')]
         ]
-        async with db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY id ASC")
+        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY id ASC")
         msg = "📋 **لیست محصولات فعلی:**\n\n"
         for p in plans: msg += f"🆔 `ID:{p['id']}` | {p['name']} | عادی: {p['price']:,} | مدت: {p['duration_days']}روز | اینباند: {p['inbound_id']}\n"
         await query.edit_message_text(msg if plans else "محصولی یافت نشد.", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
@@ -807,7 +548,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.delete_message()
 
     elif data == 'admin_list_specials' and admin_status:
-        async with db_pool.acquire() as conn:
+        async with db.db_pool.acquire() as conn:
             vips = await conn.fetch("SELECT user_id, nickname FROM users WHERE role='vip'")
             admins = await conn.fetch("SELECT user_id, name FROM admins")
         
@@ -908,13 +649,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 client_dict['id'] = new_uuid
                 if await xui.update_client(inbound_id, old_uuid, client_dict):
                     new_link = old_link.replace(old_uuid, new_uuid)
-                    async with db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
+                    async with db.db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
                     await render_order_details(query, order_id, "✅ لینک اتصال و UUID با موفقیت تغییر کرد!")
 
     elif data.startswith("renew_menu_"):
         order_id = data.split("_")[2]
         if not await ensure_order_access(query, order_id, admin_status): return
-        async with db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
+        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
         if not plans: return await query.answer("پلنی برای تمدید وجود ندارد!", show_alert=True)
         kb = []
         for p in plans:
@@ -928,7 +669,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = parts[2]
         if not await ensure_order_access(query, order_id, admin_status): return
         plan_id = int(parts[3])
-        async with db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
+        async with db.db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
         if not plan: return
         price = plan['vip_price'] if role == 'vip' else plan['price']
         
@@ -944,7 +685,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = parts[2]
         if not await ensure_order_access(query, order_id, admin_status): return
         plan_id = int(parts[3])
-        async with db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
+        async with db.db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
         if not plan: return await query.answer("❌ پلن یافت نشد!", show_alert=True)
         price = plan['vip_price'] if role == 'vip' else plan['price']
 
@@ -1019,7 +760,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_id = int(parts[2])
         final_name = "_".join(parts[3:]) 
         
-        async with db_pool.acquire() as conn:
+        async with db.db_pool.acquire() as conn:
             plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
             custom = await conn.fetchrow("SELECT price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, plan_id)
             
@@ -1083,7 +824,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefix = context.user_data['b_prefix']
         count = end_n - start_n + 1
         
-        async with db_pool.acquire() as conn:
+        async with db.db_pool.acquire() as conn:
             plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
             custom = await conn.fetchrow("SELECT bulk_price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, int(plan_id))
             
@@ -1166,7 +907,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_order_details(query, data.split("_")[2])
         
     elif data == 'back_to_orders':
-        async with db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date FROM orders WHERE user_id = $1", user_id)
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date FROM orders WHERE user_id = $1", user_id)
         xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
         keyboard = await generate_orders_keyboard(orders, xui)
         await query.edit_message_text("✅ سرویس خود را انتخاب کنید:", reply_markup=keyboard)
@@ -1176,7 +917,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(parts[1])
         amt = int(parts[2])
         receipt_id = parts[3]
-        async with db_pool.acquire() as conn:
+        async with db.db_pool.acquire() as conn:
             res = await conn.fetchval("SELECT status FROM receipts WHERE id = $1", receipt_id)
             if not res or res != 'pending': return await query.edit_message_caption(caption="⚠️ قبلاً بررسی شده.")
             await conn.execute("UPDATE receipts SET status = 'approved' WHERE id = $1", receipt_id)
@@ -1189,7 +930,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split("_")
         uid = int(parts[1])
         receipt_id = parts[2]
-        async with db_pool.acquire() as conn:
+        async with db.db_pool.acquire() as conn:
             res = await conn.fetchval("SELECT status FROM receipts WHERE id = $1", receipt_id)
             if not res or res != 'pending': return await query.edit_message_caption(caption="⚠️ قبلاً بررسی شده.")
             await conn.execute("UPDATE receipts SET status = 'rejected' WHERE id = $1", receipt_id)
