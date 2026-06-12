@@ -31,6 +31,45 @@ async def get_order_xui(order_id):
     return build_xui(panel)
 
 
+# فیلدهای قابل‌ویرایش پلن: (کلید، برچسب، ستون دیتابیس، عددی‌بودن)
+PLAN_FIELDS = [
+    ("name", "نام", "name", False),
+    ("gb", "حجم (GB)", "gb", True),
+    ("duration", "مدت (روز)", "duration_days", True),
+    ("price", "قیمت عادی", "price", True),
+    ("vipprice", "قیمت VIP", "vip_price", True),
+    ("bulk", "قیمت عمده", "bulk_price", True),
+    ("vipbulk", "عمده VIP", "vip_bulk_price", True),
+    ("inbound", "اینباند", "inbound_id", True),
+    ("panel", "پنل", "panel_id", True),
+]
+PLAN_FIELD_MAP = {f[0]: f for f in PLAN_FIELDS}
+
+
+def plan_edit_markup(plan_id):
+    rows = [[InlineKeyboardButton(f"✏️ {label}", callback_data=f"pef_{key}_{plan_id}")] for key, label, _col, _isnum in PLAN_FIELDS]
+    rows.append([InlineKeyboardButton("✅ پایان", callback_data="pe_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def plan_edit_text(plan):
+    panel = await db.get_panel(plan['panel_id']) if plan['panel_id'] else None
+    pname = panel['name'] if panel else "—"
+    return (
+        f"✏️ **ویرایش پلن** (ID: `{plan['id']}`)\n\n"
+        f"📋 نام: {plan['name']}\n"
+        f"💾 حجم: {plan['gb']} GB\n"
+        f"📅 مدت: {plan['duration_days']} روز\n"
+        f"💰 قیمت عادی: {plan['price']:,}\n"
+        f"💎 قیمت VIP: {plan['vip_price']:,}\n"
+        f"📦 عمده: {plan['bulk_price']:,}\n"
+        f"👑 عمده VIP: {plan['vip_bulk_price']:,}\n"
+        f"⚙️ اینباند: {plan['inbound_id']}\n"
+        f"🖥 پنل: {pname}\n\n"
+        f"برای تغییر هر مورد، دکمه‌اش را بزنید."
+    )
+
+
 async def ensure_order_access(query, order_id, admin_status):
     """کنترل دسترسی به سفارش. ادمین‌ها به همه‌چیز دسترسی دارند؛ کاربر عادی فقط به سفارش خودش."""
     if admin_status or await order_belongs_to(order_id, query.from_user.id):
@@ -332,47 +371,85 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
         context.user_data['state'] = 'none'
 
-    # ================= ماشین وضعیت ویرایش پلن =================
+    # ================= ماشین وضعیت ویرایش پلن (تعاملی) =================
     if state == 'admin_waiting_edit_plan_id' and admin_status:
         if text.isdigit():
             async with db.db_pool.acquire() as conn: p = await conn.fetchrow("SELECT * FROM plans WHERE id=$1", int(text))
             if not p:
                 return await update.message.reply_text("❌ پلنی با این آیدی یافت نشد.")
-            context.user_data['edit_plan_id'] = int(text)
-            context.user_data['state'] = 'admin_waiting_edit_plan_data'
-            
-            old_data = f"{p['name']} | {p['gb']} | {p['duration_days']} | {p['price']} | {p['vip_price']} | {p['bulk_price']} | {p['vip_bulk_price']} | {p['inbound_id']}"
-            await update.message.reply_text(f"✏️ لطفاً اطلاعات جدید را با فرمت زیر بفرستید:\n`نام | حجم | مدت(روز) | عادی | VIP | عمده | عمده VIP | اینباند`\n\nمقدار قبلی:\n`{old_data}`", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+            context.user_data['state'] = 'none'
+            await update.message.reply_text(await plan_edit_text(p), reply_markup=plan_edit_markup(p['id']), parse_mode='Markdown')
         else: await update.message.reply_text("❌ فقط عدد بفرستید.")
         return
 
-    if state == 'admin_waiting_edit_plan_data' and admin_status:
-        try:
-            parts = text.split('|')
-            if len(parts) != 8: raise ValueError
-            name = parts[0].strip()
-            nums = [clean_num(x) for x in parts[1:]]
-            gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id = nums
-            plan_id = context.user_data['edit_plan_id']
-            
-            async with db.db_pool.acquire() as conn:
-                await conn.execute("UPDATE plans SET name=$1, gb=$2, duration_days=$3, price=$4, vip_price=$5, bulk_price=$6, vip_bulk_price=$7, inbound_id=$8 WHERE id=$9", name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, plan_id)
+    if admin_status and state.startswith('peset_'):
+        parts = state.split('_')
+        field, plan_id = parts[1], int(parts[2])
+        meta = PLAN_FIELD_MAP.get(field)
+        if not meta:
             context.user_data['state'] = 'none'
-            await update.message.reply_text("✅ پلن با موفقیت ویرایش شد.", reply_markup=await get_main_keyboard(user_id))
-        except: await update.message.reply_text("❌ فرمت اشتباه است!")
+            return
+        _key, label, col, isnum = meta
+        if isnum:
+            try:
+                val = clean_num(text)
+            except ValueError:
+                return await update.message.reply_text("❌ فقط عدد بفرستید.")
+            if field == 'panel':
+                panels = await db.get_panels()
+                if val not in [pr['id'] for pr in panels]:
+                    return await update.message.reply_text("❌ آیدی پنل نامعتبر است. دوباره بفرستید:")
+        else:
+            val = text.strip()
+        async with db.db_pool.acquire() as conn:
+            # col از لیست ثابت PLAN_FIELDS می‌آید؛ امکان تزریق SQL وجود ندارد
+            await conn.execute(f"UPDATE plans SET {col} = $1 WHERE id = $2", val, plan_id)
+            p = await conn.fetchrow("SELECT * FROM plans WHERE id=$1", plan_id)
+        context.user_data['state'] = 'none'
+        if not p:
+            return await update.message.reply_text("❌ پلن یافت نشد.", reply_markup=await get_main_keyboard(user_id))
+        await update.message.reply_text(f"✅ «{label}» بروزرسانی شد.")
+        await update.message.reply_text(await plan_edit_text(p), reply_markup=plan_edit_markup(p['id']), parse_mode='Markdown')
         return
 
-    # ================= ماشین وضعیت قیمت اختصاصی =================
-    if state == 'admin_waiting_custom_price' and admin_status:
-        try:
-            parts = text.split('|')
-            if len(parts) != 4: raise ValueError
-            target_uid, plan_id, c_price, c_bulk = [clean_num(x) for x in parts]
-            async with db.db_pool.acquire() as conn:
-                await conn.execute("INSERT INTO custom_prices (user_id, plan_id, price, bulk_price) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, plan_id) DO UPDATE SET price=$3, bulk_price=$4", target_uid, plan_id, c_price, c_bulk)
+    # ================= ماشین وضعیت قیمت اختصاصی (ویزارد) =================
+    if state == 'cp_uid' and admin_status:
+        if not text.isdigit():
+            return await update.message.reply_text("❌ فقط آیدی عددی کاربر را بفرستید.")
+        context.user_data['cp_uid'] = int(text)
+        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT id, name, price, bulk_price FROM plans ORDER BY id ASC")
+        if not plans:
             context.user_data['state'] = 'none'
-            await update.message.reply_text("✅ قیمت اختصاصی برای این کاربر با موفقیت ثبت شد.", reply_markup=await get_main_keyboard(user_id))
-        except: await update.message.reply_text("❌ فرمت اشتباه است!")
+            return await update.message.reply_text("❌ هیچ پلنی وجود ندارد.", reply_markup=await get_main_keyboard(user_id))
+        kb = [[InlineKeyboardButton(f"{p['name']} (پیش‌فرض {p['price']:,} / عمده {p['bulk_price']:,})", callback_data=f"cpplan_{p['id']}")] for p in plans]
+        context.user_data['state'] = 'cp_choose'
+        await update.message.reply_text("کدام پلن؟", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if state == 'cp_single' and admin_status:
+        try:
+            context.user_data['cp_single'] = clean_num(text)
+        except ValueError:
+            return await update.message.reply_text("❌ فقط عدد بفرستید.")
+        context.user_data['state'] = 'cp_bulk'
+        await update.message.reply_text("💰 قیمت اختصاصی **عمده** (دونه‌ای) را بفرستید:", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+        return
+
+    if state == 'cp_bulk' and admin_status:
+        try:
+            c_bulk = clean_num(text)
+        except ValueError:
+            return await update.message.reply_text("❌ فقط عدد بفرستید.")
+        uid = context.user_data.get('cp_uid')
+        plan_id = context.user_data.get('cp_plan')
+        c_price = context.user_data.get('cp_single')
+        if uid is None or plan_id is None or c_price is None:
+            context.user_data['state'] = 'none'
+            return await update.message.reply_text("❌ اطلاعات ناقص است، دوباره از منو شروع کنید.", reply_markup=await get_main_keyboard(user_id))
+        async with db.db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO custom_prices (user_id, plan_id, price, bulk_price) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, plan_id) DO UPDATE SET price=$3, bulk_price=$4", uid, plan_id, c_price, c_bulk)
+        context.user_data['state'] = 'none'
+        await update.message.reply_text(f"✅ قیمت اختصاصی برای کاربر `{uid}` ثبت شد.\nتکی: {c_price:,} | عمده: {c_bulk:,}", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
         return
 
     # ================= ماشین وضعیت افزودن پنل =================
@@ -621,9 +698,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.delete_message()
 
     elif data == 'admin_custom_price' and admin_status:
-        context.user_data['state'] = 'admin_waiting_custom_price'
-        msg = "💎 **ثبت قیمت اختصاصی برای کاربر**\n\nلطفاً اطلاعات را با فرمت زیر بفرستید:\n`آیدی کاربر | آیدی پلن | قیمت تکی | قیمت عمده`\n\nمثال:\n`123456789 | 2 | 50000 | 45000`"
-        await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+        context.user_data['state'] = 'cp_uid'
+        await query.message.reply_text("💎 **قیمت اختصاصی کاربر**\n\nآیدی عددی کاربر را بفرستید:", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data.startswith('cpplan_') and admin_status:
+        context.user_data['cp_plan'] = int(data.split('_')[1])
+        context.user_data['state'] = 'cp_single'
+        await query.message.reply_text("💰 قیمت اختصاصی **تکی** را بفرستید:", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'pe_done':
+        try: await query.edit_message_text("✅ ویرایش پلن به پایان رسید.")
+        except: pass
+
+    elif data.startswith('pef_') and admin_status:
+        parts = data.split('_')
+        field, plan_id = parts[1], parts[2]
+        meta = PLAN_FIELD_MAP.get(field)
+        if not meta: return
+        label = meta[1]
+        context.user_data['state'] = f"peset_{field}_{plan_id}"
+        if field == 'panel':
+            panels = await db.get_panels()
+            lst = "\n".join([f"🆔 {pr['id']} - {pr['name']}" for pr in panels]) or "—"
+            await query.message.reply_text(f"🖥 آیدی پنل جدید را بفرستید:\n\n{lst}", reply_markup=CANCEL_MARKUP)
+        else:
+            await query.message.reply_text(f"مقدار جدید «{label}» را بفرستید:", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
     elif data == 'admin_list_specials' and admin_status:
@@ -915,6 +1016,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['processing'] = False
 
     elif data.startswith("bulkbuy_"):
+        if not (can_bulk or admin_status):
+            return await query.answer("⛔️ خرید عمده فقط برای همکاران مجاز است.", show_alert=True)
         plan_id = data.split("_")[1]
         context.user_data['b_plan'] = plan_id
         context.user_data['state'] = 'bulk_waiting_prefix'
@@ -922,6 +1025,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ================= ساخت کانفیگ عمده + فاکتور دقیق ادمین =================
     elif data == "confirm_execute_bulk":
+        if not (can_bulk or admin_status):
+            return await query.answer("⛔️ خرید عمده فقط برای همکاران مجاز است.", show_alert=True)
         start_n = context.user_data.get('b_start', 1)
         end_n = context.user_data.get('b_end', 1)
         postfix = context.user_data.get('b_postfix', "")
