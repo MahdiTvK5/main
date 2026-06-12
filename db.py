@@ -28,6 +28,8 @@ async def init_db():
 
         # ===== پشتیبانی چند پنل =====
         await conn.execute('''CREATE TABLE IF NOT EXISTS panels (id SERIAL PRIMARY KEY, name TEXT, url TEXT, username TEXT, password TEXT, config_ip TEXT)''')
+        # آدرس سرور اشتراک (subscription) برای ساخت لینک ساب؛ اختیاری
+        await conn.execute("ALTER TABLE panels ADD COLUMN IF NOT EXISTS sub_url TEXT DEFAULT ''")
         # هر پلن و هر سفارش به یک پنل متصل می‌شود
         await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS panel_id INT")
         await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS panel_id INT")
@@ -219,11 +221,11 @@ async def get_panel(panel_id):
         return await conn.fetchrow("SELECT * FROM panels WHERE id = $1", int(panel_id))
 
 
-async def add_panel(name, url, username, password, config_ip):
+async def add_panel(name, url, username, password, config_ip, sub_url=''):
     async with db_pool.acquire() as conn:
         return await conn.fetchval(
-            "INSERT INTO panels (name, url, username, password, config_ip) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            name, url, username, password, config_ip,
+            "INSERT INTO panels (name, url, username, password, config_ip, sub_url) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            name, url, username, password, config_ip, sub_url,
         )
 
 
@@ -232,7 +234,7 @@ async def delete_panel(panel_id):
         await conn.execute("DELETE FROM panels WHERE id = $1", int(panel_id))
 
 
-PANEL_COLUMNS = {'name', 'url', 'username', 'password', 'config_ip'}
+PANEL_COLUMNS = {'name', 'url', 'username', 'password', 'config_ip', 'sub_url'}
 
 
 async def update_panel_field(panel_id, col, value):
