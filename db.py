@@ -3,6 +3,7 @@ import asyncpg
 
 from config import (
     DB_USER, DB_PASS, DB_NAME, DB_HOST, DB_PORT, SUPER_ADMIN_ID,
+    PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP,
 )
 
 # استخر اتصال دیتابیس؛ در init_db مقداردهی می‌شود و سایر ماژول‌ها با db.db_pool به آن دسترسی دارند.
@@ -24,6 +25,24 @@ async def init_db():
         await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS duration_days INT DEFAULT 30")
         # جدول جدید برای قیمت‌های اختصاصی کاربران
         await conn.execute('''CREATE TABLE IF NOT EXISTS custom_prices (user_id BIGINT, plan_id INT, price BIGINT, bulk_price BIGINT, PRIMARY KEY(user_id, plan_id))''')
+
+        # ===== پشتیبانی چند پنل =====
+        await conn.execute('''CREATE TABLE IF NOT EXISTS panels (id SERIAL PRIMARY KEY, name TEXT, url TEXT, username TEXT, password TEXT, config_ip TEXT)''')
+        # هر پلن و هر سفارش به یک پنل متصل می‌شود
+        await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS panel_id INT")
+        await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS panel_id INT")
+
+        # مهاجرت: اگر هیچ پنلی ثبت نشده ولی پنل پیش‌فرض در .env وجود دارد، آن را به‌عنوان پنل اول بساز
+        default_panel_id = await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
+        if default_panel_id is None and PANEL_URL:
+            default_panel_id = await conn.fetchval(
+                "INSERT INTO panels (name, url, username, password, config_ip) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                "پنل پیش‌فرض", PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP,
+            )
+        # سفارش‌ها و پلن‌های قدیمیِ بدون پنل را به پنل پیش‌فرض نسبت بده
+        if default_panel_id is not None:
+            await conn.execute("UPDATE plans SET panel_id = $1 WHERE panel_id IS NULL", default_panel_id)
+            await conn.execute("UPDATE orders SET panel_id = $1 WHERE panel_id IS NULL", default_panel_id)
 
         await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
@@ -95,15 +114,51 @@ async def get_balance(user_id):
         return await conn.fetchval("SELECT balance FROM users WHERE user_id = $1", user_id) or 0
 
 
-async def add_order(user_id, config_link):
+async def add_order(user_id, config_link, panel_id=None):
     async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO orders (user_id, config_link, date) VALUES ($1, $2, $3)", user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        await conn.execute("INSERT INTO orders (user_id, config_link, date, panel_id) VALUES ($1, $2, $3, $4)", user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), panel_id)
 
 
 async def get_order_by_id(order_id):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT config_link, date FROM orders WHERE id = $1", int(order_id))
         return (row['config_link'], row['date']) if row else None
+
+
+async def get_order_panel_id(order_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval("SELECT panel_id FROM orders WHERE id = $1", int(order_id))
+
+
+# ================= پنل‌ها =================
+async def get_panels():
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM panels ORDER BY id ASC")
+
+
+async def get_panel(panel_id):
+    if panel_id is None:
+        return None
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM panels WHERE id = $1", int(panel_id))
+
+
+async def add_panel(name, url, username, password, config_ip):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO panels (name, url, username, password, config_ip) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            name, url, username, password, config_ip,
+        )
+
+
+async def delete_panel(panel_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM panels WHERE id = $1", int(panel_id))
+
+
+async def get_default_panel_id():
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
 
 
 async def order_belongs_to(order_id, user_id):
