@@ -57,6 +57,15 @@ async def init_db():
             date TIMESTAMP DEFAULT NOW()
         )''')
 
+        # ===== سیستم دعوت (Referral) =====
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_rewarded BOOLEAN DEFAULT FALSE")
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('ref_bonus', '0') ON CONFLICT DO NOTHING")
+
+        # ===== کدهای هدیه =====
+        await conn.execute('''CREATE TABLE IF NOT EXISTS gift_codes (code TEXT PRIMARY KEY, amount BIGINT, max_uses INT DEFAULT 1, used_count INT DEFAULT 0)''')
+        await conn.execute('''CREATE TABLE IF NOT EXISTS gift_redemptions (code TEXT, user_id BIGINT, PRIMARY KEY (code, user_id))''')
+
         await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('support_id', '@khodehamed') ON CONFLICT DO NOTHING")
@@ -202,6 +211,87 @@ async def delete_panel(panel_id):
 async def get_default_panel_id():
     async with db_pool.acquire() as conn:
         return await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
+
+
+# ================= سیستم دعوت =================
+async def is_new_user(user_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user_id) is None
+
+
+async def set_referrer(user_id, referrer_id):
+    """معرف را فقط در صورتی ثبت می‌کند که قبلاً ثبت نشده باشد و خودِ کاربر نباشد."""
+    if referrer_id == user_id:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+        await conn.execute("UPDATE users SET referred_by = $1 WHERE user_id = $2 AND referred_by IS NULL", referrer_id, user_id)
+
+
+async def referral_count(user_id):
+    async with db_pool.acquire() as conn:
+        return int(await conn.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", user_id) or 0)
+
+
+async def try_reward_referrer(user_id):
+    """هنگام اولین شارژِ تاییدشده‌ی کاربر، یک‌بار به معرف پاداش می‌دهد.
+    خروجی: (referrer_id, bonus) یا None."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("SELECT referred_by, ref_rewarded FROM users WHERE user_id = $1 FOR UPDATE", user_id)
+            if not row or not row['referred_by'] or row['ref_rewarded']:
+                return None
+            try:
+                bonus = int(await conn.fetchval("SELECT value FROM settings WHERE key = 'ref_bonus'") or 0)
+            except (TypeError, ValueError):
+                bonus = 0
+            referrer = row['referred_by']
+            await conn.execute("UPDATE users SET ref_rewarded = TRUE WHERE user_id = $1", user_id)
+            if bonus <= 0:
+                return None
+            await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", referrer)
+            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", bonus, referrer)
+            await conn.execute("INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)", referrer, bonus, 'پاداش دعوت', f'دعوت کاربر {user_id}')
+            return referrer, bonus
+
+
+# ================= کدهای هدیه =================
+async def add_gift_code(code, amount, max_uses):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO gift_codes (code, amount, max_uses) VALUES ($1, $2, $3) ON CONFLICT (code) DO UPDATE SET amount = $2, max_uses = $3",
+            code, amount, max_uses,
+        )
+
+
+async def delete_gift_code(code):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM gift_codes WHERE code = $1", code)
+
+
+async def list_gift_codes():
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT code, amount, max_uses, used_count FROM gift_codes ORDER BY code")
+
+
+async def redeem_gift_code(user_id, code):
+    """اعمال اتمیک کد هدیه. خروجی: (ok, message)."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            gc = await conn.fetchrow("SELECT amount, max_uses, used_count FROM gift_codes WHERE code = $1 FOR UPDATE", code)
+            if not gc:
+                return False, "❌ کد نامعتبر است."
+            if gc['used_count'] >= gc['max_uses']:
+                return False, "❌ ظرفیت این کد تکمیل شده است."
+            already = await conn.fetchval("SELECT 1 FROM gift_redemptions WHERE code = $1 AND user_id = $2", code, user_id)
+            if already:
+                return False, "❌ شما قبلاً این کد را استفاده کرده‌اید."
+            await conn.execute("INSERT INTO gift_redemptions (code, user_id) VALUES ($1, $2)", code, user_id)
+            await conn.execute("UPDATE gift_codes SET used_count = used_count + 1 WHERE code = $1", code)
+            await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", gc['amount'], user_id)
+            await conn.execute("INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)", user_id, gc['amount'], 'کد هدیه', code)
+            return True, f"✅ کد اعمال شد. {gc['amount']:,} تومان به حساب شما اضافه شد."
 
 
 # ================= اکانت تست =================
