@@ -52,6 +52,34 @@ def plan_edit_markup(plan_id):
     return InlineKeyboardMarkup(rows)
 
 
+# فیلدهای قابل‌ویرایش پنل: (کلید، برچسب، ستون دیتابیس)
+PANEL_FIELDS = [
+    ("name", "نام", "name"),
+    ("url", "آدرس (URL)", "url"),
+    ("user", "نام کاربری", "username"),
+    ("pass", "رمز عبور", "password"),
+    ("ip", "IP کانفیگ", "config_ip"),
+]
+PANEL_FIELD_MAP = {f[0]: f for f in PANEL_FIELDS}
+
+
+def panel_edit_markup(panel_id):
+    rows = [[InlineKeyboardButton(f"✏️ {label}", callback_data=f"panef_{key}_{panel_id}")] for key, label, _col in PANEL_FIELDS]
+    rows.append([InlineKeyboardButton("✅ پایان", callback_data="pe_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+def panel_edit_text(panel):
+    return (
+        f"✏️ **ویرایش پنل** (ID: `{panel['id']}`)\n\n"
+        f"📋 نام: {panel['name']}\n"
+        f"🔗 URL: {panel['url']}\n"
+        f"👤 یوزر: {panel['username']}\n"
+        f"🌐 IP کانفیگ: {panel['config_ip']}\n\n"
+        f"برای تغییر هر مورد، دکمه‌اش را بزنید."
+    )
+
+
 async def render_test_menu(query):
     enabled = (await get_setting('test_enabled')) == 'on'
     gb = await get_setting('test_gb')
@@ -333,10 +361,22 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif text == 'سفارشات من 📦':
             async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
             if not orders: return await update.message.reply_text("📦 شما سفارشی ندارید.")
-            
+            context.user_data['order_search'] = None
+            context.user_data['order_page'] = 0
             wait_msg = await update.message.reply_text("در حال دریافت وضعیت از سرور... ⏳")
-            keyboard = await generate_orders_keyboard(orders)
-            await wait_msg.edit_text(f"✅ سفارش خود را انتخاب کنید (۳۰ سرویس اخیر):", reply_markup=keyboard)
+            keyboard = await generate_orders_keyboard(orders, page=0, search=None)
+            await wait_msg.edit_text("✅ سفارش خود را انتخاب کنید:", reply_markup=keyboard)
+        return
+
+    # ================= جستجوی سفارش‌ها =================
+    if state == 'waiting_order_search':
+        context.user_data['state'] = 'none'
+        term = text.strip()
+        context.user_data['order_search'] = term
+        context.user_data['order_page'] = 0
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        keyboard = await generate_orders_keyboard(orders, page=0, search=term)
+        await update.message.reply_text(f"🔎 نتایج جستجوی «{term}»:", reply_markup=keyboard)
         return
 
     # ================= اعمال کد هدیه =================
@@ -727,6 +767,47 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("✅ آستانه‌ی هشدار انقضا تنظیم شد.", reply_markup=await get_main_keyboard(user_id))
         return
 
+    # ================= ویرایش/انتقال پنل =================
+    if state == 'admin_waiting_edit_panel_id' and admin_status:
+        if text.isdigit():
+            p = await db.get_panel(int(text))
+            if not p:
+                return await update.message.reply_text("❌ پنلی با این آیدی یافت نشد.")
+            context.user_data['state'] = 'none'
+            await update.message.reply_text(panel_edit_text(p), reply_markup=panel_edit_markup(p['id']), parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ فقط عدد بفرستید.")
+        return
+
+    if admin_status and state.startswith('paneset_'):
+        parts = state.split('_')
+        field, panel_id = parts[1], int(parts[2])
+        meta = PANEL_FIELD_MAP.get(field)
+        if not meta:
+            context.user_data['state'] = 'none'
+            return
+        await db.update_panel_field(panel_id, meta[2], text.strip())
+        p = await db.get_panel(panel_id)
+        context.user_data['state'] = 'none'
+        if not p:
+            return await update.message.reply_text("❌ پنل یافت نشد.", reply_markup=await get_main_keyboard(user_id))
+        await update.message.reply_text(f"✅ «{meta[1]}» بروزرسانی شد.")
+        await update.message.reply_text(panel_edit_text(p), reply_markup=panel_edit_markup(p['id']), parse_mode='Markdown')
+        return
+
+    if state == 'admin_waiting_move_panel' and admin_status:
+        parts = text.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            src, dst = int(parts[0]), int(parts[1])
+            if not await db.get_panel(dst):
+                return await update.message.reply_text("❌ پنل مقصد وجود ندارد.")
+            n_plans, n_orders = await db.move_panel_assets(src, dst)
+            context.user_data['state'] = 'none'
+            await update.message.reply_text(f"✅ انتقال انجام شد.\n📦 سفارش‌ها: {n_orders}\n🛒 پلن‌ها: {n_plans}", reply_markup=await get_main_keyboard(user_id))
+        else:
+            await update.message.reply_text("❌ فرمت اشتباه! مثال: `1 2`")
+        return
+
     # بقیه هندلرهای ادمین
     if state == 'admin_waiting_del_panel' and admin_status:
         if text.isdigit():
@@ -943,8 +1024,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "هنوز پنلی ثبت نشده است.\n"
         kb = [
             [InlineKeyboardButton("➕ افزودن پنل", callback_data='admin_add_panel'), InlineKeyboardButton("🗑 حذف پنل", callback_data='admin_del_panel')],
+            [InlineKeyboardButton("✏️ ویرایش پنل", callback_data='admin_edit_panel'), InlineKeyboardButton("🔀 انتقال سفارش‌ها", callback_data='admin_move_panel')],
         ]
         await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif data == 'admin_edit_panel' and admin_status:
+        context.user_data['state'] = 'admin_waiting_edit_panel_id'
+        await query.message.reply_text("آیدی پنلی که می‌خواهید ویرایش کنید را بفرستید:", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_move_panel' and admin_status:
+        context.user_data['state'] = 'admin_waiting_move_panel'
+        panels = await db.get_panels()
+        lst = "\n".join([f"🆔 {pr['id']} - {pr['name']}" for pr in panels]) or "—"
+        await query.message.reply_text(f"🔀 آیدی پنل **مبدأ** و **مقصد** را با فاصله بفرستید:\nمثال: `1 2`\n\n{lst}", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data.startswith('panef_') and admin_status:
+        parts = data.split('_')
+        field, panel_id = parts[1], parts[2]
+        meta = PANEL_FIELD_MAP.get(field)
+        if not meta: return
+        context.user_data['state'] = f"paneset_{field}_{panel_id}"
+        await query.message.reply_text(f"مقدار جدید «{meta[1]}» را بفرستید:", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
 
     elif data == 'admin_add_panel' and admin_status:
         context.user_data['new_panel'] = {}
@@ -1424,8 +1527,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif data == 'back_to_orders':
         async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
-        keyboard = await generate_orders_keyboard(orders)
+        keyboard = await generate_orders_keyboard(orders, page=context.user_data.get('order_page', 0), search=context.user_data.get('order_search'))
         await query.edit_message_text("✅ سرویس خود را انتخاب کنید:", reply_markup=keyboard)
+
+    elif data.startswith('orders_page_'):
+        page = int(data.split('_')[2])
+        context.user_data['order_page'] = page
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        keyboard = await generate_orders_keyboard(orders, page=page, search=context.user_data.get('order_search'))
+        try: await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception: pass
+
+    elif data == 'orders_search':
+        context.user_data['state'] = 'waiting_order_search'
+        await query.message.reply_text("🔎 بخشی از نام سرویس را بفرستید:", reply_markup=CANCEL_MARKUP)
+
+    elif data == 'orders_clearsearch':
+        context.user_data['order_search'] = None
+        context.user_data['order_page'] = 0
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        keyboard = await generate_orders_keyboard(orders, page=0, search=None)
+        try: await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception: pass
 
     elif data.startswith("approve_") and admin_status:
         parts = data.split("_")

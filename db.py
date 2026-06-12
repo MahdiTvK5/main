@@ -230,6 +230,33 @@ async def delete_panel(panel_id):
         await conn.execute("DELETE FROM panels WHERE id = $1", int(panel_id))
 
 
+PANEL_COLUMNS = {'name', 'url', 'username', 'password', 'config_ip'}
+
+
+async def update_panel_field(panel_id, col, value):
+    if col not in PANEL_COLUMNS:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"UPDATE panels SET {col} = $1 WHERE id = $2", value, int(panel_id))
+
+
+async def move_panel_assets(src_panel_id, dst_panel_id):
+    """همه‌ی پلن‌ها و سفارش‌های پنل مبدأ را به پنل مقصد منتقل می‌کند.
+    خروجی: (تعداد پلن‌ها، تعداد سفارش‌ها)."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            p_status = await conn.execute("UPDATE plans SET panel_id = $1 WHERE panel_id = $2", dst_panel_id, src_panel_id)
+            o_status = await conn.execute("UPDATE orders SET panel_id = $1 WHERE panel_id = $2", dst_panel_id, src_panel_id)
+
+    def _count(status):
+        try:
+            return int(status.split()[-1])
+        except (ValueError, IndexError, AttributeError):
+            return 0
+
+    return _count(p_status), _count(o_status)
+
+
 async def get_default_panel_id():
     async with db_pool.acquire() as conn:
         return await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
