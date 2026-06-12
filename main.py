@@ -283,7 +283,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
                 [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
                 [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
-                [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report')],
+                [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
                 [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
                 [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
             ]
@@ -718,6 +718,15 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("✅ پاداش دعوت تنظیم شد.", reply_markup=await get_main_keyboard(user_id))
         return
 
+    if state == 'admin_waiting_notify' and admin_status:
+        try:
+            await update_setting('notify_days', max(1, clean_num(text)))
+        except ValueError:
+            return await update.message.reply_text("❌ فقط عدد بفرستید.")
+        context.user_data['state'] = 'none'
+        await update.message.reply_text("✅ آستانه‌ی هشدار انقضا تنظیم شد.", reply_markup=await get_main_keyboard(user_id))
+        return
+
     # بقیه هندلرهای ادمین
     if state == 'admin_waiting_del_panel' and admin_status:
         if text.isdigit():
@@ -854,7 +863,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
             [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
             [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
-            [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report')],
+            [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
             [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
             [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
         ]
@@ -1025,6 +1034,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'admin_waiting_refbonus'
         cur = await get_setting('ref_bonus')
         await query.message.reply_text(f"🎁 مبلغ پاداش دعوت (تومان) را بفرستید:\nمقدار فعلی: {int(cur or 0):,}", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_set_notify' and admin_status:
+        context.user_data['state'] = 'admin_waiting_notify'
+        cur = await get_setting('notify_days')
+        await query.message.reply_text(f"🔔 چند روز مانده به انقضا هشدار ارسال شود؟ (فقط عدد)\nمقدار فعلی: {cur}", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
     elif data == 'admin_test_menu' and admin_status:
@@ -1215,6 +1230,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client_dict['expiryTime'] = base_ms + (duration_days * 86400 * 1000)
             client_dict['enable'] = True
             if await xui.update_client(inbound_id, client_dict['id'], client_dict):
+                await db.reset_notify(order_id)
                 await render_order_details(query, order_id, f"✅ با موفقیت تمدید شد!")
             else:
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
@@ -1451,6 +1467,61 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """هندلر سراسری خطا تا استثناهای مدیریت‌نشده لاگ شوند به‌جای اینکه بی‌صدا گم شوند."""
     logging.error("استثنای مدیریت‌نشده هنگام پردازش آپدیت", exc_info=context.error)
 
+
+async def _notify_user(context, order_row, text):
+    kb = [[InlineKeyboardButton("♻️ تمدید سریع", callback_data=f"renew_menu_{order_row['id']}")]]
+    try:
+        await context.bot.send_message(chat_id=order_row['user_id'], text=text, reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        pass
+
+
+async def notify_job(context: ContextTypes.DEFAULT_TYPE):
+    """به‌صورت دوره‌ای سرویس‌های نزدیک به انقضا یا اتمام حجم را پیدا و به کاربر اطلاع می‌دهد."""
+    from collections import defaultdict
+    try:
+        days = int(await get_setting('notify_days') or 3)
+    except (TypeError, ValueError):
+        days = 3
+    orders = await db.get_orders_for_notify()
+    by_panel = defaultdict(list)
+    for o in orders:
+        by_panel[o['panel_id']].append(o)
+
+    now_ms = int(time.time() * 1000)
+    for panel_id, group in by_panel.items():
+        panel = await db.get_panel(panel_id) if panel_id else None
+        if panel is None and not PANEL_URL:
+            continue
+        xui, _ip = build_xui(panel)
+        ok, _ = await xui.login()
+        if not ok:
+            continue
+        stats_map = await xui.get_all_client_stats()
+        if not stats_map:
+            continue
+        for o in group:
+            link = o['config_link']
+            email = unquote(link.split("#")[-1]) if "#" in link else ""
+            st = stats_map.get(email.strip().lower())
+            if not st or not st.get('enable', False):
+                continue
+            total = st.get('total', 0)
+            used = st.get('up', 0) + st.get('down', 0)
+            expiry = st.get('expiryTime', 0)
+            # نزدیک انقضا
+            if expiry > 0 and not o['expiry_notified']:
+                remain_days = (expiry - now_ms) / 86400000.0
+                if 0 < remain_days <= days:
+                    await _notify_user(context, o, f"⏳ سرویس «{email}» تا حدود {int(remain_days) + 1} روز دیگر منقضی می‌شود.\nبرای جلوگیری از قطعی، همین حالا تمدید کنید.")
+                    await db.mark_notified(o['id'], 'expiry_notified')
+            # اتمام حجم (کمتر از ۱۰٪ باقی‌مانده)
+            if total > 0 and not o['lowdata_notified']:
+                remain = total - used
+                if remain <= total * 0.1:
+                    await _notify_user(context, o, f"📉 حجم سرویس «{email}» رو به اتمام است ({format_size(max(remain, 0))} باقی‌مانده).\nبرای ادامه‌ی استفاده، سرویس را تمدید کنید.")
+                    await db.mark_notified(o['id'], 'lowdata_notified')
+
 def main():
     if not TOKEN:
         raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده است.")
@@ -1464,6 +1535,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_all_messages))
     app.add_handler(CallbackQueryHandler(button_handler))
+    # اجرای دوره‌ای هشدار انقضا/اتمام حجم (هر ۶ ساعت)
+    if app.job_queue:
+        app.job_queue.run_repeating(notify_job, interval=21600, first=120)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':

@@ -66,6 +66,11 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS gift_codes (code TEXT PRIMARY KEY, amount BIGINT, max_uses INT DEFAULT 1, used_count INT DEFAULT 0)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS gift_redemptions (code TEXT, user_id BIGINT, PRIMARY KEY (code, user_id))''')
 
+        # ===== هشدار انقضا/اتمام حجم =====
+        await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS expiry_notified BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS lowdata_notified BOOLEAN DEFAULT FALSE")
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('notify_days', '3') ON CONFLICT DO NOTHING")
+
         await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('support_id', '@khodehamed') ON CONFLICT DO NOTHING")
@@ -180,6 +185,23 @@ async def get_order_by_id(order_id):
 async def get_order_panel_id(order_id):
     async with db_pool.acquire() as conn:
         return await conn.fetchval("SELECT panel_id FROM orders WHERE id = $1", int(order_id))
+
+
+async def get_orders_for_notify():
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT id, user_id, config_link, panel_id, expiry_notified, lowdata_notified FROM orders")
+
+
+async def mark_notified(order_id, field):
+    if field not in ('expiry_notified', 'lowdata_notified'):
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"UPDATE orders SET {field} = TRUE WHERE id = $1", int(order_id))
+
+
+async def reset_notify(order_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE orders SET expiry_notified = FALSE, lowdata_notified = FALSE WHERE id = $1", int(order_id))
 
 
 # ================= پنل‌ها =================
