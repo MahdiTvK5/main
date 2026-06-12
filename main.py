@@ -276,12 +276,15 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
                 [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
                 [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
+                [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report')],
                 [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
             ]
             if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
             await update.message.reply_text("⚙️ پنل مدیریت اختصاصی:", reply_markup=InlineKeyboardMarkup(kb))
             
-        elif text == 'کیف پول من 💰': await update.message.reply_text(f"موجودی فعلی: {balance:,} تومان")
+        elif text == 'کیف پول من 💰':
+            kb = [[InlineKeyboardButton("📜 تاریخچه تراکنش‌ها", callback_data='wallet_history')]]
+            await update.message.reply_text(f"💰 موجودی فعلی: {balance:,} تومان", reply_markup=InlineKeyboardMarkup(kb))
         elif text == 'پشتیبانی 📞': await update.message.reply_text(f"پشتیبانی: {await get_setting('support_id')}")
         
         elif text == 'شارژ حساب 💳':
@@ -792,6 +795,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
             [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
             [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
+            [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report')],
             [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
         ]
         if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
@@ -883,6 +887,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'admin_waiting_del_panel'
         await query.message.reply_text("🗑 آیدی (ID) پنلی که می‌خواهید حذف شود را بفرستید:", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
+
+    elif data == 'wallet_history':
+        txns = await db.get_user_transactions(user_id, 15)
+        if not txns:
+            return await query.answer("تراکنشی ثبت نشده است.", show_alert=True)
+        lines = ["📜 **۱۵ تراکنش اخیر:**\n"]
+        for t in txns:
+            sign = "➕" if t['amount'] > 0 else "➖"
+            d = t['date'].strftime('%Y-%m-%d %H:%M') if t['date'] else ''
+            desc = f" - {t['description']}" if t['description'] else ''
+            lines.append(f"{sign} {abs(t['amount']):,} | {t['kind']}{desc} | {d}")
+        try:
+            await query.edit_message_text("\n".join(lines), parse_mode='Markdown')
+        except Exception:
+            await query.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+    elif data == 'admin_report' and admin_status:
+        r = await db.get_sales_report()
+        msg = (
+            f"📊 **گزارش فروش**\n\n"
+            f"🛒 کل فروش (کسر شده): {r['spent']:,} تومان\n"
+            f"📅 فروش امروز: {r['today_spent']:,} تومان\n"
+            f"💳 کل شارژ حساب‌ها: {r['topup']:,} تومان\n"
+            f"↩️ کل برگشت وجه: {r['refunds']:,} تومان\n"
+            f"📦 تعداد کل سفارش‌ها: {r['orders']:,}\n"
+            f"👥 تعداد کاربران: {r['users']:,}\n"
+            f"👛 مجموع موجودی کیف‌پول کاربران: {r['balances']:,} تومان"
+        )
+        await query.edit_message_text(msg, parse_mode='Markdown')
 
     elif data == 'admin_test_menu' and admin_status:
         await render_test_menu(query)
@@ -1047,21 +1080,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             email = unquote(res[0].split("#")[-1])
 
             # کسر اتمیک موجودی پیش از تماس با پنل
-            if await deduct_balance(user_id, price) is None:
+            if await deduct_balance(user_id, price, kind='تمدید') is None:
                 return await query.answer("❌ موجودی کم است!", show_alert=True)
 
             xui, _ip = await get_order_xui(order_id)
             await query.edit_message_text("در حال انجام عملیات تمدید... ⏳")
             is_logged, _ = await xui.login()
             if not is_logged:
-                await credit_balance(user_id, price)  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
                 return await render_order_details(query, order_id, "❌ خطا در اتصال به پنل!")
 
             stats = await xui.get_client_stats(email)
             used_bytes = stats.get('up', 0) + stats.get('down', 0) if stats else 0
             inbound_id, port, client_dict = await xui.get_client_exact_info(email)
             if not client_dict:
-                await credit_balance(user_id, price)  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
                 return await render_order_details(query, order_id, "❌ کانفیگ در سرور یافت نشد!")
 
             duration_days = plan['duration_days'] or 30
@@ -1074,7 +1107,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await xui.update_client(inbound_id, client_dict['id'], client_dict):
                 await render_order_details(query, order_id, f"✅ با موفقیت تمدید شد!")
             else:
-                await credit_balance(user_id, price)  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
                 await render_order_details(query, order_id, "❌ خطا: سرور درخواست تمدید را رد کرد!")
         finally:
             context.user_data['processing'] = False
@@ -1122,7 +1155,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['processing'] = True
         try:
             # ابتدا موجودی به‌صورت اتمیک کسر می‌شود تا از کسر دوباره/همزمان جلوگیری شود
-            if await deduct_balance(user_id, price) is None:
+            if await deduct_balance(user_id, price, kind='خرید') is None:
                 return await query.edit_message_text(f"❌ موجودی کافی نیست. (نیاز: {price:,})")
 
             await query.edit_message_text("در حال اتصال به سرور و استخراج پورت... ⏳")
@@ -1132,12 +1165,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_logged, login_err = await xui.login()
 
             if not is_logged:
-                await credit_balance(user_id, price)  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
                 return await query.edit_message_text(f"❌ خطا در لاگین به پنل سنایی.\nدلیل: {login_err}")
 
             port = await xui.get_inbound_port(plan['inbound_id'])
             if not port:
-                await credit_balance(user_id, price)  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
                 return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
 
             new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), 1)
@@ -1155,7 +1188,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text(f"✅ خرید موفق!\n\n`{config_link}`{SECURITY_WARNING}", parse_mode='Markdown')
                 # ========================================
             else:
-                await credit_balance(user_id, price)  # برگشت وجه چون ساخت کانفیگ ناموفق بود
+                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه چون ساخت کانفیگ ناموفق بود
                 await query.edit_message_text(f"❌ سرور ساخت کانفیگ را رد کرد!\nارور: `{error_msg}`", parse_mode='Markdown')
         finally:
             context.user_data['processing'] = False
@@ -1191,7 +1224,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['processing'] = True
         try:
             # کل مبلغ به‌صورت اتمیک رزرو می‌شود؛ مابه‌التفاوت کانفیگ‌های ناموفق بعداً برگشت می‌خورد
-            if await deduct_balance(user_id, total_price) is None:
+            if await deduct_balance(user_id, total_price, kind='خرید عمده') is None:
                 return await query.edit_message_text("❌ موجودی کافی نیست!")
 
             await query.edit_message_text(f"در حال ساخت {count} کانفیگ... ⏳")
@@ -1200,7 +1233,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order_panel_id = panel['id'] if panel else None
             is_logged, login_err = await xui.login()
             if not is_logged:
-                await credit_balance(user_id, total_price)  # برگشت کل وجه
+                await credit_balance(user_id, total_price, kind='برگشت وجه')  # برگشت کل وجه
                 return await query.edit_message_text(f"❌ خطا در لاگین پنل: {login_err}")
 
             port = await xui.get_inbound_port(plan['inbound_id'])
@@ -1220,7 +1253,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             actual_deduction = unit_price * len(success_configs)
             refund = total_price - actual_deduction
             if refund > 0:
-                await credit_balance(user_id, refund)
+                await credit_balance(user_id, refund, kind='برگشت وجه', description='کانفیگ‌های ناموفق عمده')
 
             if success_configs:
                 configs_text = "\n\n".join(success_configs)
