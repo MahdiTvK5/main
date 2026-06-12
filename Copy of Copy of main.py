@@ -28,10 +28,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 TOKEN = os.getenv("BOT_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
 
-DB_USER = 'overwall_user'
-DB_PASS = 'OverWall@12345'
-DB_NAME = 'overwall_db'
-DB_HOST = '127.0.0.1'
+DB_USER = os.getenv("DB_USER", "overwall_user")
+DB_PASS = os.getenv("DB_PASS", "OverWall@12345")
+DB_NAME = os.getenv("DB_NAME", "overwall_db")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
 
 try: SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", 0))
 except ValueError: SUPER_ADMIN_ID = 0
@@ -57,7 +58,7 @@ def clean_num(text):
 # ================= توابع دیتابیس =================
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(user=DB_USER, password=DB_PASS, database=DB_NAME, host=DB_HOST)
+    db_pool = await asyncpg.create_pool(user=DB_USER, password=DB_PASS, database=DB_NAME, host=DB_HOST, port=DB_PORT)
     async with db_pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, balance BIGINT DEFAULT 0, nickname TEXT, role TEXT DEFAULT 'normal', can_bulk BOOLEAN DEFAULT FALSE)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, user_id BIGINT, config_link TEXT, date TEXT)''')
@@ -97,6 +98,32 @@ async def get_user(user_id):
 async def update_balance(user_id, new_balance):
     async with db_pool.acquire() as conn: await conn.execute("UPDATE users SET balance = $1 WHERE user_id = $2", new_balance, user_id)
 
+async def deduct_balance(user_id, amount):
+    """کسر اتمیک موجودی. فقط در صورتی کم می‌کند که موجودی کافی باشد.
+    خروجی: موجودی جدید در صورت موفقیت، یا None اگر موجودی کافی نبود."""
+    if amount <= 0:
+        return await get_balance(user_id)
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+        new_balance = await conn.fetchval(
+            "UPDATE users SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1 RETURNING balance",
+            amount, user_id,
+        )
+        return new_balance
+
+async def credit_balance(user_id, amount):
+    """افزودن اتمیک موجودی (برای شارژ/برگشت وجه). خروجی: موجودی جدید."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+        return await conn.fetchval(
+            "UPDATE users SET balance = balance + $1 WHERE user_id = $2 RETURNING balance",
+            amount, user_id,
+        )
+
+async def get_balance(user_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval("SELECT balance FROM users WHERE user_id = $1", user_id) or 0
+
 async def add_order(user_id, config_link):
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO orders (user_id, config_link, date) VALUES ($1, $2, $3)", user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -105,6 +132,23 @@ async def get_order_by_id(order_id):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT config_link, date FROM orders WHERE id = $1", int(order_id))
         return (row['config_link'], row['date']) if row else None
+
+async def order_belongs_to(order_id, user_id):
+    """آیا این سفارش متعلق به همین کاربر است؟"""
+    try:
+        oid = int(order_id)
+    except (TypeError, ValueError):
+        return False
+    async with db_pool.acquire() as conn:
+        owner = await conn.fetchval("SELECT user_id FROM orders WHERE id = $1", oid)
+    return owner is not None and owner == user_id
+
+async def ensure_order_access(query, order_id, admin_status):
+    """کنترل دسترسی به سفارش. ادمین‌ها به همه‌چیز دسترسی دارند؛ کاربر عادی فقط به سفارش خودش."""
+    if admin_status or await order_belongs_to(order_id, query.from_user.id):
+        return True
+    await query.answer("⛔️ این سفارش متعلق به شما نیست.", show_alert=True)
+    return False
 
 # ================= پنل X-UI =================
 class AsyncXuiAPI:
@@ -220,6 +264,9 @@ async def generate_orders_keyboard(orders, xui_api):
     return InlineKeyboardMarkup(keyboard)
 
 async def render_order_details(query, order_id, alert_msg=None):
+    if not await is_admin(query.from_user.id) and not await order_belongs_to(order_id, query.from_user.id):
+        await query.answer("⛔️ این سفارش متعلق به شما نیست.", show_alert=True)
+        return
     res = await get_order_by_id(order_id)
     if not res: 
         await query.answer("سفارش یافت نشد!", show_alert=True)
@@ -636,6 +683,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     # هندلرهای کاربری
     elif state.startswith('waiting_rename_'):
         order_id = state.split('_')[2]
+        if not admin_status and not await order_belongs_to(order_id, user_id):
+            context.user_data['state'] = 'none'
+            return await update.message.reply_text("⛔️ این سفارش متعلق به شما نیست.", reply_markup=await get_main_keyboard(user_id))
         if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) < 20:
             res = await get_order_by_id(order_id)
             if not res: return
@@ -794,6 +844,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ================= هندلرهای مدیریت سفارشات =================
     elif data.startswith("toggle_status_"):
         order_id = data.split("_")[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
         res = await get_order_by_id(order_id)
         if not res: return
         email = unquote(res[0].split("#")[-1])
@@ -809,6 +860,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif data.startswith("change_uuid_"):
         order_id = data.split("_")[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
         res = await get_order_by_id(order_id)
         if not res: return
         old_link, _ = res
@@ -828,6 +880,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("renew_menu_"):
         order_id = data.split("_")[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
         async with db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
         if not plans: return await query.answer("پلنی برای تمدید وجود ندارد!", show_alert=True)
         kb = []
@@ -840,6 +893,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("confirm_renew_"):
         parts = data.split("_")
         order_id = parts[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
         plan_id = int(parts[3])
         async with db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
         if not plan: return
@@ -855,36 +909,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("execute_renew_"):
         parts = data.split("_")
         order_id = parts[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
         plan_id = int(parts[3])
         async with db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
+        if not plan: return await query.answer("❌ پلن یافت نشد!", show_alert=True)
         price = plan['vip_price'] if role == 'vip' else plan['price']
-        
-        if balance < price: return await query.answer(f"❌ موجودی کم است!", show_alert=True)
-            
-        res = await get_order_by_id(order_id)
-        if not res: return
-        email = unquote(res[0].split("#")[-1])
-        xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
-        await query.edit_message_text("در حال انجام عملیات تمدید... ⏳")
-        is_logged, _ = await xui.login()
-        if is_logged:
+
+        if context.user_data.get('processing'):
+            return await query.answer("⏳ یک عملیات در حال انجام است، صبر کنید.", show_alert=True)
+        context.user_data['processing'] = True
+        try:
+            res = await get_order_by_id(order_id)
+            if not res: return
+            email = unquote(res[0].split("#")[-1])
+
+            # کسر اتمیک موجودی پیش از تماس با پنل
+            if await deduct_balance(user_id, price) is None:
+                return await query.answer("❌ موجودی کم است!", show_alert=True)
+
+            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+            await query.edit_message_text("در حال انجام عملیات تمدید... ⏳")
+            is_logged, _ = await xui.login()
+            if not is_logged:
+                await credit_balance(user_id, price)  # برگشت وجه
+                return await render_order_details(query, order_id, "❌ خطا در اتصال به پنل!")
+
             stats = await xui.get_client_stats(email)
             used_bytes = stats.get('up', 0) + stats.get('down', 0) if stats else 0
             inbound_id, port, client_dict = await xui.get_client_exact_info(email)
-            if client_dict:
-                client_dict['totalGB'] = used_bytes + (plan['gb'] * 1024 * 1024 * 1024)
-                client_dict['expiryTime'] = int((time.time() + (30 * 86400)) * 1000)
-                client_dict['enable'] = True 
-                if await xui.update_client(inbound_id, client_dict['id'], client_dict):
-                    await update_balance(user_id, balance - price)
-                    await render_order_details(query, order_id, f"✅ با موفقیت تمدید شد!")
-                else: await render_order_details(query, order_id, "❌ خطا: سرور درخواست تمدید را رد کرد!")
-            else: await render_order_details(query, order_id, "❌ کانفیگ در سرور یافت نشد!")
-        else: await render_order_details(query, order_id, "❌ خطا در اتصال به پنل!")
+            if not client_dict:
+                await credit_balance(user_id, price)  # برگشت وجه
+                return await render_order_details(query, order_id, "❌ کانفیگ در سرور یافت نشد!")
+
+            client_dict['totalGB'] = used_bytes + (plan['gb'] * 1024 * 1024 * 1024)
+            client_dict['expiryTime'] = int((time.time() + (30 * 86400)) * 1000)
+            client_dict['enable'] = True
+            if await xui.update_client(inbound_id, client_dict['id'], client_dict):
+                await render_order_details(query, order_id, f"✅ با موفقیت تمدید شد!")
+            else:
+                await credit_balance(user_id, price)  # برگشت وجه
+                await render_order_details(query, order_id, "❌ خطا: سرور درخواست تمدید را رد کرد!")
+        finally:
+            context.user_data['processing'] = False
 
     # ================= هندلر دریافت بارکد =================
     elif data.startswith("get_conf_"):
         order_id = data.split("_")[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
         res = await get_order_by_id(order_id)
         if res:
             config_link = res[0]
@@ -918,20 +989,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not plan: return await query.edit_message_text("❌ پلن یافت نشد.")
         
         price = custom['price'] if custom else (plan['vip_price'] if role == 'vip' else plan['price'])
-        
-        if balance < price: return await query.edit_message_text(f"❌ موجودی کافی نیست. (نیاز: {price:,})")
-            
-        await query.edit_message_text("در حال اتصال به سرور و استخراج پورت... ⏳")
-        xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
-        is_logged, login_err = await xui.login()
-        
-        if is_logged:
+
+        if context.user_data.get('processing'):
+            return await query.answer("⏳ یک عملیات در حال انجام است، صبر کنید.", show_alert=True)
+        context.user_data['processing'] = True
+        try:
+            # ابتدا موجودی به‌صورت اتمیک کسر می‌شود تا از کسر دوباره/همزمان جلوگیری شود
+            if await deduct_balance(user_id, price) is None:
+                return await query.edit_message_text(f"❌ موجودی کافی نیست. (نیاز: {price:,})")
+
+            await query.edit_message_text("در حال اتصال به سرور و استخراج پورت... ⏳")
+            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+            is_logged, login_err = await xui.login()
+
+            if not is_logged:
+                await credit_balance(user_id, price)  # برگشت وجه
+                return await query.edit_message_text(f"❌ خطا در لاگین به پنل سنایی.\nدلیل: {login_err}")
+
             port = await xui.get_inbound_port(plan['inbound_id'])
-            if not port: return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
-            
+            if not port:
+                await credit_balance(user_id, price)  # برگشت وجه
+                return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
+
             new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], 30, 1)
             if new_uuid:
-                await update_balance(user_id, balance - price)
                 config_link = f"vless://{new_uuid}@{CONFIG_IP}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={CONFIG_IP}#{final_name}"
                 await add_order(user_id, config_link)
                 
@@ -944,8 +1025,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except:
                     await query.edit_message_text(f"✅ خرید موفق!\n\n`{config_link}`{SECURITY_WARNING}", parse_mode='Markdown')
                 # ========================================
-            else: await query.edit_message_text(f"❌ سرور ساخت کانفیگ را رد کرد!\nارور: `{error_msg}`", parse_mode='Markdown')
-        else: await query.edit_message_text(f"❌ خطا در لاگین به پنل سنایی.\nدلیل: {login_err}")
+            else:
+                await credit_balance(user_id, price)  # برگشت وجه چون ساخت کانفیگ ناموفق بود
+                await query.edit_message_text(f"❌ سرور ساخت کانفیگ را رد کرد!\nارور: `{error_msg}`", parse_mode='Markdown')
+        finally:
+            context.user_data['processing'] = False
 
     elif data.startswith("bulkbuy_"):
         plan_id = data.split("_")[1]
@@ -968,13 +1052,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         unit_price = custom['bulk_price'] if custom else (plan['vip_bulk_price'] if role == 'vip' else plan['bulk_price'])
         total_price = unit_price * count
-        
-        if balance < total_price: return await query.edit_message_text("❌ موجودی کافی نیست!")
-            
-        await query.edit_message_text(f"در حال ساخت {count} کانفیگ... ⏳")
-        xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
-        is_logged, login_err = await xui.login()
-        if is_logged:
+
+        if context.user_data.get('processing'):
+            return await query.answer("⏳ یک عملیات در حال انجام است، صبر کنید.", show_alert=True)
+        context.user_data['processing'] = True
+        try:
+            # کل مبلغ به‌صورت اتمیک رزرو می‌شود؛ مابه‌التفاوت کانفیگ‌های ناموفق بعداً برگشت می‌خورد
+            if await deduct_balance(user_id, total_price) is None:
+                return await query.edit_message_text("❌ موجودی کافی نیست!")
+
+            await query.edit_message_text(f"در حال ساخت {count} کانفیگ... ⏳")
+            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+            is_logged, login_err = await xui.login()
+            if not is_logged:
+                await credit_balance(user_id, total_price)  # برگشت کل وجه
+                return await query.edit_message_text(f"❌ خطا در لاگین پنل: {login_err}")
+
             port = await xui.get_inbound_port(plan['inbound_id'])
             success_configs = []
             last_err = "نامشخص"
@@ -987,11 +1080,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await add_order(user_id, link)
                 else:
                     last_err = err
-                    
+
+            # برگشت وجهِ کانفیگ‌هایی که ساخته نشدند
+            actual_deduction = unit_price * len(success_configs)
+            refund = total_price - actual_deduction
+            if refund > 0:
+                await credit_balance(user_id, refund)
+
             if success_configs:
-                actual_deduction = unit_price * len(success_configs)
-                await update_balance(user_id, balance - actual_deduction)
-                
                 configs_text = "\n\n".join(success_configs)
                 file_in_ram = io.BytesIO(configs_text.encode('utf-8'))
                 file_in_ram.name = f"Configs_Bulk_{prefix}.txt"
@@ -1026,7 +1122,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # -------------------------------------------------------------
             else: 
                 await query.edit_message_text(f"❌ سرور پنل سنایی اجازه ساخت هیچ کانفیگی را نداد!\n\nدلیل خطای پنل: `{last_err}`\n\n⚠️ راهنمایی: احتمالاً کانفیگی با این اسم از قبل در پنل وجود دارد.", parse_mode='Markdown')
-        else: await query.edit_message_text(f"❌ خطا در لاگین پنل: {login_err}")
+        finally:
+            context.user_data['processing'] = False
 
     elif data.startswith("show_order_") or data.startswith("refresh_order_"):
         await render_order_details(query, data.split("_")[2])
@@ -1046,8 +1143,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = await conn.fetchval("SELECT status FROM receipts WHERE id = $1", receipt_id)
             if not res or res != 'pending': return await query.edit_message_caption(caption="⚠️ قبلاً بررسی شده.")
             await conn.execute("UPDATE receipts SET status = 'approved' WHERE id = $1", receipt_id)
-        cur_bal, _, _, _ = await get_user(uid)
-        await update_balance(uid, cur_bal + amt)
+        await credit_balance(uid, amt)
         await query.edit_message_caption(caption="✅ تایید شد.")
         try: await context.bot.send_message(chat_id=uid, text=f"🎉 حساب شما {amt:,} شارژ شد.")
         except: pass
