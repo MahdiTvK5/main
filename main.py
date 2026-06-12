@@ -65,7 +65,9 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS admins (user_id BIGINT PRIMARY KEY, name TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, status TEXT DEFAULT 'pending')''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS plans (id SERIAL PRIMARY KEY, name TEXT, gb INT, price BIGINT, vip_price BIGINT, bulk_price BIGINT, vip_bulk_price BIGINT, inbound_id INT)''')
+        await conn.execute('''CREATE TABLE IF NOT EXISTS plans (id SERIAL PRIMARY KEY, name TEXT, gb INT, price BIGINT, vip_price BIGINT, bulk_price BIGINT, vip_bulk_price BIGINT, inbound_id INT, duration_days INT DEFAULT 30)''')
+        # مهاجرت برای دیتابیس‌های قدیمی که هنوز ستون مدت‌زمان را ندارند
+        await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS duration_days INT DEFAULT 30")
         # جدول جدید برای قیمت‌های اختصاصی کاربران
         await conn.execute('''CREATE TABLE IF NOT EXISTS custom_prices (user_id BIGINT, plan_id INT, price BIGINT, bulk_price BIGINT, PRIMARY KEY(user_id, plan_id))''')
         
@@ -575,22 +577,22 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data['edit_plan_id'] = int(text)
             context.user_data['state'] = 'admin_waiting_edit_plan_data'
             
-            old_data = f"{p['name']} | {p['gb']} | {p['price']} | {p['vip_price']} | {p['bulk_price']} | {p['vip_bulk_price']} | {p['inbound_id']}"
-            await update.message.reply_text(f"✏️ لطفاً اطلاعات جدید را با فرمت زیر بفرستید:\n`نام | حجم | عادی | VIP | عمده | عمده VIP | اینباند`\n\nمقدار قبلی:\n`{old_data}`", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+            old_data = f"{p['name']} | {p['gb']} | {p['duration_days']} | {p['price']} | {p['vip_price']} | {p['bulk_price']} | {p['vip_bulk_price']} | {p['inbound_id']}"
+            await update.message.reply_text(f"✏️ لطفاً اطلاعات جدید را با فرمت زیر بفرستید:\n`نام | حجم | مدت(روز) | عادی | VIP | عمده | عمده VIP | اینباند`\n\nمقدار قبلی:\n`{old_data}`", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
         else: await update.message.reply_text("❌ فقط عدد بفرستید.")
         return
 
     if state == 'admin_waiting_edit_plan_data' and admin_status:
         try:
             parts = text.split('|')
-            if len(parts) != 7: raise ValueError
+            if len(parts) != 8: raise ValueError
             name = parts[0].strip()
             nums = [clean_num(x) for x in parts[1:]]
-            gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id = nums
+            gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id = nums
             plan_id = context.user_data['edit_plan_id']
             
             async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE plans SET name=$1, gb=$2, price=$3, vip_price=$4, bulk_price=$5, vip_bulk_price=$6, inbound_id=$7 WHERE id=$8", name, gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id, plan_id)
+                await conn.execute("UPDATE plans SET name=$1, gb=$2, duration_days=$3, price=$4, vip_price=$5, bulk_price=$6, vip_bulk_price=$7, inbound_id=$8 WHERE id=$9", name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, plan_id)
             context.user_data['state'] = 'none'
             await update.message.reply_text("✅ پلن با موفقیت ویرایش شد.", reply_markup=await get_main_keyboard(user_id))
         except: await update.message.reply_text("❌ فرمت اشتباه است!")
@@ -620,6 +622,10 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("🔢 **حجم** پلن را به گیگابایت وارد کنید (فقط عدد):", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'gb':
                 context.user_data['new_plan']['gb'] = clean_num(text)
+                context.user_data['state'] = 'plan_add_duration'
+                await update.message.reply_text("📅 **مدت‌زمان** پلن را به روز وارد کنید (مثلاً برای یک‌ماهه: 30):", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+            elif step == 'duration':
+                context.user_data['new_plan']['duration_days'] = clean_num(text)
                 context.user_data['state'] = 'plan_add_price'
                 await update.message.reply_text("💰 **قیمت عادی** را به تومان وارد کنید:", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'price':
@@ -642,7 +648,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 inbound = clean_num(text)
                 p = context.user_data['new_plan']
                 async with db_pool.acquire() as conn:
-                    await conn.execute("INSERT INTO plans (name, gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id) VALUES ($1, $2, $3, $4, $5, $6, $7)", p['name'], p['gb'], p['price'], p['vip_price'], p['bulk_price'], p['vip_bulk_price'], inbound)
+                    await conn.execute("INSERT INTO plans (name, gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id, duration_days) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", p['name'], p['gb'], p['price'], p['vip_price'], p['bulk_price'], p['vip_bulk_price'], inbound, p.get('duration_days', 30))
                 context.user_data['state'] = 'none'
                 await update.message.reply_text(f"✅ **پلن `{p['name']}` با موفقیت ذخیره شد!**", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
         except ValueError: await update.message.reply_text("❌ لطفاً فقط عدد وارد کنید!")
@@ -786,7 +792,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         async with db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY id ASC")
         msg = "📋 **لیست محصولات فعلی:**\n\n"
-        for p in plans: msg += f"🆔 `ID:{p['id']}` | {p['name']} | عادی: {p['price']:,} | اینباند: {p['inbound_id']}\n"
+        for p in plans: msg += f"🆔 `ID:{p['id']}` | {p['name']} | عادی: {p['price']:,} | مدت: {p['duration_days']}روز | اینباند: {p['inbound_id']}\n"
         await query.edit_message_text(msg if plans else "محصولی یافت نشد.", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     elif data == 'admin_edit_plan' and admin_status:
@@ -968,8 +974,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await credit_balance(user_id, price)  # برگشت وجه
                 return await render_order_details(query, order_id, "❌ کانفیگ در سرور یافت نشد!")
 
+            duration_days = plan['duration_days'] or 30
             client_dict['totalGB'] = used_bytes + (plan['gb'] * 1024 * 1024 * 1024)
-            client_dict['expiryTime'] = int((time.time() + (30 * 86400)) * 1000)
+            # تمدید از زمان فعلی یا از انقضای باقی‌مانده (هرکدام دیرتر) تا مدت پلن به سرویس اضافه شود
+            now_ms = int(time.time() * 1000)
+            base_ms = max(now_ms, client_dict.get('expiryTime', 0) or 0)
+            client_dict['expiryTime'] = base_ms + (duration_days * 86400 * 1000)
             client_dict['enable'] = True
             if await xui.update_client(inbound_id, client_dict['id'], client_dict):
                 await render_order_details(query, order_id, f"✅ با موفقیت تمدید شد!")
@@ -1038,7 +1048,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await credit_balance(user_id, price)  # برگشت وجه
                 return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
 
-            new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], 30, 1)
+            new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), 1)
             if new_uuid:
                 config_link = f"vless://{new_uuid}@{CONFIG_IP}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={CONFIG_IP}#{final_name}"
                 await add_order(user_id, config_link)
@@ -1100,7 +1110,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_err = "نامشخص"
             for i in range(start_n, end_n + 1):
                 name = f"{prefix}{i}{postfix}"
-                new_uuid, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], 30, 1)
+                new_uuid, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), 1)
                 if new_uuid:
                     link = f"vless://{new_uuid}@{CONFIG_IP}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={CONFIG_IP}#{name}"
                     success_configs.append(link)
