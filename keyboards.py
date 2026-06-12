@@ -3,7 +3,10 @@ from urllib.parse import unquote
 
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 
+import db
 from db import get_user, is_admin
+from panel import build_xui
+from config import PANEL_URL
 
 
 # ================= رابط کاربری =================
@@ -25,16 +28,27 @@ async def get_main_keyboard(user_id):
 CANCEL_MARKUP = ReplyKeyboardMarkup([['لغو ❌']], resize_keyboard=True)
 
 
-async def generate_orders_keyboard(orders, xui_api):
+async def generate_orders_keyboard(orders):
+    """orders: لیستی از ردیف‌ها شامل (id, config_link, date, panel_id).
+    آمار هر پنل فقط یک‌بار گرفته و بین سفارش‌های همان پنل به اشتراک گذاشته می‌شود."""
     keyboard = [[InlineKeyboardButton("وضعیت 🔎", callback_data='ignore'), InlineKeyboardButton("عنوان 📋", callback_data='ignore')]]
-    is_login, _ = await xui_api.login()
 
-    # به‌جای یک درخواست به‌ازای هر سفارش (N+1)، یک‌بار آمار همه‌ی کلاینت‌ها گرفته می‌شود
-    stats_map = await xui_api.get_all_client_stats() if is_login else None
+    recent = orders[-30:]
+    # برای هر پنلِ درگیر، یک‌بار آمار همه‌ی کلاینت‌ها را می‌گیریم
+    stats_by_panel = {}
+    for panel_id in {o[3] for o in recent}:
+        panel = await db.get_panel(panel_id) if panel_id else None
+        if panel is None and not PANEL_URL:
+            stats_by_panel[panel_id] = None
+            continue
+        xui, _ip = build_xui(panel)
+        is_login, _ = await xui.login()
+        stats_by_panel[panel_id] = await xui.get_all_client_stats() if is_login else None
 
-    for order_id, link, _ in orders[-30:]:
+    for order_id, link, _date, panel_id in recent:
         email = unquote(link.split("#")[-1]) if "#" in link else f"سرویس {order_id}"
-        if not is_login or stats_map is None:
+        stats_map = stats_by_panel.get(panel_id)
+        if stats_map is None:
             status_text = "خطا ⚠️"
         else:
             stats = stats_map.get(email.strip().lower())

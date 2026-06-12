@@ -5,6 +5,16 @@ import logging
 
 import httpx
 
+from config import PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP
+
+
+def build_xui(panel):
+    """از روی ردیف پنل، کلاینت X-UI و config_ip مربوطه را می‌سازد.
+    اگر panel برابر None باشد، به مقادیر پیش‌فرضِ .env برمی‌گردد (سازگاری با نسخه‌ی تک‌پنل)."""
+    if panel:
+        return AsyncXuiAPI(panel['url'], panel['username'], panel['password']), (panel['config_ip'] or CONFIG_IP)
+    return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), CONFIG_IP
+
 
 # ================= پنل X-UI =================
 class AsyncXuiAPI:

@@ -21,8 +21,14 @@ from db import (
     update_balance, deduct_balance, credit_balance, get_balance, add_order,
     get_order_by_id, order_belongs_to,
 )
-from panel import AsyncXuiAPI
+from panel import AsyncXuiAPI, build_xui
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
+
+
+async def get_order_xui(order_id):
+    """کلاینت X-UI و config_ip متناسب با پنلِ همان سفارش را برمی‌گرداند."""
+    panel = await db.get_panel(await db.get_order_panel_id(order_id))
+    return build_xui(panel)
 
 
 async def ensure_order_access(query, order_id, admin_status):
@@ -44,7 +50,7 @@ async def render_order_details(query, order_id, alert_msg=None):
         
     link, _ = res
     email = unquote(link.split("#")[-1])
-    xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+    xui, _ip = await get_order_xui(order_id)
     is_logged, _ = await xui.login()
     
     if not is_logged:
@@ -155,6 +161,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("مجوز عمده 📦", callback_data='admin_toggle_bulk'), InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip')],
                 [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
                 [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
+                [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels')],
                 [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
             ]
             if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
@@ -196,12 +203,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("📦 لطفاً پلن خرید گروهی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'سفارشات من 📦':
-            async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date FROM orders WHERE user_id = $1", user_id)
+            async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
             if not orders: return await update.message.reply_text("📦 شما سفارشی ندارید.")
             
             wait_msg = await update.message.reply_text("در حال دریافت وضعیت از سرور... ⏳")
-            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
-            keyboard = await generate_orders_keyboard(orders, xui)
+            keyboard = await generate_orders_keyboard(orders)
             await wait_msg.edit_text(f"✅ سفارش خود را انتخاب کنید (۳۰ سرویس اخیر):", reply_markup=keyboard)
         return
 
@@ -227,32 +233,49 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             config_emails = parts[1:]
             
             await update.message.reply_text(f"در حال جستجو و ایمپورت {len(config_emails)} کانفیگ در سرور... ⏳")
-            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
-            is_logged, _ = await xui.login()
-            
-            if is_logged:
+            # کانفیگ در تمام پنل‌های موجود جستجو می‌شود
+            panels = await db.get_panels()
+            panel_clients = []  # (panel_row_or_None, xui, config_ip, is_logged)
+            if panels:
+                for prow in panels:
+                    x, ip = build_xui(prow)
+                    ok, _ = await x.login()
+                    panel_clients.append((prow, x, ip, ok))
+            else:
+                x, ip = build_xui(None)
+                ok, _ = await x.login()
+                panel_clients.append((None, x, ip, ok))
+
+            if not any(pc[3] for pc in panel_clients):
+                await update.message.reply_text("❌ خطا در اتصال به پنل X-UI.", reply_markup=await get_main_keyboard(user_id))
+            else:
                 success_count = 0
                 failed_emails = []
-                await get_user(target_user_id) 
-                
+                await get_user(target_user_id)
+
                 for email in config_emails:
-                    inbound_id, port, client_dict = await xui.get_client_exact_info(email)
-                    if client_dict:
-                        client_uuid = client_dict['id']
-                        real_email_from_panel = client_dict.get('email', email)
-                        config_link = f"vless://{client_uuid}@{CONFIG_IP}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={CONFIG_IP}#{real_email_from_panel}"
-                        await add_order(target_user_id, config_link)
-                        success_count += 1
-                    else:
+                    found = False
+                    for prow, x, ip, ok in panel_clients:
+                        if not ok:
+                            continue
+                        inbound_id, port, client_dict = await x.get_client_exact_info(email)
+                        if client_dict:
+                            client_uuid = client_dict['id']
+                            real_email_from_panel = client_dict.get('email', email)
+                            pid = prow['id'] if prow else None
+                            config_link = f"vless://{client_uuid}@{ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={ip}#{real_email_from_panel}"
+                            await add_order(target_user_id, config_link, pid)
+                            success_count += 1
+                            found = True
+                            break
+                    if not found:
                         failed_emails.append(email)
-                        
+
                 context.user_data['state'] = 'none'
                 report = f"✅ عملیات ایمپورت پایان یافت.\n\n📦 تعداد موفق: {success_count}\n"
                 if failed_emails:
                     report += f"❌ یافت نشد (دقیقاً چک کنید): {', '.join(failed_emails)}"
                 await update.message.reply_text(report, reply_markup=await get_main_keyboard(user_id))
-            else:
-                await update.message.reply_text("❌ خطا در اتصال به پنل X-UI.", reply_markup=await get_main_keyboard(user_id))
         else:
             await update.message.reply_text("❌ فرمت اشتباه است! لطفاً اول آیدی عددی و سپس نام کانفیگ‌ها را بفرستید.")
         return
@@ -352,6 +375,34 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         except: await update.message.reply_text("❌ فرمت اشتباه است!")
         return
 
+    # ================= ماشین وضعیت افزودن پنل =================
+    if admin_status and state.startswith('panel_add_'):
+        step = state.split('_')[2]
+        if 'new_panel' not in context.user_data: context.user_data['new_panel'] = {}
+        np = context.user_data['new_panel']
+        if step == 'name':
+            np['name'] = text.strip()
+            context.user_data['state'] = 'panel_add_url'
+            await update.message.reply_text("🔗 آدرس کامل پنل (URL) را وارد کنید:\nمثال: `https://example.com:54321/abcd`", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+        elif step == 'url':
+            np['url'] = text.strip()
+            context.user_data['state'] = 'panel_add_user'
+            await update.message.reply_text("👤 نام کاربری پنل را وارد کنید:", reply_markup=CANCEL_MARKUP)
+        elif step == 'user':
+            np['username'] = text.strip()
+            context.user_data['state'] = 'panel_add_pass'
+            await update.message.reply_text("🔑 رمز عبور پنل را وارد کنید:", reply_markup=CANCEL_MARKUP)
+        elif step == 'pass':
+            np['password'] = text.strip()
+            context.user_data['state'] = 'panel_add_ip'
+            await update.message.reply_text("🌐 آی‌پی یا دامنه‌ای که در لینک کانفیگ (sni/host) استفاده شود را وارد کنید:", reply_markup=CANCEL_MARKUP)
+        elif step == 'ip':
+            np['config_ip'] = text.strip()
+            await db.add_panel(np['name'], np['url'], np['username'], np['password'], np['config_ip'])
+            context.user_data['state'] = 'none'
+            await update.message.reply_text(f"✅ پنل «{np['name']}» با موفقیت اضافه شد.", reply_markup=await get_main_keyboard(user_id))
+        return
+
     # ================= ماشین وضعیت برای افزودن پلن =================
     if admin_status and state.startswith('plan_add_'):
         step = state.split('_')[2]
@@ -388,14 +439,41 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             elif step == 'inbound':
                 inbound = clean_num(text)
                 p = context.user_data['new_plan']
+                p['inbound_id'] = inbound
+                panels = await db.get_panels()
+                if len(panels) <= 1:
+                    chosen_pid = panels[0]['id'] if panels else None
+                    async with db.db_pool.acquire() as conn:
+                        await conn.execute("INSERT INTO plans (name, gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id, duration_days, panel_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)", p['name'], p['gb'], p['price'], p['vip_price'], p['bulk_price'], p['vip_bulk_price'], inbound, p.get('duration_days', 30), chosen_pid)
+                    context.user_data['state'] = 'none'
+                    await update.message.reply_text(f"✅ **پلن `{p['name']}` با موفقیت ذخیره شد!**", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
+                else:
+                    context.user_data['state'] = 'plan_add_panel'
+                    lst = "\n".join([f"🆔 {pr['id']} - {pr['name']}" for pr in panels])
+                    await update.message.reply_text(f"🖥 این پلن روی کدام پنل ساخته شود؟ آیدی پنل را بفرستید:\n\n{lst}", reply_markup=CANCEL_MARKUP)
+            elif step == 'panel':
+                chosen_pid = clean_num(text)
+                panels = await db.get_panels()
+                if chosen_pid not in [pr['id'] for pr in panels]:
+                    return await update.message.reply_text("❌ آیدی پنل نامعتبر است. دوباره بفرستید:")
+                p = context.user_data['new_plan']
                 async with db.db_pool.acquire() as conn:
-                    await conn.execute("INSERT INTO plans (name, gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id, duration_days) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", p['name'], p['gb'], p['price'], p['vip_price'], p['bulk_price'], p['vip_bulk_price'], inbound, p.get('duration_days', 30))
+                    await conn.execute("INSERT INTO plans (name, gb, price, vip_price, bulk_price, vip_bulk_price, inbound_id, duration_days, panel_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)", p['name'], p['gb'], p['price'], p['vip_price'], p['bulk_price'], p['vip_bulk_price'], p['inbound_id'], p.get('duration_days', 30), chosen_pid)
                 context.user_data['state'] = 'none'
                 await update.message.reply_text(f"✅ **پلن `{p['name']}` با موفقیت ذخیره شد!**", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
         except ValueError: await update.message.reply_text("❌ لطفاً فقط عدد وارد کنید!")
         return
 
     # بقیه هندلرهای ادمین
+    if state == 'admin_waiting_del_panel' and admin_status:
+        if text.isdigit():
+            await db.delete_panel(int(text))
+            context.user_data['state'] = 'none'
+            await update.message.reply_text("✅ پنل حذف شد. (توجه: پلن‌ها و سفارش‌های متصل به این پنل باید به پنل دیگری منتقل شوند.)", reply_markup=await get_main_keyboard(user_id))
+        else:
+            await update.message.reply_text("❌ فقط عدد بفرستید.")
+        return
+
     if state == 'admin_waiting_del_plan' and admin_status:
         if text.isdigit():
             async with db.db_pool.acquire() as conn: await conn.execute("DELETE FROM plans WHERE id = $1", int(text))
@@ -467,7 +545,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             old_email = unquote(old_link.split("#")[-1])
 
             await update.message.reply_text("در حال اعمال تغییرات در سرور... ⏳")
-            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+            xui, _ip = await get_order_xui(order_id)
             is_logged, _ = await xui.login()
             if is_logged:
                 inbound_id, port, client_dict = await xui.get_client_exact_info(old_email)
@@ -521,6 +599,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("مجوز عمده 📦", callback_data='admin_toggle_bulk'), InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip')],
             [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
             [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
+            [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels')],
             [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
         ]
         if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
@@ -563,6 +642,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'admin_waiting_import'
         msg = "🔗 **ایمپورت کانفیگ (تکی یا گروهی)**\n\nلطفاً آیدی عددی کاربر و نام کانفیگ‌ها (Email) در سرور را بفرستید.\nخط اول آیدی کاربر، و در ادامه نام کانفیگ‌ها را با فاصله یا خط جدید وارد کنید.\n\nمثال:\n`123456789 ali_1 ali_2 ali_3`"
         await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_manage_panels' and admin_status:
+        panels = await db.get_panels()
+        msg = "🖥 **لیست پنل‌ها:**\n\n"
+        if panels:
+            for pr in panels:
+                msg += f"🆔 `ID:{pr['id']}` | {pr['name']} | {pr['url']} | IP: {pr['config_ip']}\n"
+        else:
+            msg += "هنوز پنلی ثبت نشده است.\n"
+        kb = [
+            [InlineKeyboardButton("➕ افزودن پنل", callback_data='admin_add_panel'), InlineKeyboardButton("🗑 حذف پنل", callback_data='admin_del_panel')],
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif data == 'admin_add_panel' and admin_status:
+        context.user_data['new_panel'] = {}
+        context.user_data['state'] = 'panel_add_name'
+        await query.message.reply_text("🖥 یک **نام** برای این پنل وارد کنید (مثلاً: سرور آلمان):", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+        await query.delete_message()
+
+    elif data == 'admin_del_panel' and admin_status:
+        context.user_data['state'] = 'admin_waiting_del_panel'
+        await query.message.reply_text("🗑 آیدی (ID) پنلی که می‌خواهید حذف شود را بفرستید:", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
     elif data == 'admin_add_plan' and admin_status:
@@ -622,7 +725,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = await get_order_by_id(order_id)
         if not res: return
         email = unquote(res[0].split("#")[-1])
-        xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+        xui, _ip = await get_order_xui(order_id)
         is_logged, _ = await xui.login()
         if is_logged:
             inbound_id, port, client_dict = await xui.get_client_exact_info(email)
@@ -639,7 +742,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not res: return
         old_link, _ = res
         email = unquote(old_link.split("#")[-1])
-        xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+        xui, _ip = await get_order_xui(order_id)
         is_logged, _ = await xui.login()
         if is_logged:
             inbound_id, port, client_dict = await xui.get_client_exact_info(email)
@@ -701,7 +804,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await deduct_balance(user_id, price) is None:
                 return await query.answer("❌ موجودی کم است!", show_alert=True)
 
-            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+            xui, _ip = await get_order_xui(order_id)
             await query.edit_message_text("در حال انجام عملیات تمدید... ⏳")
             is_logged, _ = await xui.login()
             if not is_logged:
@@ -777,7 +880,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await query.edit_message_text(f"❌ موجودی کافی نیست. (نیاز: {price:,})")
 
             await query.edit_message_text("در حال اتصال به سرور و استخراج پورت... ⏳")
-            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+            panel = await db.get_panel(plan['panel_id'])
+            xui, cfg_ip = build_xui(panel)
+            order_panel_id = panel['id'] if panel else None
             is_logged, login_err = await xui.login()
 
             if not is_logged:
@@ -791,8 +896,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), 1)
             if new_uuid:
-                config_link = f"vless://{new_uuid}@{CONFIG_IP}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={CONFIG_IP}#{final_name}"
-                await add_order(user_id, config_link)
+                config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{final_name}"
+                await add_order(user_id, config_link, order_panel_id)
                 
                 # ====== ارسال بارکد برای خرید تکی ======
                 encoded_url = urllib.parse.quote(config_link)
@@ -840,7 +945,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await query.edit_message_text("❌ موجودی کافی نیست!")
 
             await query.edit_message_text(f"در حال ساخت {count} کانفیگ... ⏳")
-            xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+            panel = await db.get_panel(plan['panel_id'])
+            xui, cfg_ip = build_xui(panel)
+            order_panel_id = panel['id'] if panel else None
             is_logged, login_err = await xui.login()
             if not is_logged:
                 await credit_balance(user_id, total_price)  # برگشت کل وجه
@@ -853,9 +960,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = f"{prefix}{i}{postfix}"
                 new_uuid, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), 1)
                 if new_uuid:
-                    link = f"vless://{new_uuid}@{CONFIG_IP}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={CONFIG_IP}#{name}"
+                    link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{name}"
                     success_configs.append(link)
-                    await add_order(user_id, link)
+                    await add_order(user_id, link, order_panel_id)
                 else:
                     last_err = err
 
@@ -907,9 +1014,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_order_details(query, data.split("_")[2])
         
     elif data == 'back_to_orders':
-        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date FROM orders WHERE user_id = $1", user_id)
-        xui = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
-        keyboard = await generate_orders_keyboard(orders, xui)
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        keyboard = await generate_orders_keyboard(orders)
         await query.edit_message_text("✅ سرویس خود را انتخاب کنید:", reply_markup=keyboard)
 
     elif data.startswith("approve_") and admin_status:
