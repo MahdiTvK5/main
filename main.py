@@ -1,3 +1,5 @@
+import os
+import asyncio
 import uuid
 import time
 import datetime
@@ -14,6 +16,7 @@ from telegram.request import HTTPXRequest
 from config import (
     TOKEN, PROXY_URL, SUPER_ADMIN_ID, PANEL_URL, PANEL_USER, PANEL_PASS,
     CONFIG_IP, SECURITY_WARNING, format_size, clean_num,
+    DB_USER, DB_PASS, DB_NAME, DB_HOST, DB_PORT,
 )
 import db
 from db import (
@@ -313,6 +316,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
                 [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
                 [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
+                [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
                 [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
             ]
             if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
@@ -946,6 +950,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
             [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
             [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
+            [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
             [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
         ]
         if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
@@ -1110,6 +1115,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👛 مجموع موجودی کیف‌پول کاربران: {r['balances']:,} تومان"
         )
         await query.edit_message_text(msg, parse_mode='Markdown')
+
+    elif data == 'admin_backup_menu' and admin_status:
+        enabled = (await get_setting('backup_enabled')) == 'on'
+        status = "🟢 روشن" if enabled else "🔴 خاموش"
+        msg = f"💾 **بکاپ دیتابیس**\n\nبکاپ خودکار روزانه: {status}\n(بکاپ به همه‌ی ادمین‌ها ارسال می‌شود)"
+        kb = [
+            [InlineKeyboardButton("⬇️ بکاپ فوری", callback_data='admin_backup_now')],
+            [InlineKeyboardButton(("🔴 خاموش کن" if enabled else "🟢 روشن کن"), callback_data='admin_backup_toggle')],
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif data == 'admin_backup_toggle' and admin_status:
+        cur = (await get_setting('backup_enabled')) == 'on'
+        await update_setting('backup_enabled', 'off' if cur else 'on')
+        enabled = not cur
+        status = "🟢 روشن" if enabled else "🔴 خاموش"
+        msg = f"💾 **بکاپ دیتابیس**\n\nبکاپ خودکار روزانه: {status}\n(بکاپ به همه‌ی ادمین‌ها ارسال می‌شود)"
+        kb = [
+            [InlineKeyboardButton("⬇️ بکاپ فوری", callback_data='admin_backup_now')],
+            [InlineKeyboardButton(("🔴 خاموش کن" if enabled else "🟢 روشن کن"), callback_data='admin_backup_toggle')],
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif data == 'admin_backup_now' and admin_status:
+        await query.answer("در حال تهیه بکاپ... ⏳")
+        await _send_backup_to(context, user_id)
 
     elif data == 'admin_gift_menu' and admin_status:
         codes = await db.list_gift_codes()
@@ -1599,6 +1630,58 @@ async def _notify_user(context, order_row, text):
         pass
 
 
+async def make_backup_bytes():
+    """با pg_dump یک بکاپ متنی از دیتابیس می‌سازد. خروجی: (data_bytes, error_str)."""
+    env = os.environ.copy()
+    env['PGPASSWORD'] = DB_PASS
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'pg_dump', '-h', DB_HOST, '-p', str(DB_PORT), '-U', DB_USER, '-d', DB_NAME,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            return None, (err.decode(errors='ignore')[:500] or 'pg_dump failed')
+        return out, None
+    except FileNotFoundError:
+        return None, "ابزار pg_dump روی سرور نصب نیست (بسته‌ی postgresql-client را نصب کنید)."
+    except Exception as e:
+        return None, str(e)
+
+
+async def _send_backup_to(context, chat_id):
+    data, err = await make_backup_bytes()
+    if not data:
+        try: await context.bot.send_message(chat_id, f"❌ بکاپ ناموفق: {err}")
+        except Exception: pass
+        return False
+    bio = io.BytesIO(data)
+    bio.name = f"backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.sql"
+    try:
+        await context.bot.send_document(chat_id, document=bio, caption="💾 بکاپ دیتابیس")
+        return True
+    except Exception:
+        return False
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE):
+    if (await get_setting('backup_enabled')) != 'on':
+        return
+    admins = await db.get_all_admins()
+    data, err = await make_backup_bytes()
+    for a in admins:
+        if not a:
+            continue
+        if not data:
+            try: await context.bot.send_message(a, f"❌ بکاپ خودکار ناموفق: {err}")
+            except Exception: pass
+            continue
+        bio = io.BytesIO(data)
+        bio.name = f"backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.sql"
+        try: await context.bot.send_document(a, document=bio, caption="💾 بکاپ خودکار دیتابیس")
+        except Exception: pass
+
+
 async def notify_job(context: ContextTypes.DEFAULT_TYPE):
     """به‌صورت دوره‌ای سرویس‌های نزدیک به انقضا یا اتمام حجم را پیدا و به کاربر اطلاع می‌دهد."""
     from collections import defaultdict
@@ -1661,6 +1744,8 @@ def main():
     # اجرای دوره‌ای هشدار انقضا/اتمام حجم (هر ۶ ساعت)
     if app.job_queue:
         app.job_queue.run_repeating(notify_job, interval=21600, first=120)
+        # بکاپ خودکار دیتابیس (هر ۲۴ ساعت)
+        app.job_queue.run_repeating(backup_job, interval=86400, first=300)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':

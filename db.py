@@ -70,6 +70,8 @@ async def init_db():
         await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS expiry_notified BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS lowdata_notified BOOLEAN DEFAULT FALSE")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('notify_days', '3') ON CONFLICT DO NOTHING")
+        # ===== بکاپ خودکار =====
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('backup_enabled', 'off') ON CONFLICT DO NOTHING")
 
         await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
