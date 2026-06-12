@@ -175,7 +175,8 @@ class AsyncXuiAPI:
                 if res.status_code == 200:
                     for inbound in res.json().get('obj', []):
                         if int(inbound.get('id')) == int(inbound_id): return inbound.get('port')
-            except Exception: pass
+            except Exception as e:
+                logging.warning("get_inbound_port failed: %s", e)
         return None
 
     async def add_client(self, inbound_id, client_email, total_gb, expire_days, limit_ip=1):
@@ -199,7 +200,8 @@ class AsyncXuiAPI:
             try:
                 res = await client.get(f"{self.url}/panel/api/inbounds/getClientTraffics/{email}")
                 if res.status_code == 200 and res.json().get('success'): return res.json().get('obj', {})
-            except Exception: pass
+            except Exception as e:
+                logging.warning("get_client_stats failed: %s", e)
         return None
 
     async def get_all_client_stats(self):
@@ -215,7 +217,8 @@ class AsyncXuiAPI:
                             email = str(cs.get('email', '')).strip().lower()
                             if email:
                                 result[email] = cs
-            except Exception:
+            except Exception as e:
+                logging.warning("get_all_client_stats failed: %s", e)
                 return None
         return result
 
@@ -231,7 +234,8 @@ class AsyncXuiAPI:
                             c_email = str(c.get('email', '')).strip().lower()
                             if c_email == target_email: 
                                 return inbound.get('id'), inbound.get('port'), c
-            except Exception: pass
+            except Exception as e:
+                logging.warning("get_client_exact_info failed: %s", e)
         return None, None, None
 
     async def update_client(self, inbound_id, old_uuid, client_dict):
@@ -240,7 +244,9 @@ class AsyncXuiAPI:
             try:
                 res = await client.post(f"{self.url}/panel/api/inbounds/updateClient/{old_uuid}", json=payload, headers={'Accept': 'application/json'})
                 return res.status_code == 200 and res.json().get('success', False)
-            except Exception: return False
+            except Exception as e:
+                logging.warning("update_client failed: %s", e)
+                return False
 
 # ================= رابط کاربری =================
 async def get_main_keyboard(user_id):
@@ -1183,15 +1189,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_db(app: Application):
     await init_db()
-    print("🚀 ربات با موفقیت استارت شد...")
+    logging.info("🚀 ربات با موفقیت استارت شد...")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """هندلر سراسری خطا تا استثناهای مدیریت‌نشده لاگ شوند به‌جای اینکه بی‌صدا گم شوند."""
+    logging.error("استثنای مدیریت‌نشده هنگام پردازش آپدیت", exc_info=context.error)
 
 def main():
+    if not TOKEN:
+        raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده است.")
     # تنظیم دقیق و استاندارد پروکسی برای python-telegram-bot
     req = HTTPXRequest(proxy=PROXY_URL, connect_timeout=30.0, read_timeout=30.0) if PROXY_URL else HTTPXRequest(connect_timeout=30.0)
     
     # ساخت ربات و اعمال تنظیمات
     app = Application.builder().token(TOKEN).request(req).post_init(setup_db).build()
     
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_all_messages))
     app.add_handler(CallbackQueryHandler(button_handler))
