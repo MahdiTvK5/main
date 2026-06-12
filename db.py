@@ -44,9 +44,18 @@ async def init_db():
             await conn.execute("UPDATE plans SET panel_id = $1 WHERE panel_id IS NULL", default_panel_id)
             await conn.execute("UPDATE orders SET panel_id = $1 WHERE panel_id IS NULL", default_panel_id)
 
+        # ===== اکانت تست =====
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS got_test BOOLEAN DEFAULT FALSE")
+
         await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('support_id', '@khodehamed') ON CONFLICT DO NOTHING")
+        # تنظیمات پیش‌فرض اکانت تست
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('test_enabled', 'off') ON CONFLICT DO NOTHING")
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('test_gb', '1') ON CONFLICT DO NOTHING")
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('test_days', '1') ON CONFLICT DO NOTHING")
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('test_panel_id', '') ON CONFLICT DO NOTHING")
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('test_inbound_id', '') ON CONFLICT DO NOTHING")
 
 
 async def is_admin(user_id):
@@ -159,6 +168,17 @@ async def delete_panel(panel_id):
 async def get_default_panel_id():
     async with db_pool.acquire() as conn:
         return await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
+
+
+# ================= اکانت تست =================
+async def has_test(user_id):
+    async with db_pool.acquire() as conn:
+        return bool(await conn.fetchval("SELECT got_test FROM users WHERE user_id = $1", user_id))
+
+
+async def mark_test_used(user_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET got_test = TRUE WHERE user_id = $1", user_id)
 
 
 async def order_belongs_to(order_id, user_id):
