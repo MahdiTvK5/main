@@ -47,6 +47,16 @@ async def init_db():
         # ===== اکانت تست =====
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS got_test BOOLEAN DEFAULT FALSE")
 
+        # ===== تاریخچه تراکنش‌ها =====
+        await conn.execute('''CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            amount BIGINT,
+            kind TEXT,
+            description TEXT,
+            date TIMESTAMP DEFAULT NOW()
+        )''')
+
         await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('support_id', '@khodehamed') ON CONFLICT DO NOTHING")
@@ -94,7 +104,7 @@ async def update_balance(user_id, new_balance):
         await conn.execute("UPDATE users SET balance = $1 WHERE user_id = $2", new_balance, user_id)
 
 
-async def deduct_balance(user_id, amount):
+async def deduct_balance(user_id, amount, kind='خرید', description=''):
     """کسر اتمیک موجودی. فقط در صورتی کم می‌کند که موجودی کافی باشد.
     خروجی: موجودی جدید در صورت موفقیت، یا None اگر موجودی کافی نبود."""
     if amount <= 0:
@@ -105,17 +115,41 @@ async def deduct_balance(user_id, amount):
             "UPDATE users SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1 RETURNING balance",
             amount, user_id,
         )
+        if new_balance is not None:
+            await conn.execute("INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)", user_id, -amount, kind, description)
         return new_balance
 
 
-async def credit_balance(user_id, amount):
+async def credit_balance(user_id, amount, kind='شارژ حساب', description=''):
     """افزودن اتمیک موجودی (برای شارژ/برگشت وجه). خروجی: موجودی جدید."""
     async with db_pool.acquire() as conn:
         await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-        return await conn.fetchval(
+        nb = await conn.fetchval(
             "UPDATE users SET balance = balance + $1 WHERE user_id = $2 RETURNING balance",
             amount, user_id,
         )
+        await conn.execute("INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)", user_id, amount, kind, description)
+        return nb
+
+
+async def get_user_transactions(user_id, limit=15):
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT amount, kind, description, date FROM transactions WHERE user_id = $1 ORDER BY id DESC LIMIT $2",
+            user_id, limit,
+        )
+
+
+async def get_sales_report():
+    async with db_pool.acquire() as conn:
+        topup = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'شارژ حساب'")
+        spent = await conn.fetchval("SELECT COALESCE(-SUM(amount), 0) FROM transactions WHERE amount < 0")
+        today_spent = await conn.fetchval("SELECT COALESCE(-SUM(amount), 0) FROM transactions WHERE amount < 0 AND date::date = CURRENT_DATE")
+        refunds = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'برگشت وجه'")
+        orders = await conn.fetchval("SELECT COUNT(*) FROM orders")
+        users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        balances = await conn.fetchval("SELECT COALESCE(SUM(balance), 0) FROM users")
+    return dict(topup=int(topup), spent=int(spent), today_spent=int(today_spent), refunds=int(refunds), orders=int(orders), users=int(users), balances=int(balances))
 
 
 async def get_balance(user_id):
