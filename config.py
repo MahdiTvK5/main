@@ -41,6 +41,15 @@ PANEL_USER = os.getenv("PANEL_USER")
 PANEL_PASS = os.getenv("PANEL_PASS")
 CONFIG_IP = os.getenv("CONFIG_IP")
 
+# ===== پنل وب مدیریت =====
+# اگر رمز تنظیم نشده باشد، پنل وب اجرا نمی‌شود.
+WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
+try:
+    WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+except ValueError:
+    WEB_PORT = 8080
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+
 SECURITY_WARNING = "\n\n⚠️ **هشدار امنیتی بسیار مهم:**\nلطفاً از ارسال لینک در پیام‌رسان‌های داخلی جداً خودداری کنید."
 
 

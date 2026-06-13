@@ -150,6 +150,35 @@ async def credit_balance(user_id, amount, kind='شارژ حساب', description=
         return nb
 
 
+async def list_users(search=None, limit=100):
+    async with db_pool.acquire() as conn:
+        if search:
+            like = f"%{search}%"
+            return await conn.fetch(
+                "SELECT user_id, balance, nickname, role, can_bulk FROM users WHERE CAST(user_id AS TEXT) LIKE $1 OR nickname ILIKE $1 ORDER BY user_id DESC LIMIT $2",
+                like, limit,
+            )
+        return await conn.fetch("SELECT user_id, balance, nickname, role, can_bulk FROM users ORDER BY user_id DESC LIMIT $1", limit)
+
+
+async def list_recent_orders(limit=50, search=None):
+    async with db_pool.acquire() as conn:
+        if search:
+            like = f"%{search}%"
+            return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders WHERE config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1 ORDER BY id DESC LIMIT $2", like, limit)
+        return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders ORDER BY id DESC LIMIT $1", limit)
+
+
+async def list_recent_transactions(limit=50):
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT user_id, amount, kind, description, date FROM transactions ORDER BY id DESC LIMIT $1", limit)
+
+
+async def list_plans():
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM plans ORDER BY id ASC")
+
+
 async def get_user_transactions(user_id, limit=15):
     async with db_pool.acquire() as conn:
         return await conn.fetch(
