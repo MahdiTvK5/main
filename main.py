@@ -34,6 +34,26 @@ async def get_order_xui(order_id):
     return build_xui(panel)
 
 
+# ================= محدودیت نرخ (ضدِ اسپم) =================
+from collections import defaultdict, deque
+
+_RATE_LIMIT = 10        # حداکثر تعداد رویداد
+_RATE_WINDOW = 5.0      # در این بازه (ثانیه)
+_user_hits = defaultdict(deque)
+
+
+def _rate_ok(user_id):
+    """پنجره‌ی لغزان ساده برای جلوگیری از اسپم و فشار روی دیتابیس/پنل."""
+    now = time.monotonic()
+    dq = _user_hits[user_id]
+    while dq and now - dq[0] > _RATE_WINDOW:
+        dq.popleft()
+    if len(dq) >= _RATE_LIMIT:
+        return False
+    dq.append(now)
+    return True
+
+
 # فیلدهای قابل‌ویرایش پلن: (کلید، برچسب، ستون دیتابیس، عددی‌بودن)
 PLAN_FIELDS = [
     ("name", "نام", "name", False),
@@ -206,6 +226,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
     user_id = update.message.from_user.id
+    if not _rate_ok(user_id):
+        return  # ضدِ اسپم: پیام‌های اضافی بی‌صدا نادیده گرفته می‌شوند
     balance, nickname, role, can_bulk = await get_user(user_id)
     state = context.user_data.get('state', 'none')
     admin_status = await is_admin(user_id)
@@ -933,8 +955,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
+    if not _rate_ok(user_id):
+        try: await query.answer("⏳ کمی آرام‌تر! لطفاً چند لحظه صبر کنید.", show_alert=False)
+        except Exception: pass
+        return
+    await query.answer()
     data = query.data
     admin_status = await is_admin(user_id)
     balance, nickname, role, can_bulk = await get_user(user_id)
@@ -1447,6 +1473,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if new_uuid:
                 config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{final_name}"
                 await add_order(user_id, config_link, order_panel_id)
+                logging.info("PURCHASE user=%s plan=%s price=%s name=%s", user_id, plan_id, price, final_name)
 
                 # اگر پنل لینک ساب داشته باشد، آن را لینک اصلی قرار می‌دهیم
                 sub = sub_link_for(panel, final_name)
@@ -1606,6 +1633,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not res or res != 'pending': return await query.edit_message_caption(caption="⚠️ قبلاً بررسی شده.")
             await conn.execute("UPDATE receipts SET status = 'approved' WHERE id = $1", receipt_id)
         await credit_balance(uid, amt)
+        logging.info("CHARGE_APPROVED admin=%s user=%s amount=%s receipt=%s", user_id, uid, amt, receipt_id)
         await query.edit_message_caption(caption="✅ تایید شد.")
         try: await context.bot.send_message(chat_id=uid, text=f"🎉 حساب شما {amt:,} شارژ شد.")
         except: pass
@@ -1746,11 +1774,11 @@ async def notify_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده است.")
-    # تنظیم دقیق و استاندارد پروکسی برای python-telegram-bot
-    req = HTTPXRequest(proxy=PROXY_URL, connect_timeout=30.0, read_timeout=30.0) if PROXY_URL else HTTPXRequest(connect_timeout=30.0)
-    
+    # تنظیم درخواست با pool بزرگ‌تر و درخواست اختصاصی getUpdates (پایداری بیشتر روی سرور ایران)
+    req = HTTPXRequest(connection_pool_size=20, proxy=PROXY_URL, connect_timeout=30.0, read_timeout=30.0) if PROXY_URL else HTTPXRequest(connection_pool_size=20, connect_timeout=30.0)
+
     # ساخت ربات و اعمال تنظیمات
-    app = Application.builder().token(TOKEN).request(req).post_init(setup_db).build()
+    app = Application.builder().token(TOKEN).request(req).get_updates_request(req).post_init(setup_db).build()
     
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
