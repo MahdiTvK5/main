@@ -2,13 +2,24 @@ import os
 import math
 import re
 import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+_LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+logging.basicConfig(format=_LOG_FORMAT, level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# لاگ روی فایل با چرخش خودکار (نگهداری تاریخچه‌ی فعالیت‌ها و خطاها)
+try:
+    _file_handler = RotatingFileHandler(os.path.join(BASE_DIR, "bot.log"), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    _file_handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(_file_handler)
+except Exception:
+    pass
 
 # ================= تنظیمات ثابت =================
 TOKEN = os.getenv("BOT_TOKEN")
