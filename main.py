@@ -1658,7 +1658,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_db(app: Application):
     await init_db()
+    # اجرای پنل وب مدیریت (در صورت تنظیم WEB_ADMIN_PASSWORD) داخل همان event loop
+    try:
+        import webpanel
+        app.bot_data['web_runner'] = await webpanel.start_web()
+    except Exception as e:
+        logging.error("راه‌اندازی پنل وب ناموفق بود: %s", e)
     logging.info("🚀 ربات با موفقیت استارت شد...")
+
+
+async def on_shutdown(app: Application):
+    runner = app.bot_data.get('web_runner')
+    if runner:
+        try:
+            await runner.cleanup()
+        except Exception:
+            pass
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """هندلر سراسری خطا تا استثناهای مدیریت‌نشده لاگ شوند به‌جای اینکه بی‌صدا گم شوند."""
@@ -1778,7 +1793,7 @@ def main():
     req = HTTPXRequest(connection_pool_size=20, proxy=PROXY_URL, connect_timeout=30.0, read_timeout=30.0) if PROXY_URL else HTTPXRequest(connection_pool_size=20, connect_timeout=30.0)
 
     # ساخت ربات و اعمال تنظیمات
-    app = Application.builder().token(TOKEN).request(req).get_updates_request(req).post_init(setup_db).build()
+    app = Application.builder().token(TOKEN).request(req).get_updates_request(req).post_init(setup_db).post_shutdown(on_shutdown).build()
     
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
