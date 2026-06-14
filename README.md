@@ -13,7 +13,42 @@
 - PostgreSQL
 - یک پنل X-UI در دسترس
 
-## نصب
+## نصب سریع روی سرور (از گیت)
+دیگر نیازی به آپلود/دانلود دستی نیست. روی سرور یک‌بار کلون کن و بعد فقط با `git` به‌روزرسانی کن.
+
+**۱) پیش‌نیازهای سیستمی (یک‌بار):**
+```bash
+sudo apt update && sudo apt install -y python3-venv git postgresql postgresql-client
+```
+
+**۲) گرفتن کد:**
+```bash
+git clone https://github.com/MahdiTvK5/main.git overwallbot
+cd overwallbot
+# اگر هنوز همه‌چیز در شاخه‌ی main مرج نشده، شاخه‌ای که همه‌ی امکانات را دارد چک‌اوت کن:
+# git checkout <نام-شاخه>
+```
+
+**۳) آماده‌سازی و پر کردن تنظیمات:**
+```bash
+bash deploy.sh      # ساخت venv + نصب وابستگی‌ها + ساخت .env
+nano .env           # مقادیر را پر کن (توکن، پنل، دیتابیس، WEB_ADMIN_PASSWORD و ...)
+```
+
+**۴) اجرا:**
+```bash
+bash run.sh                 # اجرای دستی (foreground)
+# یا اجرای دائمی به‌صورت سرویس (پیشنهادی):
+bash install_service.sh     # نصب سرویس systemd (خودکار با ریبوت/کرش بالا می‌آید)
+```
+
+**به‌روزرسانی بعدی (فقط همین):**
+```bash
+cd overwallbot && bash deploy.sh   # کد جدید را می‌گیرد و سرویس را ری‌استارت می‌کند
+```
+دستورهای سرویس: `systemctl status overwallbot` · `journalctl -u overwallbot -f` · `systemctl restart overwallbot`
+
+## نصب دستی (جایگزین)
 ```bash
 python -m venv .venv
 source .venv/bin/activate
