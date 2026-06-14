@@ -122,6 +122,28 @@ async def update_balance(user_id, new_balance):
         await conn.execute("UPDATE users SET balance = $1 WHERE user_id = $2", new_balance, user_id)
 
 
+async def get_user_row(user_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("SELECT user_id, balance, nickname, role, can_bulk FROM users WHERE user_id = $1", user_id)
+
+
+async def save_user(user_id, nickname, role, can_bulk, balance):
+    """ساخت یا ویرایش کاربر (upsert) از پنل وب."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO users (user_id, nickname, role, can_bulk, balance) VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (user_id) DO UPDATE SET nickname = $2, role = $3, can_bulk = $4, balance = $5""",
+            user_id, nickname, role, can_bulk, balance,
+        )
+
+
+async def delete_user(user_id):
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM custom_prices WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM users WHERE user_id = $1", user_id)
+
+
 async def deduct_balance(user_id, amount, kind='خرید', description=''):
     """کسر اتمیک موجودی. فقط در صورتی کم می‌کند که موجودی کافی باشد.
     خروجی: موجودی جدید در صورت موفقیت، یا None اگر موجودی کافی نبود."""
@@ -177,6 +199,41 @@ async def list_recent_transactions(limit=50):
 async def list_plans():
     async with db_pool.acquire() as conn:
         return await conn.fetch("SELECT * FROM plans ORDER BY id ASC")
+
+
+async def get_plan(plan_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
+
+
+async def create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            """INSERT INTO plans (name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id""",
+            name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+        )
+
+
+async def update_plan(plan_id, name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE plans SET name=$2, gb=$3, duration_days=$4, price=$5, vip_price=$6, bulk_price=$7, vip_bulk_price=$8, inbound_id=$9, panel_id=$10 WHERE id=$1""",
+            int(plan_id), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+        )
+
+
+async def delete_plan(plan_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM plans WHERE id = $1", int(plan_id))
+
+
+async def update_panel(panel_id, name, url, username, password, config_ip, sub_url):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE panels SET name=$2, url=$3, username=$4, password=$5, config_ip=$6, sub_url=$7 WHERE id=$1",
+            int(panel_id), name, url, username, password, config_ip, sub_url,
+        )
 
 
 async def get_user_transactions(user_id, limit=15):
