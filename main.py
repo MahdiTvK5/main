@@ -34,6 +34,27 @@ async def get_order_xui(order_id):
     return build_xui(panel)
 
 
+def can_buy_bulk(role, admin_status):
+    """خرید عمده فقط برای VIP و ادمین."""
+    return admin_status or role == 'vip'
+
+
+async def resolve_plan_price(user_id, plan, role, bulk=False):
+    """قیمت پلن با اولویت: قیمت اختصاصی ← VIP ← عادی."""
+    async with db.db_pool.acquire() as conn:
+        custom = await conn.fetchrow(
+            "SELECT price, bulk_price FROM custom_prices WHERE user_id=$1 AND plan_id=$2",
+            user_id, plan['id'],
+        )
+    if bulk:
+        if custom and custom['bulk_price'] is not None:
+            return int(custom['bulk_price'])
+        return int(plan['vip_bulk_price'] if role == 'vip' else plan['bulk_price'])
+    if custom and custom['price'] is not None:
+        return int(custom['price'])
+    return int(plan['vip_price'] if role == 'vip' else plan['price'])
+
+
 # ================= محدودیت نرخ (ضدِ اسپم) =================
 from collections import defaultdict, deque
 
@@ -334,8 +355,8 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton("محصولات و پلن‌ها 🛒", callback_data='admin_manage_plans')],
                 [InlineKeyboardButton("لیست VIP و ادمین‌ها 📋", callback_data='admin_list_specials')],
                 [InlineKeyboardButton("قیمت اختصاصی کاربر 💎", callback_data='admin_custom_price'), InlineKeyboardButton("کارت 💳", callback_data='admin_set_card')],
-                [InlineKeyboardButton("مجوز عمده 📦", callback_data='admin_toggle_bulk'), InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip')],
-                [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
+                [InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
+                [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast')],
                 [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
                 [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
                 [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
@@ -344,7 +365,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
             ]
             if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
-            await update.message.reply_text("⚙️ پنل مدیریت اختصاصی:", reply_markup=InlineKeyboardMarkup(kb))
+            await update.message.reply_text("⚙️ پنل مدیریت اختصاصی:\n(خرید عمده فقط برای کاربران VIP فعال است)", reply_markup=InlineKeyboardMarkup(kb))
             
         elif text == 'کیف پول من 💰':
             kb = [
@@ -362,28 +383,26 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             async with db.db_pool.acquire() as conn:
                 plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
-                customs = await conn.fetch("SELECT plan_id, price FROM custom_prices WHERE user_id = $1", user_id)
             if not plans: return await update.message.reply_text("🛒 هنوز هیچ محصولی اضافه نشده است.")
-            
-            custom_map = {c['plan_id']: c['price'] for c in customs}
             kb = []
             for p in plans:
-                price = custom_map.get(p['id'], p['vip_price'] if role == 'vip' else p['price'])
-                kb.append([InlineKeyboardButton(f"{p['name']} - {price:,} تومان", callback_data=f"prebuy_{p['id']}")])
+                price = await resolve_plan_price(user_id, p, role, bulk=False)
+                days = p['duration_days'] or 30
+                kb.append([InlineKeyboardButton(f"{p['name']} | {p['gb']}GB / {days}روز - {price:,} تومان", callback_data=f"prebuy_{p['id']}")])
             await update.message.reply_text("🛍 محصول مورد نظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
-        elif text == 'خرید عمده 📦' and (can_bulk or admin_status):
+        elif text == 'خرید عمده 📦':
+            if not can_buy_bulk(role, admin_status):
+                return await update.message.reply_text("❌ خرید عمده فقط برای کاربران VIP فعال است.")
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             async with db.db_pool.acquire() as conn:
                 plans = await conn.fetch("SELECT * FROM plans ORDER BY bulk_price ASC")
-                customs = await conn.fetch("SELECT plan_id, bulk_price FROM custom_prices WHERE user_id = $1", user_id)
             if not plans: return await update.message.reply_text("🛒 هیچ محصولی برای عمده موجود نیست.")
-            
-            custom_map = {c['plan_id']: c['bulk_price'] for c in customs}
             kb = []
             for p in plans:
-                price = custom_map.get(p['id'], p['vip_bulk_price'] if role == 'vip' else p['bulk_price'])
-                kb.append([InlineKeyboardButton(f"عمده {p['name']} - دونه‌ای {price:,}T", callback_data=f"bulkbuy_{p['id']}")])
+                price = await resolve_plan_price(user_id, p, role, bulk=True)
+                days = p['duration_days'] or 30
+                kb.append([InlineKeyboardButton(f"عمده {p['name']} | {p['gb']}GB / {days}روز - دونه‌ای {price:,}T", callback_data=f"bulkbuy_{p['id']}")])
             await update.message.reply_text("📦 لطفاً پلن خرید گروهی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'سفارشات من 📦':
@@ -510,20 +529,27 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ================= ماشین وضعیت خرید عمده مرحله‌ای =================
+    if state.startswith('bulk_waiting_'):
+        if not can_buy_bulk(role, admin_status):
+            context.user_data['state'] = 'none'
+            return await update.message.reply_text("❌ خرید عمده فقط برای کاربران VIP فعال است.", reply_markup=await get_main_keyboard(user_id))
+
     if state == 'bulk_waiting_prefix':
         context.user_data['b_prefix'] = text.strip().replace(" ", "_")
         context.user_data['state'] = 'bulk_waiting_start'
         await update.message.reply_text("🔢 شماره شروع را وارد کنید (مثلاً اگر میخواهید از ali1 شروع شود، بنویسید 1):", reply_markup=CANCEL_MARKUP)
-            
-    elif state == 'bulk_waiting_start':
+        return
+
+    if state == 'bulk_waiting_start':
         if text.isdigit():
             context.user_data['b_start'] = int(text)
             context.user_data['state'] = 'bulk_waiting_end'
             await update.message.reply_text("🔢 شماره پایان را وارد کنید (مثلاً اگر میخواهید تا ali10 ساخته شود، بنویسید 10):", reply_markup=CANCEL_MARKUP)
         else:
             await update.message.reply_text("❌ لطفاً فقط عدد وارد کنید.")
-            
-    elif state == 'bulk_waiting_end':
+        return
+
+    if state == 'bulk_waiting_end':
         if text.isdigit():
             end_n = int(text)
             start_n = context.user_data['b_start']
@@ -531,14 +557,15 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return await update.message.reply_text("❌ شماره پایان نمی‌تواند از شماره شروع کوچکتر باشد.")
             if (end_n - start_n) >= 100:
                 return await update.message.reply_text("❌ مجاز به ساخت حداکثر 100 کانفیگ در هر بار هستید.")
-            
+
             context.user_data['b_end'] = end_n
             context.user_data['state'] = 'bulk_waiting_postfix'
             await update.message.reply_text("🔡 پسوند (Postfix) را وارد کنید:\nاگر پسوند نمی‌خواهید کلمه `خیر` یا عدد `0` را بفرستید.", reply_markup=CANCEL_MARKUP)
         else:
             await update.message.reply_text("❌ لطفاً فقط عدد وارد کنید.")
+        return
 
-    elif state == 'bulk_waiting_postfix':
+    if state == 'bulk_waiting_postfix':
         postfix = "" if text in ['0', '-', 'ندارد', 'خیر'] else text.strip().replace(" ", "_")
         plan_id = context.user_data['b_plan']
         prefix = context.user_data['b_prefix']
@@ -551,15 +578,24 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         async with db.db_pool.acquire() as conn:
             plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
-            custom = await conn.fetchrow("SELECT bulk_price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, int(plan_id))
-        
-        unit_price = custom['bulk_price'] if custom else (plan['vip_bulk_price'] if role == 'vip' else plan['bulk_price'])
+        if not plan:
+            context.user_data['state'] = 'none'
+            return await update.message.reply_text("❌ پلن یافت نشد.", reply_markup=await get_main_keyboard(user_id))
+
+        unit_price = await resolve_plan_price(user_id, plan, role, bulk=True)
         total = unit_price * count
+        days = plan['duration_days'] or 30
 
         kb = [[InlineKeyboardButton("✅ تایید و ساخت", callback_data="confirm_execute_bulk")]]
-        msg = f"📦 **تعداد ساخت:** {count} عدد\nنمونه نام: `{prefix}{start_n}{postfix}`\nپلن: {plan['name']}\nقیمت کل: {total:,} تومان\n\nتایید می‌کنید؟"
+        msg = (
+            f"📦 **تعداد ساخت:** {count} عدد\n"
+            f"نمونه نام: `{prefix}{start_n}{postfix}`\n"
+            f"پلن: {plan['name']} ({plan['gb']}GB / {days}روز)\n"
+            f"قیمت واحد: {unit_price:,} | قیمت کل: {total:,} تومان\n\nتایید می‌کنید؟"
+        )
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
         context.user_data['state'] = 'none'
+        return
 
     # ================= ماشین وضعیت ویرایش پلن (تعاملی) =================
     if state == 'admin_waiting_edit_plan_id' and admin_status:
@@ -856,15 +892,6 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data['state'] = 'none'
             await update.message.reply_text("✅ پلن حذف شد.", reply_markup=await get_main_keyboard(user_id))
             
-    elif state == 'admin_waiting_bulk_id' and admin_status:
-        if text.isdigit():
-            async with db.db_pool.acquire() as conn:
-                current = await conn.fetchval("SELECT can_bulk FROM users WHERE user_id = $1", int(text))
-                if current is not None:
-                    await conn.execute("UPDATE users SET can_bulk = $1 WHERE user_id = $2", not current, int(text))
-                    await update.message.reply_text(f"✅ دسترسی عمده تغییر کرد.", reply_markup=await get_main_keyboard(user_id))
-            context.user_data['state'] = 'none'
-
     elif state == 'admin_waiting_vip_id' and admin_status:
         parts = text.split(maxsplit=1)
         if len(parts) >= 1 and parts[0].isdigit():
@@ -873,7 +900,10 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             async with db.db_pool.acquire() as conn:
                 await conn.execute("INSERT INTO users (user_id, nickname, role) VALUES ($1, $2, 'vip') ON CONFLICT (user_id) DO UPDATE SET role = 'vip', nickname = $2", uid, name)
             context.user_data['state'] = 'none'
-            await update.message.reply_text(f"✅ کاربر {name} VIP شد.", reply_markup=await get_main_keyboard(user_id))
+            await update.message.reply_text(
+                f"✅ کاربر {name} VIP شد.\n📦 دسترسی خرید عمده به‌صورت خودکار فعال است.",
+                reply_markup=await get_main_keyboard(user_id),
+            )
         else: await update.message.reply_text("❌ فرمت اشتباه! مثال: `123456789 علی`")
 
     elif state == 'admin_waiting_rem_vip' and admin_status:
@@ -943,13 +973,16 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) < 20:
             async with db.db_pool.acquire() as conn:
                 plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
-                custom = await conn.fetchrow("SELECT price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, plan_id)
             if not plan: return
-            
-            price = custom['price'] if custom else (plan['vip_price'] if role == 'vip' else plan['price'])
+
+            price = await resolve_plan_price(user_id, plan, role, bulk=False)
+            days = plan['duration_days'] or 30
             final_name = f"{user_id}_{text}"
             kb = [[InlineKeyboardButton("✅ تایید نهایی و پرداخت", callback_data=f"confirm_buy_{plan_id}_{final_name}")]]
-            await update.message.reply_text(f"اسم: `{final_name}`\nپلن: {plan['name']}\nقیمت: {price:,} تومان\nتایید خرید؟", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+            await update.message.reply_text(
+                f"اسم: `{final_name}`\nپلن: {plan['name']} ({plan['gb']}GB / {days}روز)\nقیمت: {price:,} تومان\nتایید خرید؟",
+                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
+            )
             context.user_data['state'] = 'none'
         else: await update.message.reply_text("❌ نامعتبر! فقط از حروف انگلیسی و اعداد استفاده کنید:")
 
@@ -976,8 +1009,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("محصولات و پلن‌ها 🛒", callback_data='admin_manage_plans')],
             [InlineKeyboardButton("لیست VIP و ادمین‌ها 📋", callback_data='admin_list_specials')],
             [InlineKeyboardButton("قیمت اختصاصی کاربر 💎", callback_data='admin_custom_price'), InlineKeyboardButton("کارت 💳", callback_data='admin_set_card')],
-            [InlineKeyboardButton("مجوز عمده 📦", callback_data='admin_toggle_bulk'), InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip')],
-            [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
+            [InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
+            [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast')],
             [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
             [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
             [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
@@ -1249,9 +1282,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.delete_message()
 
     elif data == 'admin_toggle_bulk' and admin_status:
-        context.user_data['state'] = 'admin_waiting_bulk_id'
-        await query.message.reply_text("👤 آیدی عددی کاربر را برای فعال/غیرفعال کردن قابلیت «خرید عمده» وارد کنید:", reply_markup=CANCEL_MARKUP)
-        await query.delete_message()
+        await query.answer("خرید عمده فقط با نقش VIP فعال است. کاربر را VIP کنید.", show_alert=True)
 
     elif data == 'admin_add_vip' and admin_status:
         context.user_data['state'] = 'admin_waiting_vip_id'
@@ -1332,10 +1363,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not plans: return await query.answer("پلنی برای تمدید وجود ندارد!", show_alert=True)
         kb = []
         for p in plans:
-            price = p['vip_price'] if role == 'vip' else p['price']
-            kb.append([InlineKeyboardButton(f"{p['name']} - {price:,} T", callback_data=f"confirm_renew_{order_id}_{p['id']}")])
+            price = await resolve_plan_price(user_id, p, role, bulk=False)
+            days = p['duration_days'] or 30
+            kb.append([InlineKeyboardButton(f"{p['name']} | {p['gb']}GB / {days}روز - {price:,} T", callback_data=f"confirm_renew_{order_id}_{p['id']}")])
         kb.append([InlineKeyboardButton("🔙 انصراف", callback_data=f'show_order_{order_id}')])
-        await query.edit_message_text("🔄 **بخش تمدید سرویس**\nلطفاً پلن جدید را برای این کانفیگ انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await query.edit_message_text(
+            "🔄 **بخش تمدید سرویس**\nبا تمدید، حجم و زمان سرویس مطابق پلن انتخابی **ریست** می‌شود.\nلطفاً پلن را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
+        )
 
     elif data.startswith("confirm_renew_"):
         parts = data.split("_")
@@ -1344,14 +1379,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_id = int(parts[3])
         async with db.db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
         if not plan: return
-        price = plan['vip_price'] if role == 'vip' else plan['price']
-        
-        if balance < price: 
+        price = await resolve_plan_price(user_id, plan, role, bulk=False)
+        days = plan['duration_days'] or 30
+
+        if balance < price:
             kb = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f'renew_menu_{order_id}')]]
             return await query.edit_message_text(f"❌ **موجودی حساب شما کافی نیست.**\nموجودی: {balance:,} | نیاز: {price:,}", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-            
+
         kb = [[InlineKeyboardButton("✅ تایید و اعمال تمدید", callback_data=f'execute_renew_{order_id}_{plan_id}')], [InlineKeyboardButton("❌ انصراف", callback_data=f'renew_menu_{order_id}')]]
-        await query.edit_message_text(f"آیا از اعمال پلن **{plan['name']}** روی این سرویس اطمینان دارید؟\nمبلغ کسر: **{price:,} تومان**", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await query.edit_message_text(
+            f"آیا از اعمال پلن **{plan['name']}** روی این سرویس اطمینان دارید؟\n"
+            f"💾 حجم جدید: **{plan['gb']} GB** (ریست کامل)\n"
+            f"📅 مدت جدید: **{days} روز** از همین الان\n"
+            f"💳 مبلغ کسر: **{price:,} تومان**",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
+        )
 
     elif data.startswith("execute_renew_"):
         parts = data.split("_")
@@ -1360,7 +1402,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_id = int(parts[3])
         async with db.db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
         if not plan: return await query.answer("❌ پلن یافت نشد!", show_alert=True)
-        price = plan['vip_price'] if role == 'vip' else plan['price']
+        price = await resolve_plan_price(user_id, plan, role, bulk=False)
 
         if context.user_data.get('processing'):
             return await query.answer("⏳ یک عملیات در حال انجام است، صبر کنید.", show_alert=True)
@@ -1378,28 +1420,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("در حال انجام عملیات تمدید... ⏳")
             is_logged, _ = await xui.login()
             if not is_logged:
-                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')
                 return await render_order_details(query, order_id, "❌ خطا در اتصال به پنل!")
 
-            stats = await xui.get_client_stats(email)
-            used_bytes = stats.get('up', 0) + stats.get('down', 0) if stats else 0
             inbound_id, port, client_dict = await xui.get_client_exact_info(email)
             if not client_dict:
-                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')
                 return await render_order_details(query, order_id, "❌ کانفیگ در سرور یافت نشد!")
 
+            # ریست کامل مطابق پلن: حجم = حجم پلن، مصرف صفر، انقضا = الان + مدت پلن
             duration_days = plan['duration_days'] or 30
-            client_dict['totalGB'] = used_bytes + (plan['gb'] * 1024 * 1024 * 1024)
-            # تمدید از زمان فعلی یا از انقضای باقی‌مانده (هرکدام دیرتر) تا مدت پلن به سرویس اضافه شود
-            now_ms = int(time.time() * 1000)
-            base_ms = max(now_ms, client_dict.get('expiryTime', 0) or 0)
-            client_dict['expiryTime'] = base_ms + (duration_days * 86400 * 1000)
+            client_dict['totalGB'] = int(plan['gb']) * 1024 * 1024 * 1024
+            client_dict['up'] = 0
+            client_dict['down'] = 0
+            client_dict['expiryTime'] = int((time.time() + (duration_days * 86400)) * 1000)
             client_dict['enable'] = True
             if await xui.update_client(inbound_id, client_dict['id'], client_dict):
+                # بعضی پنل‌ها up/down را از updateClient قبول نمی‌کنند؛ جداگانه ریست می‌کنیم
+                await xui.reset_client_traffic(email)
                 await db.reset_notify(order_id)
-                await render_order_details(query, order_id, f"✅ با موفقیت تمدید شد!")
+                await render_order_details(query, order_id, f"✅ تمدید شد: {plan['gb']}GB / {duration_days} روز")
             else:
-                await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
+                await credit_balance(user_id, price, kind='برگشت وجه')
                 await render_order_details(query, order_id, "❌ خطا: سرور درخواست تمدید را رد کرد!")
         finally:
             context.user_data['processing'] = False
@@ -1436,15 +1478,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("confirm_buy_"):
         parts = data.split("_")
         plan_id = int(parts[2])
-        final_name = "_".join(parts[3:]) 
-        
+        final_name = "_".join(parts[3:])
+
         async with db.db_pool.acquire() as conn:
             plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
-            custom = await conn.fetchrow("SELECT price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, plan_id)
-            
+
         if not plan: return await query.edit_message_text("❌ پلن یافت نشد.")
-        
-        price = custom['price'] if custom else (plan['vip_price'] if role == 'vip' else plan['price'])
+
+        price = await resolve_plan_price(user_id, plan, role, bulk=False)
 
         if context.user_data.get('processing'):
             return await query.answer("⏳ یک عملیات در حال انجام است، صبر کنید.", show_alert=True)
@@ -1496,8 +1537,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['processing'] = False
 
     elif data.startswith("bulkbuy_"):
-        if not (can_bulk or admin_status):
-            return await query.answer("⛔️ خرید عمده فقط برای همکاران مجاز است.", show_alert=True)
+        if not can_buy_bulk(role, admin_status):
+            return await query.answer("⛔️ خرید عمده فقط برای کاربران VIP فعال است.", show_alert=True)
         plan_id = data.split("_")[1]
         context.user_data['b_plan'] = plan_id
         context.user_data['state'] = 'bulk_waiting_prefix'
@@ -1505,20 +1546,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ================= ساخت کانفیگ عمده + فاکتور دقیق ادمین =================
     elif data == "confirm_execute_bulk":
-        if not (can_bulk or admin_status):
-            return await query.answer("⛔️ خرید عمده فقط برای همکاران مجاز است.", show_alert=True)
+        if not can_buy_bulk(role, admin_status):
+            return await query.answer("⛔️ خرید عمده فقط برای کاربران VIP فعال است.", show_alert=True)
         start_n = context.user_data.get('b_start', 1)
         end_n = context.user_data.get('b_end', 1)
         postfix = context.user_data.get('b_postfix', "")
-        plan_id = context.user_data['b_plan']
-        prefix = context.user_data['b_prefix']
+        plan_id = context.user_data.get('b_plan')
+        prefix = context.user_data.get('b_prefix')
+        if not plan_id or prefix is None:
+            return await query.edit_message_text("❌ اطلاعات خرید عمده ناقص است. دوباره از منو شروع کنید.")
         count = end_n - start_n + 1
-        
+
         async with db.db_pool.acquire() as conn:
             plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
-            custom = await conn.fetchrow("SELECT bulk_price FROM custom_prices WHERE user_id=$1 AND plan_id=$2", user_id, int(plan_id))
-            
-        unit_price = custom['bulk_price'] if custom else (plan['vip_bulk_price'] if role == 'vip' else plan['bulk_price'])
+        if not plan:
+            return await query.edit_message_text("❌ پلن یافت نشد.")
+
+        unit_price = await resolve_plan_price(user_id, plan, role, bulk=True)
         total_price = unit_price * count
 
         if context.user_data.get('processing'):
@@ -1572,7 +1616,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # --- سیستم فاکتور دقیق برای مدیریت (هر کسی خرید عمده زد) ---
                 admins = await get_all_admins()
                 u_nick = nickname if nickname else "بدون نام"
-                user_type = "VIP 💎" if role == 'vip' else "همکار (عادی) 📦"
+                user_type = "ادمین 👑" if admin_status else ("VIP 💎" if role == 'vip' else "عادی")
                 
                 invoice_text = (
                     f"🧾 **فاکتور فروش عمده**\n\n"
