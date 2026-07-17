@@ -1330,15 +1330,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not res: return
         email = unquote(res[0].split("#")[-1])
         xui, _ip = await get_order_xui(order_id)
-        is_logged, _ = await xui.login()
-        if is_logged:
-            inbound_id, port, client_dict = await xui.get_client_exact_info(email)
-            if client_dict:
-                old_uuid = client_dict['id']
-                client_dict['enable'] = not client_dict['enable'] 
-                if await xui.update_client(inbound_id, old_uuid, client_dict):
-                    await render_order_details(query, order_id, f"✅ وضعیت تغییر کرد!")
-        
+        is_logged, login_err = await xui.login()
+        if not is_logged:
+            return await query.answer(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:150]}", show_alert=True)
+        inbound_id, port, client_dict = await xui.get_client_exact_info(email)
+        if not client_dict:
+            return await query.answer("❌ کانفیگ در پنل یافت نشد (شاید حذف شده).", show_alert=True)
+        old_uuid = client_dict['id']
+        client_dict['enable'] = not client_dict['enable']
+        if await xui.update_client(inbound_id, old_uuid, client_dict):
+            await render_order_details(query, order_id, "✅ وضعیت تغییر کرد!")
+        else:
+            await query.answer("❌ سرور درخواست تغییر وضعیت را رد کرد.", show_alert=True)
+
     elif data.startswith("change_uuid_"):
         order_id = data.split("_")[2]
         if not await ensure_order_access(query, order_id, admin_status): return
@@ -1347,17 +1351,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old_link, _ = res
         email = unquote(old_link.split("#")[-1])
         xui, _ip = await get_order_xui(order_id)
-        is_logged, _ = await xui.login()
-        if is_logged:
-            inbound_id, port, client_dict = await xui.get_client_exact_info(email)
-            if client_dict:
-                old_uuid = client_dict['id']
-                new_uuid = str(uuid.uuid4())
-                client_dict['id'] = new_uuid
-                if await xui.update_client(inbound_id, old_uuid, client_dict):
-                    new_link = old_link.replace(old_uuid, new_uuid)
-                    async with db.db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
-                    await render_order_details(query, order_id, "✅ لینک اتصال و UUID با موفقیت تغییر کرد!")
+        is_logged, login_err = await xui.login()
+        if not is_logged:
+            return await query.answer(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:150]}", show_alert=True)
+        inbound_id, port, client_dict = await xui.get_client_exact_info(email)
+        if not client_dict:
+            return await query.answer("❌ کانفیگ در پنل یافت نشد (شاید حذف شده).", show_alert=True)
+        old_uuid = client_dict['id']
+        new_uuid = str(uuid.uuid4())
+        client_dict['id'] = new_uuid
+        if await xui.update_client(inbound_id, old_uuid, client_dict):
+            new_link = old_link.replace(old_uuid, new_uuid)
+            async with db.db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
+            await render_order_details(query, order_id, "✅ لینک اتصال و UUID با موفقیت تغییر کرد!")
+        else:
+            await query.answer("❌ سرور درخواست تغییر UUID را رد کرد.", show_alert=True)
+
+    elif data.startswith("rename_conf_"):
+        order_id = data.split("_")[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
+        context.user_data['state'] = f'waiting_rename_{order_id}'
+        await query.message.reply_text(
+            "📝 نام جدید کانفیگ را به انگلیسی وارد کنید (فقط حروف انگلیسی، اعداد، - و _):",
+            reply_markup=CANCEL_MARKUP,
+        )
+        try: await query.delete_message()
+        except Exception: pass
 
     elif data.startswith("renew_menu_"):
         order_id = data.split("_")[2]
@@ -1656,7 +1675,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['processing'] = False
 
     elif data.startswith("show_order_") or data.startswith("refresh_order_"):
-        await render_order_details(query, data.split("_")[2])
+        order_id = data.split("_")[2]
+        alert = "🔄 بروزرسانی شد" if data.startswith("refresh_order_") else None
+        await render_order_details(query, order_id, alert)
         
     elif data == 'back_to_orders':
         async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
