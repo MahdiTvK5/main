@@ -315,6 +315,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         xui, cfg_ip = build_xui(panel)
         opid = panel['id'] if panel else None
 
+        if not cfg_ip:
+            return await update.message.reply_text("❌ «IP کانفیگ» پنل اکانت تست تنظیم نشده است. لطفاً به ادمین اطلاع دهید.", reply_markup=await get_main_keyboard(user_id))
+
         if context.user_data.get('processing'):
             return await update.message.reply_text("⏳ یک عملیات در حال انجام است، صبر کنید.")
         context.user_data['processing'] = True
@@ -1500,6 +1503,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             panel = await db.get_panel(plan['panel_id'])
             xui, cfg_ip = build_xui(panel)
             order_panel_id = panel['id'] if panel else None
+
+            # جلوگیری از ساختِ کانفیگِ خراب بدون هاست/دامنه
+            if not cfg_ip:
+                await credit_balance(user_id, price, kind='برگشت وجه')
+                return await query.edit_message_text("❌ «IP کانفیگ» این پنل تنظیم نشده است. لطفاً به ادمین اطلاع دهید. (وجه بازگشت داده شد)")
+
             is_logged, login_err = await xui.login()
 
             if not is_logged:
@@ -1578,6 +1587,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             panel = await db.get_panel(plan['panel_id'])
             xui, cfg_ip = build_xui(panel)
             order_panel_id = panel['id'] if panel else None
+
+            # جلوگیری از ساختِ کانفیگِ خراب بدون هاست/دامنه
+            if not cfg_ip:
+                await credit_balance(user_id, total_price, kind='برگشت وجه')
+                return await query.edit_message_text("❌ «IP کانفیگ» این پنل تنظیم نشده است. لطفاً به ادمین اطلاع دهید. (وجه بازگشت داده شد)")
+
             is_logged, login_err = await xui.login()
             if not is_logged:
                 await credit_balance(user_id, total_price, kind='برگشت وجه')  # برگشت کل وجه

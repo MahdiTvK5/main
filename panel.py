@@ -2,18 +2,37 @@ import json
 import uuid
 import time
 import logging
+from urllib.parse import urlparse
 
 import httpx
 
 from config import PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP
 
 
+def _host_from_url(url):
+    """دامنه/آی‌پیِ داخل یک URL را برمی‌گرداند (بدون پورت و مسیر).
+    آدرس‌های بدون اسکیم (مثل `1.2.3.4:54321/path`) را هم پشتیبانی می‌کند."""
+    if not url:
+        return ""
+    try:
+        u = url if "://" in url else "//" + url
+        host = urlparse(u).hostname
+        return host or ""
+    except Exception:
+        return ""
+
+
 def build_xui(panel):
     """از روی ردیف پنل، کلاینت X-UI و config_ip مربوطه را می‌سازد.
-    اگر panel برابر None باشد، به مقادیر پیش‌فرضِ .env برمی‌گردد (سازگاری با نسخه‌ی تک‌پنل)."""
+    اگر panel برابر None باشد، به مقادیر پیش‌فرضِ .env برمی‌گردد (سازگاری با نسخه‌ی تک‌پنل).
+    اگر «IP کانفیگ» پنل تنظیم نشده باشد، برای جلوگیری از ساختِ لینک خرابِ بدون هاست،
+    به‌ترتیب از CONFIG_IP و سپس دامنه‌ی خود پنل استفاده می‌شود."""
     if panel:
-        return AsyncXuiAPI(panel['url'], panel['username'], panel['password']), (panel['config_ip'] or CONFIG_IP)
-    return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), CONFIG_IP
+        panel_url = panel['url']
+        cfg_ip = (panel['config_ip'] or CONFIG_IP or _host_from_url(panel_url))
+        return AsyncXuiAPI(panel_url, panel['username'], panel['password']), cfg_ip
+    cfg_ip = CONFIG_IP or _host_from_url(PANEL_URL)
+    return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), cfg_ip
 
 
 def sub_link_for(panel, email):
