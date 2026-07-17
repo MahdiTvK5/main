@@ -74,9 +74,10 @@ class AsyncXuiAPI:
                         self.url = base
                         self.cookies = res.cookies
                         return True, "OK"
-                    last_err = res.text
+                    # پاسخ گرفتیم ولی ناموفق (مثلاً یوزر/پس اشتباه یا مسیر نادرست)
+                    last_err = f"{base}/login → HTTP {res.status_code}: {str(res.text)[:200]}"
                 except Exception as e:
-                    last_err = str(e)
+                    last_err = f"{base}/login → {type(e).__name__}: {e}"
         return False, last_err
 
     async def get_inbound_port(self, inbound_id):
