@@ -18,8 +18,9 @@
 
 **۱) پیش‌نیازهای سیستمی (یک‌بار):**
 ```bash
-sudo apt update && sudo apt install -y python3-venv git postgresql postgresql-client
+sudo apt update && sudo apt install -y python3-venv python3-pip git postgresql postgresql-client
 ```
+> ⚠️ اگر `python3-venv` نصب نباشد، `deploy.sh`/`run.sh` هنگام ساخت venv خطا می‌دهند. حتماً این مرحله را انجام بده.
 
 **۲) گرفتن کد:**
 ```bash

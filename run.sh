@@ -3,15 +3,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [ ! -d .venv ]; then
-  python3 -m venv .venv
-  # shellcheck disable=SC1091
-  . .venv/bin/activate
-  pip install --upgrade pip >/dev/null
-  pip install -r requirements.txt
-else
-  # shellcheck disable=SC1091
-  . .venv/bin/activate
+# Create the venv if missing or broken, then install deps.
+if [ ! -x .venv/bin/python ]; then
+  rm -rf .venv
+  if ! python3 -m venv .venv; then
+    echo "ERROR: Could not create a Python virtual environment."
+    echo "  sudo apt update && sudo apt install -y python3-venv python3-pip"
+    exit 1
+  fi
+  .venv/bin/python -m pip install --upgrade pip >/dev/null
+  .venv/bin/python -m pip install -r requirements.txt
 fi
 
 if [ ! -f .env ]; then
@@ -19,4 +20,4 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-exec python main.py
+exec .venv/bin/python main.py

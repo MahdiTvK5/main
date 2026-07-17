@@ -3,19 +3,34 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "==> Pulling latest from git..."
-git pull --ff-only || git pull || true
-
-echo "==> Setting up Python venv..."
-if [ ! -d .venv ]; then
-  python3 -m venv .venv
+# --- Git pull (only when this really is a git checkout) ---
+if [ -d .git ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "==> Pulling latest from git..."
+  git pull --ff-only || git pull || true
+else
+  echo "==> Skipping git pull (this folder is not a git repository)."
+  echo "    For auto-update next time, install with:"
+  echo "      git clone <repo-url> overwallbot && cd overwallbot"
 fi
-# shellcheck disable=SC1091
-. .venv/bin/activate
+
+# --- Python venv (robust: recreate if missing OR broken) ---
+echo "==> Setting up Python venv..."
+if [ ! -x .venv/bin/python ]; then
+  # A previous failed run can leave a partial .venv with no python/activate.
+  rm -rf .venv
+  if ! python3 -m venv .venv; then
+    echo "ERROR: Could not create a Python virtual environment."
+    echo "Install the required packages first, then re-run this script:"
+    echo "  sudo apt update && sudo apt install -y python3-venv python3-pip"
+    exit 1
+  fi
+fi
+
+VENV_PY=".venv/bin/python"
 
 echo "==> Installing dependencies..."
-pip install --upgrade pip >/dev/null
-pip install -r requirements.txt
+"$VENV_PY" -m pip install --upgrade pip >/dev/null
+"$VENV_PY" -m pip install -r requirements.txt
 
 if [ ! -f .env ]; then
   cp .env.example .env
