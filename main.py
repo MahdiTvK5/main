@@ -1436,8 +1436,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client_dict['expiryTime'] = int((time.time() + (duration_days * 86400)) * 1000)
             client_dict['enable'] = True
             if await xui.update_client(inbound_id, client_dict['id'], client_dict):
-                # بعضی پنل‌ها up/down را از updateClient قبول نمی‌کنند؛ جداگانه ریست می‌کنیم
-                await xui.reset_client_traffic(email)
+                # مصرف واقعی در جدول جدا نگه داشته می‌شود؛ updateClient آن را صفر نمی‌کند،
+                # پس حتماً از endpoint اختصاصی ریست ترافیک استفاده می‌کنیم.
+                await xui.reset_client_traffic(inbound_id, email)
                 await db.reset_notify(order_id)
                 await render_order_details(query, order_id, f"✅ تمدید شد: {plan['gb']}GB / {duration_days} روز")
             else:
