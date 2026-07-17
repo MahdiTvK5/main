@@ -54,6 +54,7 @@ form.inline{display:inline-flex;gap:6px;align-items:center}
 h2{margin:18px 0 8px}
 .box{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:16px;margin-top:14px}
 .login{max-width:360px;margin:12vh auto;text-align:center}
+.muted{color:#94a3b8;font-size:13px;margin:8px 0}
 </style>
 """
 
@@ -140,7 +141,7 @@ async def users_page(request):
     for u in users:
         rows += (
             f"<tr><td>{e(u['user_id'])}</td><td>{e(u['nickname'])}</td><td>{u['balance']:,}</td>"
-            f"<td>{e(u['role'])}</td><td>{'✅' if u['can_bulk'] else '—'}</td>"
+            f"<td>{e(u['role'])}</td><td>{'✅ VIP' if u['role'] == 'vip' else '—'}</td>"
             f"<td><a href='/users/edit?id={e(u['user_id'])}'>✏️ ویرایش</a>"
             f" | <form class='inline' method='post' action='/users/delete' onsubmit=\"return confirm('حذف کاربر {e(u['user_id'])}؟')\">"
             f"<input type='hidden' name='user_id' value='{e(u['user_id'])}'><button style='background:#dc2626'>🗑 حذف</button></form>"
@@ -149,6 +150,7 @@ async def users_page(request):
             f"<input name='amount' placeholder='±مبلغ' style='width:90px'><button>موجودی</button></form></td></tr>"
         )
     body = f"""<h2>کاربران</h2>
+    <p class='muted'>خرید عمده فقط برای نقش VIP فعال است.</p>
     <a href='/users/edit'><button>➕ افزودن کاربر</button></a>
     <form class='inline' method='get' action='/users' style='margin-right:8px'><input name='q' placeholder='جستجو (آیدی/نام)' value='{e(search or "")}'><button>جستجو</button></form>
     <table><tr><th>آیدی</th><th>نام</th><th>موجودی</th><th>نقش</th><th>عمده</th><th>عملیات</th></tr>{rows}</table>"""
@@ -165,7 +167,6 @@ async def user_edit_form(request):
     nick_v = e(u['nickname']) if u else ""
     bal_v = e(u['balance']) if u else "0"
     role_v = u['role'] if u else "normal"
-    bulk_v = bool(u['can_bulk']) if u else False
     uid_field = (f"<input value='{uid_v}' disabled>" + f"<input type='hidden' name='user_id' value='{uid_v}'>") if not is_new else "<input name='user_id' placeholder='آیدی عددی کاربر'>"
     body = f"""<h2>{e(title)}</h2>
     <div class='box'><form method='post' action='/users/save'>
@@ -176,7 +177,7 @@ async def user_edit_form(request):
         <option value='normal' {'selected' if role_v=='normal' else ''}>عادی</option>
         <option value='vip' {'selected' if role_v=='vip' else ''}>VIP</option>
       </select></p>
-      <p><label><input type='checkbox' name='can_bulk' {'checked' if bulk_v else ''}> دسترسی خرید عمده</label></p>
+      <p class='muted'>خرید عمده فقط با نقش VIP فعال می‌شود (جداگانه نیاز به مجوز نیست).</p>
       <button type='submit'>ذخیره</button> <a href='/users'>انصراف</a>
     </form></div>"""
     return layout(title, body, "/users")
@@ -192,9 +193,9 @@ async def user_save(request):
         raise web.HTTPFound("/users")
     nickname = (data.get("nickname") or "").strip() or None
     role = data.get("role") if data.get("role") in ("normal", "vip") else "normal"
-    can_bulk = data.get("can_bulk") is not None
-    await db.save_user(uid, nickname, role, can_bulk, balance)
-    logging.info("WEB_USER_SAVE user=%s role=%s bulk=%s balance=%s", uid, role, can_bulk, balance)
+    # can_bulk دیگر معیار دسترسی نیست؛ برای سازگاری دیتابیس False ذخیره می‌شود
+    await db.save_user(uid, nickname, role, False, balance)
+    logging.info("WEB_USER_SAVE user=%s role=%s balance=%s", uid, role, balance)
     raise web.HTTPFound("/users")
 
 

@@ -133,3 +133,21 @@ class AsyncXuiAPI:
             except Exception as e:
                 logging.warning("update_client failed: %s", e)
                 return False
+
+    async def reset_client_traffic(self, inbound_id, email):
+        """ریست مصرف (up/down) کلاینت.
+        مسیر صحیح در پنل سنایی (3x-ui): /panel/api/inbounds/{inboundId}/resetClientTraffic/{email}
+        """
+        from urllib.parse import quote
+        safe_email = quote(str(email), safe="")
+        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
+            try:
+                res = await client.post(
+                    f"{self.url}/panel/api/inbounds/{int(inbound_id)}/resetClientTraffic/{safe_email}",
+                    headers={'Accept': 'application/json'},
+                )
+                if res.status_code == 200 and res.json().get('success', False):
+                    return True
+            except Exception as e:
+                logging.warning("reset_client_traffic failed: %s", e)
+        return False

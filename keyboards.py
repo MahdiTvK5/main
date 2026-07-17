@@ -11,10 +11,11 @@ from config import PANEL_URL
 
 # ================= رابط کاربری =================
 async def get_main_keyboard(user_id):
-    _, _, _, can_bulk = await get_user(user_id)
+    _, _, role, _ = await get_user(user_id)
     is_adm = await is_admin(user_id)
     menu = []
-    if can_bulk or is_adm:
+    # خرید عمده فقط برای VIP و ادمین (نه کاربران عادی با can_bulk)
+    if is_adm or role == 'vip':
         menu.append(['خرید عمده 📦', 'محصولات 🛍'])
     else:
         menu.append(['محصولات 🛍'])
