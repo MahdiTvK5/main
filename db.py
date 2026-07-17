@@ -266,6 +266,11 @@ async def add_order(user_id, config_link, panel_id=None):
         await conn.execute("INSERT INTO orders (user_id, config_link, date, panel_id) VALUES ($1, $2, $3, $4)", user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), panel_id)
 
 
+async def delete_order(order_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM orders WHERE id = $1", int(order_id))
+
+
 async def get_order_by_id(order_id):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT config_link, date FROM orders WHERE id = $1", int(order_id))

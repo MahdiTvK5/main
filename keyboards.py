@@ -99,4 +99,5 @@ async def generate_orders_keyboard(orders, page=0, page_size=8, search=None):
     if search:
         bottom.append(InlineKeyboardButton("❌ حذف جستجو", callback_data='orders_clearsearch'))
     keyboard.append(bottom)
+    keyboard.append([InlineKeyboardButton("🧹 حذف سرویس‌های حذف‌شده از پنل", callback_data='orders_cleanup')])
     return InlineKeyboardMarkup(keyboard)

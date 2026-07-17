@@ -215,20 +215,27 @@ async def render_order_details(query, order_id, alert_msg=None):
     else:
         status_text, total_fmt, used_fmt, remain_fmt, exp_str = "نامشخص ⚪️", "نامشخص", "نامشخص", "نامشخص", "نامشخص"
         
-    msg = f"🏷 سرویس: `{email}`\n📡 وضعیت: {status_text}\n🔋 کل: {total_fmt}\n📊 مصرف: {used_fmt}\n📉 باقی‌مانده: {remain_fmt}\n📅 انقضا: {exp_str}"
-    
+    # زمان بروزرسانی همیشه تغییر می‌کند تا ادیت پیام موفق شود و «بروزرسانی» بازخورد دیداری بدهد
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    header = f"{alert_msg}\n\n" if alert_msg else ""
+    msg = (
+        f"{header}🏷 سرویس: `{email}`\n📡 وضعیت: {status_text}\n🔋 کل: {total_fmt}\n"
+        f"📊 مصرف: {used_fmt}\n📉 باقی‌مانده: {remain_fmt}\n📅 انقضا: {exp_str}\n"
+        f"🕐 آخرین بروزرسانی: {ts}"
+    )
+
     kb = [
         [InlineKeyboardButton("تغییر وضعیت 🔄", callback_data=f'toggle_status_{order_id}'), InlineKeyboardButton("تغییر UUID 🔑", callback_data=f'change_uuid_{order_id}')],
-        [InlineKeyboardButton("تغییر نام 📝", callback_data=f'rename_conf_{order_id}'), InlineKeyboardButton("📊 بروزرسانی", callback_data=f'refresh_order_{order_id}')], 
+        [InlineKeyboardButton("تغییر نام 📝", callback_data=f'rename_conf_{order_id}'), InlineKeyboardButton("📊 بروزرسانی", callback_data=f'refresh_order_{order_id}')],
         [InlineKeyboardButton("📥 دریافت کانفیگ و QR", callback_data=f'get_conf_{order_id}')],
         [InlineKeyboardButton("♻️ تمدید و تغییر پلن سرویس", callback_data=f'renew_menu_{order_id}')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_orders')]
+        [InlineKeyboardButton("🗑 حذف از لیست", callback_data=f'delorder_{order_id}'), InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_orders')],
     ]
-    if alert_msg: await query.answer(alert_msg, show_alert=True)
-    else: await query.answer()
-        
+    try: await query.answer()
+    except Exception: pass
+
     try: await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-    except: pass
+    except Exception: pass
 
 # ================= هندلرهای اصلی =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1332,16 +1339,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         xui, _ip = await get_order_xui(order_id)
         is_logged, login_err = await xui.login()
         if not is_logged:
-            return await query.answer(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:150]}", show_alert=True)
+            return await query.message.reply_text(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:200]}")
         inbound_id, port, client_dict = await xui.get_client_exact_info(email)
         if not client_dict:
-            return await query.answer("❌ کانفیگ در پنل یافت نشد (شاید حذف شده).", show_alert=True)
+            return await query.message.reply_text("❌ این کانفیگ روی پنل یافت نشد (احتمالاً حذف شده). می‌توانید با «🗑 حذف از لیست» آن را پاک کنید.")
         old_uuid = client_dict['id']
         client_dict['enable'] = not client_dict['enable']
         if await xui.update_client(inbound_id, old_uuid, client_dict):
             await render_order_details(query, order_id, "✅ وضعیت تغییر کرد!")
         else:
-            await query.answer("❌ سرور درخواست تغییر وضعیت را رد کرد.", show_alert=True)
+            await query.message.reply_text("❌ سرور درخواست تغییر وضعیت را رد کرد.")
 
     elif data.startswith("change_uuid_"):
         order_id = data.split("_")[2]
@@ -1353,10 +1360,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         xui, _ip = await get_order_xui(order_id)
         is_logged, login_err = await xui.login()
         if not is_logged:
-            return await query.answer(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:150]}", show_alert=True)
+            return await query.message.reply_text(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:200]}")
         inbound_id, port, client_dict = await xui.get_client_exact_info(email)
         if not client_dict:
-            return await query.answer("❌ کانفیگ در پنل یافت نشد (شاید حذف شده).", show_alert=True)
+            return await query.message.reply_text("❌ این کانفیگ روی پنل یافت نشد (احتمالاً حذف شده). می‌توانید با «🗑 حذف از لیست» آن را پاک کنید.")
         old_uuid = client_dict['id']
         new_uuid = str(uuid.uuid4())
         client_dict['id'] = new_uuid
@@ -1365,7 +1372,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with db.db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
             await render_order_details(query, order_id, "✅ لینک اتصال و UUID با موفقیت تغییر کرد!")
         else:
-            await query.answer("❌ سرور درخواست تغییر UUID را رد کرد.", show_alert=True)
+            await query.message.reply_text("❌ سرور درخواست تغییر UUID را رد کرد.")
 
     elif data.startswith("rename_conf_"):
         order_id = data.split("_")[2]
@@ -1678,6 +1685,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = data.split("_")[2]
         alert = "🔄 بروزرسانی شد" if data.startswith("refresh_order_") else None
         await render_order_details(query, order_id, alert)
+
+    elif data.startswith("delorder_"):
+        order_id = data.split("_")[1]
+        if not await ensure_order_access(query, order_id, admin_status): return
+        await db.delete_order(order_id)
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        if not orders:
+            try: await query.edit_message_text("🗑 سرویس حذف شد. سفارش دیگری ندارید.")
+            except Exception: pass
+            return
+        keyboard = await generate_orders_keyboard(orders, page=0, search=context.user_data.get('order_search'))
+        try: await query.edit_message_text("🗑 سرویس از لیست حذف شد.\n✅ سرویس خود را انتخاب کنید:", reply_markup=keyboard)
+        except Exception: pass
+
+    elif data == 'orders_cleanup':
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        if not orders:
+            return await query.answer("سفارشی ندارید.", show_alert=True)
+        await query.answer("در حال بررسی سرویس‌ها... ⏳")
+        # آمار هر پنل یک‌بار گرفته می‌شود؛ فقط سرویس‌هایی حذف می‌شوند که پنل در دسترس بوده ولی کلاینت پیدا نشده
+        from collections import defaultdict
+        by_panel = defaultdict(list)
+        for o in orders:
+            by_panel[o['panel_id']].append(o)
+        removed = 0
+        for panel_id, group in by_panel.items():
+            panel = await db.get_panel(panel_id) if panel_id else None
+            if panel is None and not PANEL_URL:
+                continue
+            xui, _ip = build_xui(panel)
+            ok, _ = await xui.login()
+            if not ok:
+                continue  # پنل در دسترس نیست؛ برای امنیت چیزی حذف نمی‌کنیم
+            stats_map = await xui.get_all_client_stats()
+            if stats_map is None:
+                continue
+            for o in group:
+                link = o['config_link']
+                email = unquote(link.split("#")[-1]) if "#" in link else ""
+                if email.strip().lower() not in stats_map:
+                    await db.delete_order(o['id'])
+                    removed += 1
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        if not orders:
+            try: await query.edit_message_text(f"🧹 پاک‌سازی انجام شد. {removed} سرویسِ حذف‌شده پاک شد.\nسفارش دیگری ندارید.")
+            except Exception: pass
+            return
+        keyboard = await generate_orders_keyboard(orders, page=0, search=context.user_data.get('order_search'))
+        try:
+            await query.edit_message_text(f"🧹 {removed} سرویسِ حذف‌شده از پنل پاک شد.\n✅ سرویس خود را انتخاب کنید:", reply_markup=keyboard)
+        except Exception:
+            pass
         
     elif data == 'back_to_orders':
         async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
