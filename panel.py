@@ -35,6 +35,21 @@ def build_xui(panel):
     return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), cfg_ip
 
 
+def build_vless_link(client_uuid, host, port, remark, path="/", sni=None):
+    """ساخت لینک اشتراک VLESS+WS+TLS دقیقاً مطابق قالبِ خروجیِ خودِ پنل X-UI.
+    پارامترهای غیراستاندارد قدیمی (insecure/allowInsecure) حذف شده‌اند تا کلاینت‌ها
+    بدون مشکل وصل شوند."""
+    from urllib.parse import quote
+    sni = sni or host
+    enc_path = quote(path, safe="")
+    enc_alpn = quote("h2,http/1.1,h3", safe="")
+    query = (
+        f"type=ws&encryption=none&path={enc_path}&host="
+        f"&security=tls&fp=chrome&alpn={enc_alpn}&sni={sni}"
+    )
+    return f"vless://{client_uuid}@{host}:{port}?{query}#{remark}"
+
+
 def sub_link_for(panel, email):
     """در صورتی که پنل آدرس اشتراک داشته باشد، لینک ساب را برمی‌گرداند؛ وگرنه None."""
     if not panel:

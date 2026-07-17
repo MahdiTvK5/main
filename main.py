@@ -24,7 +24,7 @@ from db import (
     update_balance, deduct_balance, credit_balance, get_balance, add_order,
     get_order_by_id, order_belongs_to,
 )
-from panel import AsyncXuiAPI, build_xui, sub_link_for
+from panel import AsyncXuiAPI, build_xui, sub_link_for, build_vless_link
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
 
@@ -332,7 +332,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             new_uuid, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, 1)
             if not new_uuid:
                 return await update.message.reply_text(f"❌ ساخت اکانت تست ناموفق بود.\n{err}", reply_markup=await get_main_keyboard(user_id))
-            config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{test_name}"
+            config_link = build_vless_link(new_uuid, cfg_ip, port, test_name)
             await add_order(user_id, config_link, opid)
             if not admin_status:
                 await db.mark_test_used(user_id)
@@ -508,7 +508,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                             real_email_from_panel = client_dict.get('email', email)
                             pid = prow['id'] if prow else None
                             pname = prow['name'] if prow else "پیش‌فرض"
-                            config_link = f"vless://{client_uuid}@{ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={ip}#{real_email_from_panel}"
+                            config_link = build_vless_link(client_uuid, ip, port, real_email_from_panel)
                             await add_order(target_user_id, config_link, pid)
                             existing_emails.add(real_email_from_panel.strip().lower())
                             per_panel[pname] = per_panel.get(pname, 0) + 1
@@ -1522,7 +1522,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), 1)
             if new_uuid:
-                config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{final_name}"
+                config_link = build_vless_link(new_uuid, cfg_ip, port, final_name)
                 await add_order(user_id, config_link, order_panel_id)
                 logging.info("PURCHASE user=%s plan=%s price=%s name=%s", user_id, plan_id, price, final_name)
 
@@ -1605,7 +1605,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = f"{prefix}{i}{postfix}"
                 new_uuid, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), 1)
                 if new_uuid:
-                    link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{name}"
+                    link = build_vless_link(new_uuid, cfg_ip, port, name)
                     success_configs.append(link)
                     await add_order(user_id, link, order_panel_id)
                 else:
