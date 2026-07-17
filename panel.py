@@ -51,21 +51,33 @@ def sub_link_for(panel, email):
 # ================= پنل X-UI =================
 class AsyncXuiAPI:
     def __init__(self, panel_url, username, password):
-        self.url = panel_url.rstrip('/')
+        self.url = (panel_url or "").rstrip('/')
         self.username = username
         self.password = password
         self.cookies = None
 
+    def _candidate_urls(self):
+        """اگر آدرس پنل اسکیم نداشته باشد، اول https و بعد http امتحان می‌شود."""
+        u = self.url
+        if u.startswith("http://") or u.startswith("https://"):
+            return [u]
+        return [f"https://{u}", f"http://{u}"]
+
     async def login(self):
-        async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.post(f"{self.url}/login", data={"username": self.username, "password": self.password})
-                if res.status_code == 200 and res.json().get('success'):
-                    self.cookies = res.cookies
-                    return True, "OK"
-                return False, res.text
-            except Exception as e:
-                return False, str(e)
+        last_err = "آدرس پنل نامعتبر است"
+        for base in self._candidate_urls():
+            async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False) as client:
+                try:
+                    res = await client.post(f"{base}/login", data={"username": self.username, "password": self.password})
+                    if res.status_code == 200 and res.json().get('success'):
+                        # آدرس کارآمد را برای درخواست‌های بعدی نگه می‌داریم
+                        self.url = base
+                        self.cookies = res.cookies
+                        return True, "OK"
+                    last_err = res.text
+                except Exception as e:
+                    last_err = str(e)
+        return False, last_err
 
     async def get_inbound_port(self, inbound_id):
         async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
