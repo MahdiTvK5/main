@@ -30,13 +30,28 @@ cd overwallbot
 # git checkout <نام-شاخه>
 ```
 
-**۳) آماده‌سازی و پر کردن تنظیمات:**
+**۳) ساخت دیتابیس و کاربر PostgreSQL (یک‌بار):**
+> ⚠️ اگر این مرحله را انجام ندهی، هنگام اجرا خطای `ConnectionRefusedError ... 127.0.0.1:5432` می‌گیری.
+```bash
+# مطمئن شو سرویس دیتابیس روشن است
+sudo systemctl enable --now postgresql
+ss -ltnp | grep 5432          # باید نشان دهد postgres روی 127.0.0.1:5432 گوش می‌دهد
+
+# کاربر و دیتابیس را بساز (به‌جای YOUR_STRONG_PASSWORD یک رمز قوی بگذار)
+sudo -u postgres psql -c "CREATE USER overwall_user WITH PASSWORD 'YOUR_STRONG_PASSWORD';" \
+  || sudo -u postgres psql -c "ALTER USER overwall_user WITH PASSWORD 'YOUR_STRONG_PASSWORD';"
+sudo -u postgres psql -c "CREATE DATABASE overwall_db OWNER overwall_user;" || true
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE overwall_db TO overwall_user;"
+```
+همین رمز را باید در `.env` مقابل `DB_PASS` بگذاری. اگر نام کاربر/دیتابیس را عوض کردی، `DB_USER`/`DB_NAME` را هم هماهنگ کن.
+
+**۴) آماده‌سازی و پر کردن تنظیمات:**
 ```bash
 bash deploy.sh      # ساخت venv + نصب وابستگی‌ها + ساخت .env
-nano .env           # مقادیر را پر کن (توکن، پنل، دیتابیس، WEB_ADMIN_PASSWORD و ...)
+nano .env           # مقادیر را پر کن (توکن، پنل، DB_PASS مطابق مرحله ۳، WEB_ADMIN_PASSWORD و ...)
 ```
 
-**۴) اجرا:**
+**۵) اجرا:**
 ```bash
 bash run.sh                 # اجرای دستی (foreground)
 # یا اجرای دائمی به‌صورت سرویس (پیشنهادی):
