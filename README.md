@@ -33,8 +33,8 @@ cd overwallbot
 **۳) ساخت دیتابیس و کاربر PostgreSQL (یک‌بار):**
 > ⚠️ اگر این مرحله را انجام ندهی، هنگام اجرا خطای `ConnectionRefusedError ... 127.0.0.1:5432` می‌گیری.
 ```bash
-# مطمئن شو سرویس دیتابیس روشن است
-sudo systemctl enable --now postgresql
+
+sudo systemctl enable --now postgresql  # مطمئن شو سرویس دیتابیس روشن است
 ss -ltnp | grep 5432          # باید نشان دهد postgres روی 127.0.0.1:5432 گوش می‌دهد
 
 # کاربر و دیتابیس را بساز (به‌جای YOUR_STRONG_PASSWORD یک رمز قوی بگذار)

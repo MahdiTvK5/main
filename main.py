@@ -24,7 +24,7 @@ from db import (
     update_balance, deduct_balance, credit_balance, get_balance, add_order,
     get_order_by_id, order_belongs_to,
 )
-from panel import AsyncXuiAPI, build_xui, sub_link_for
+from panel import AsyncXuiAPI, build_xui, sub_link_for, build_vless_link
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
 
@@ -215,20 +215,27 @@ async def render_order_details(query, order_id, alert_msg=None):
     else:
         status_text, total_fmt, used_fmt, remain_fmt, exp_str = "نامشخص ⚪️", "نامشخص", "نامشخص", "نامشخص", "نامشخص"
         
-    msg = f"🏷 سرویس: `{email}`\n📡 وضعیت: {status_text}\n🔋 کل: {total_fmt}\n📊 مصرف: {used_fmt}\n📉 باقی‌مانده: {remain_fmt}\n📅 انقضا: {exp_str}"
-    
+    # زمان بروزرسانی همیشه تغییر می‌کند تا ادیت پیام موفق شود و «بروزرسانی» بازخورد دیداری بدهد
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    header = f"{alert_msg}\n\n" if alert_msg else ""
+    msg = (
+        f"{header}🏷 سرویس: `{email}`\n📡 وضعیت: {status_text}\n🔋 کل: {total_fmt}\n"
+        f"📊 مصرف: {used_fmt}\n📉 باقی‌مانده: {remain_fmt}\n📅 انقضا: {exp_str}\n"
+        f"🕐 آخرین بروزرسانی: {ts}"
+    )
+
     kb = [
         [InlineKeyboardButton("تغییر وضعیت 🔄", callback_data=f'toggle_status_{order_id}'), InlineKeyboardButton("تغییر UUID 🔑", callback_data=f'change_uuid_{order_id}')],
-        [InlineKeyboardButton("تغییر نام 📝", callback_data=f'rename_conf_{order_id}'), InlineKeyboardButton("📊 بروزرسانی", callback_data=f'refresh_order_{order_id}')], 
+        [InlineKeyboardButton("تغییر نام 📝", callback_data=f'rename_conf_{order_id}'), InlineKeyboardButton("📊 بروزرسانی", callback_data=f'refresh_order_{order_id}')],
         [InlineKeyboardButton("📥 دریافت کانفیگ و QR", callback_data=f'get_conf_{order_id}')],
         [InlineKeyboardButton("♻️ تمدید و تغییر پلن سرویس", callback_data=f'renew_menu_{order_id}')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_orders')]
+        [InlineKeyboardButton("🗑 حذف از لیست", callback_data=f'delorder_{order_id}'), InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_orders')],
     ]
-    if alert_msg: await query.answer(alert_msg, show_alert=True)
-    else: await query.answer()
-        
+    try: await query.answer()
+    except Exception: pass
+
     try: await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-    except: pass
+    except Exception: pass
 
 # ================= هندلرهای اصلی =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -315,6 +322,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         xui, cfg_ip = build_xui(panel)
         opid = panel['id'] if panel else None
 
+        if not cfg_ip:
+            return await update.message.reply_text("❌ «IP کانفیگ» پنل اکانت تست تنظیم نشده است. لطفاً به ادمین اطلاع دهید.", reply_markup=await get_main_keyboard(user_id))
+
         if context.user_data.get('processing'):
             return await update.message.reply_text("⏳ یک عملیات در حال انجام است، صبر کنید.")
         context.user_data['processing'] = True
@@ -329,7 +339,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             new_uuid, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, 1)
             if not new_uuid:
                 return await update.message.reply_text(f"❌ ساخت اکانت تست ناموفق بود.\n{err}", reply_markup=await get_main_keyboard(user_id))
-            config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{test_name}"
+            config_link = build_vless_link(new_uuid, cfg_ip, port, test_name)
             await add_order(user_id, config_link, opid)
             if not admin_status:
                 await db.mark_test_used(user_id)
@@ -505,7 +515,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                             real_email_from_panel = client_dict.get('email', email)
                             pid = prow['id'] if prow else None
                             pname = prow['name'] if prow else "پیش‌فرض"
-                            config_link = f"vless://{client_uuid}@{ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={ip}#{real_email_from_panel}"
+                            config_link = build_vless_link(client_uuid, ip, port, real_email_from_panel)
                             await add_order(target_user_id, config_link, pid)
                             existing_emails.add(real_email_from_panel.strip().lower())
                             per_panel[pname] = per_panel.get(pname, 0) + 1
@@ -1327,15 +1337,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not res: return
         email = unquote(res[0].split("#")[-1])
         xui, _ip = await get_order_xui(order_id)
-        is_logged, _ = await xui.login()
-        if is_logged:
-            inbound_id, port, client_dict = await xui.get_client_exact_info(email)
-            if client_dict:
-                old_uuid = client_dict['id']
-                client_dict['enable'] = not client_dict['enable'] 
-                if await xui.update_client(inbound_id, old_uuid, client_dict):
-                    await render_order_details(query, order_id, f"✅ وضعیت تغییر کرد!")
-        
+        is_logged, login_err = await xui.login()
+        if not is_logged:
+            return await query.message.reply_text(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:200]}")
+        inbound_id, port, client_dict = await xui.get_client_exact_info(email)
+        if not client_dict:
+            return await query.message.reply_text("❌ این کانفیگ روی پنل یافت نشد (احتمالاً حذف شده). می‌توانید با «🗑 حذف از لیست» آن را پاک کنید.")
+        old_uuid = client_dict['id']
+        client_dict['enable'] = not client_dict['enable']
+        if await xui.update_client(inbound_id, old_uuid, client_dict):
+            await render_order_details(query, order_id, "✅ وضعیت تغییر کرد!")
+        else:
+            await query.message.reply_text("❌ سرور درخواست تغییر وضعیت را رد کرد.")
+
     elif data.startswith("change_uuid_"):
         order_id = data.split("_")[2]
         if not await ensure_order_access(query, order_id, admin_status): return
@@ -1344,17 +1358,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old_link, _ = res
         email = unquote(old_link.split("#")[-1])
         xui, _ip = await get_order_xui(order_id)
-        is_logged, _ = await xui.login()
-        if is_logged:
-            inbound_id, port, client_dict = await xui.get_client_exact_info(email)
-            if client_dict:
-                old_uuid = client_dict['id']
-                new_uuid = str(uuid.uuid4())
-                client_dict['id'] = new_uuid
-                if await xui.update_client(inbound_id, old_uuid, client_dict):
-                    new_link = old_link.replace(old_uuid, new_uuid)
-                    async with db.db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
-                    await render_order_details(query, order_id, "✅ لینک اتصال و UUID با موفقیت تغییر کرد!")
+        is_logged, login_err = await xui.login()
+        if not is_logged:
+            return await query.message.reply_text(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:200]}")
+        inbound_id, port, client_dict = await xui.get_client_exact_info(email)
+        if not client_dict:
+            return await query.message.reply_text("❌ این کانفیگ روی پنل یافت نشد (احتمالاً حذف شده). می‌توانید با «🗑 حذف از لیست» آن را پاک کنید.")
+        old_uuid = client_dict['id']
+        new_uuid = str(uuid.uuid4())
+        client_dict['id'] = new_uuid
+        if await xui.update_client(inbound_id, old_uuid, client_dict):
+            new_link = old_link.replace(old_uuid, new_uuid)
+            async with db.db_pool.acquire() as conn: await conn.execute("UPDATE orders SET config_link = $1 WHERE id = $2", new_link, int(order_id))
+            await render_order_details(query, order_id, "✅ لینک اتصال و UUID با موفقیت تغییر کرد!")
+        else:
+            await query.message.reply_text("❌ سرور درخواست تغییر UUID را رد کرد.")
+
+    elif data.startswith("rename_conf_"):
+        order_id = data.split("_")[2]
+        if not await ensure_order_access(query, order_id, admin_status): return
+        context.user_data['state'] = f'waiting_rename_{order_id}'
+        await query.message.reply_text(
+            "📝 نام جدید کانفیگ را به انگلیسی وارد کنید (فقط حروف انگلیسی، اعداد، - و _):",
+            reply_markup=CANCEL_MARKUP,
+        )
+        try: await query.delete_message()
+        except Exception: pass
 
     elif data.startswith("renew_menu_"):
         order_id = data.split("_")[2]
@@ -1500,6 +1529,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             panel = await db.get_panel(plan['panel_id'])
             xui, cfg_ip = build_xui(panel)
             order_panel_id = panel['id'] if panel else None
+
+            # جلوگیری از ساختِ کانفیگِ خراب بدون هاست/دامنه
+            if not cfg_ip:
+                await credit_balance(user_id, price, kind='برگشت وجه')
+                return await query.edit_message_text("❌ «IP کانفیگ» این پنل تنظیم نشده است. لطفاً به ادمین اطلاع دهید. (وجه بازگشت داده شد)")
+
             is_logged, login_err = await xui.login()
 
             if not is_logged:
@@ -1513,7 +1548,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), 1)
             if new_uuid:
-                config_link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{final_name}"
+                config_link = build_vless_link(new_uuid, cfg_ip, port, final_name)
                 await add_order(user_id, config_link, order_panel_id)
                 logging.info("PURCHASE user=%s plan=%s price=%s name=%s", user_id, plan_id, price, final_name)
 
@@ -1578,6 +1613,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             panel = await db.get_panel(plan['panel_id'])
             xui, cfg_ip = build_xui(panel)
             order_panel_id = panel['id'] if panel else None
+
+            # جلوگیری از ساختِ کانفیگِ خراب بدون هاست/دامنه
+            if not cfg_ip:
+                await credit_balance(user_id, total_price, kind='برگشت وجه')
+                return await query.edit_message_text("❌ «IP کانفیگ» این پنل تنظیم نشده است. لطفاً به ادمین اطلاع دهید. (وجه بازگشت داده شد)")
+
             is_logged, login_err = await xui.login()
             if not is_logged:
                 await credit_balance(user_id, total_price, kind='برگشت وجه')  # برگشت کل وجه
@@ -1590,7 +1631,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = f"{prefix}{i}{postfix}"
                 new_uuid, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), 1)
                 if new_uuid:
-                    link = f"vless://{new_uuid}@{cfg_ip}:{port}?path=%2F&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&insecure=0&fp=chrome&type=ws&allowInsecure=0&sni={cfg_ip}#{name}"
+                    link = build_vless_link(new_uuid, cfg_ip, port, name)
                     success_configs.append(link)
                     await add_order(user_id, link, order_panel_id)
                 else:
@@ -1641,7 +1682,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['processing'] = False
 
     elif data.startswith("show_order_") or data.startswith("refresh_order_"):
-        await render_order_details(query, data.split("_")[2])
+        order_id = data.split("_")[2]
+        alert = "🔄 بروزرسانی شد" if data.startswith("refresh_order_") else None
+        await render_order_details(query, order_id, alert)
+
+    elif data.startswith("delorder_"):
+        order_id = data.split("_")[1]
+        if not await ensure_order_access(query, order_id, admin_status): return
+        await db.delete_order(order_id)
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        if not orders:
+            try: await query.edit_message_text("🗑 سرویس حذف شد. سفارش دیگری ندارید.")
+            except Exception: pass
+            return
+        keyboard = await generate_orders_keyboard(orders, page=0, search=context.user_data.get('order_search'))
+        try: await query.edit_message_text("🗑 سرویس از لیست حذف شد.\n✅ سرویس خود را انتخاب کنید:", reply_markup=keyboard)
+        except Exception: pass
+
+    elif data == 'orders_cleanup':
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        if not orders:
+            return await query.answer("سفارشی ندارید.", show_alert=True)
+        await query.answer("در حال بررسی سرویس‌ها... ⏳")
+        # آمار هر پنل یک‌بار گرفته می‌شود؛ فقط سرویس‌هایی حذف می‌شوند که پنل در دسترس بوده ولی کلاینت پیدا نشده
+        from collections import defaultdict
+        by_panel = defaultdict(list)
+        for o in orders:
+            by_panel[o['panel_id']].append(o)
+        removed = 0
+        for panel_id, group in by_panel.items():
+            panel = await db.get_panel(panel_id) if panel_id else None
+            if panel is None and not PANEL_URL:
+                continue
+            xui, _ip = build_xui(panel)
+            ok, _ = await xui.login()
+            if not ok:
+                continue  # پنل در دسترس نیست؛ برای امنیت چیزی حذف نمی‌کنیم
+            stats_map = await xui.get_all_client_stats()
+            if stats_map is None:
+                continue
+            for o in group:
+                link = o['config_link']
+                email = unquote(link.split("#")[-1]) if "#" in link else ""
+                if email.strip().lower() not in stats_map:
+                    await db.delete_order(o['id'])
+                    removed += 1
+        async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)
+        if not orders:
+            try: await query.edit_message_text(f"🧹 پاک‌سازی انجام شد. {removed} سرویسِ حذف‌شده پاک شد.\nسفارش دیگری ندارید.")
+            except Exception: pass
+            return
+        keyboard = await generate_orders_keyboard(orders, page=0, search=context.user_data.get('order_search'))
+        try:
+            await query.edit_message_text(f"🧹 {removed} سرویسِ حذف‌شده از پنل پاک شد.\n✅ سرویس خود را انتخاب کنید:", reply_markup=keyboard)
+        except Exception:
+            pass
         
     elif data == 'back_to_orders':
         async with db.db_pool.acquire() as conn: orders = await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1", user_id)

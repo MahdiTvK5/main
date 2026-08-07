@@ -2,18 +2,52 @@ import json
 import uuid
 import time
 import logging
+from urllib.parse import urlparse
 
 import httpx
 
 from config import PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP
 
 
+def _host_from_url(url):
+    """دامنه/آی‌پیِ داخل یک URL را برمی‌گرداند (بدون پورت و مسیر).
+    آدرس‌های بدون اسکیم (مثل `1.2.3.4:54321/path`) را هم پشتیبانی می‌کند."""
+    if not url:
+        return ""
+    try:
+        u = url if "://" in url else "//" + url
+        host = urlparse(u).hostname
+        return host or ""
+    except Exception:
+        return ""
+
+
 def build_xui(panel):
     """از روی ردیف پنل، کلاینت X-UI و config_ip مربوطه را می‌سازد.
-    اگر panel برابر None باشد، به مقادیر پیش‌فرضِ .env برمی‌گردد (سازگاری با نسخه‌ی تک‌پنل)."""
+    اگر panel برابر None باشد، به مقادیر پیش‌فرضِ .env برمی‌گردد (سازگاری با نسخه‌ی تک‌پنل).
+    اگر «IP کانفیگ» پنل تنظیم نشده باشد، برای جلوگیری از ساختِ لینک خرابِ بدون هاست،
+    به‌ترتیب از CONFIG_IP و سپس دامنه‌ی خود پنل استفاده می‌شود."""
     if panel:
-        return AsyncXuiAPI(panel['url'], panel['username'], panel['password']), (panel['config_ip'] or CONFIG_IP)
-    return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), CONFIG_IP
+        panel_url = panel['url']
+        cfg_ip = (panel['config_ip'] or CONFIG_IP or _host_from_url(panel_url))
+        return AsyncXuiAPI(panel_url, panel['username'], panel['password']), cfg_ip
+    cfg_ip = CONFIG_IP or _host_from_url(PANEL_URL)
+    return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), cfg_ip
+
+
+def build_vless_link(client_uuid, host, port, remark, path="/", sni=None):
+    """ساخت لینک اشتراک VLESS+WS+TLS دقیقاً مطابق قالبِ خروجیِ خودِ پنل X-UI.
+    پارامترهای غیراستاندارد قدیمی (insecure/allowInsecure) حذف شده‌اند تا کلاینت‌ها
+    بدون مشکل وصل شوند."""
+    from urllib.parse import quote
+    sni = sni or host
+    enc_path = quote(path, safe="")
+    enc_alpn = quote("h2,http/1.1,h3", safe="")
+    query = (
+        f"type=ws&encryption=none&path={enc_path}&host="
+        f"&security=tls&fp=chrome&alpn={enc_alpn}&sni={sni}"
+    )
+    return f"vless://{client_uuid}@{host}:{port}?{query}#{remark}"
 
 
 def sub_link_for(panel, email):
@@ -32,21 +66,34 @@ def sub_link_for(panel, email):
 # ================= پنل X-UI =================
 class AsyncXuiAPI:
     def __init__(self, panel_url, username, password):
-        self.url = panel_url.rstrip('/')
+        self.url = (panel_url or "").rstrip('/')
         self.username = username
         self.password = password
         self.cookies = None
 
+    def _candidate_urls(self):
+        """اگر آدرس پنل اسکیم نداشته باشد، اول https و بعد http امتحان می‌شود."""
+        u = self.url
+        if u.startswith("http://") or u.startswith("https://"):
+            return [u]
+        return [f"https://{u}", f"http://{u}"]
+
     async def login(self):
-        async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.post(f"{self.url}/login", data={"username": self.username, "password": self.password})
-                if res.status_code == 200 and res.json().get('success'):
-                    self.cookies = res.cookies
-                    return True, "OK"
-                return False, res.text
-            except Exception as e:
-                return False, str(e)
+        last_err = "آدرس پنل نامعتبر است"
+        for base in self._candidate_urls():
+            async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False) as client:
+                try:
+                    res = await client.post(f"{base}/login", data={"username": self.username, "password": self.password})
+                    if res.status_code == 200 and res.json().get('success'):
+                        # آدرس کارآمد را برای درخواست‌های بعدی نگه می‌داریم
+                        self.url = base
+                        self.cookies = res.cookies
+                        return True, "OK"
+                    # پاسخ گرفتیم ولی ناموفق (مثلاً یوزر/پس اشتباه یا مسیر نادرست)
+                    last_err = f"{base}/login → HTTP {res.status_code}: {str(res.text)[:200]}"
+                except Exception as e:
+                    last_err = f"{base}/login → {type(e).__name__}: {e}"
+        return False, last_err
 
     async def get_inbound_port(self, inbound_id):
         async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
