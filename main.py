@@ -47,9 +47,10 @@ async def resolve_plan_price(user_id, plan, role, bulk=False):
             user_id, plan['id'],
         )
     if bulk:
+        # خرید عمده فقط برای VIP/ادمین است؛ یک قیمت عمده‌ی واحد (vip_bulk_price) داریم
         if custom and custom['bulk_price'] is not None:
             return int(custom['bulk_price'])
-        return int(plan['vip_bulk_price'] if role == 'vip' else plan['bulk_price'])
+        return int(plan['vip_bulk_price'])
     if custom and custom['price'] is not None:
         return int(custom['price'])
     return int(plan['vip_price'] if role == 'vip' else plan['price'])
@@ -82,8 +83,7 @@ PLAN_FIELDS = [
     ("duration", "مدت (روز)", "duration_days", True),
     ("price", "قیمت عادی", "price", True),
     ("vipprice", "قیمت VIP", "vip_price", True),
-    ("bulk", "قیمت عمده", "bulk_price", True),
-    ("vipbulk", "عمده VIP", "vip_bulk_price", True),
+    ("vipbulk", "قیمت عمده", "vip_bulk_price", True),
     ("inbound", "اینباند", "inbound_id", True),
     ("panel", "پنل", "panel_id", True),
 ]
@@ -165,8 +165,7 @@ async def plan_edit_text(plan):
         f"📅 مدت: {plan['duration_days']} روز\n"
         f"💰 قیمت عادی: {plan['price']:,}\n"
         f"💎 قیمت VIP: {plan['vip_price']:,}\n"
-        f"📦 عمده: {plan['bulk_price']:,}\n"
-        f"👑 عمده VIP: {plan['vip_bulk_price']:,}\n"
+        f"📦 قیمت عمده: {plan['vip_bulk_price']:,}\n"
         f"⚙️ اینباند: {plan['inbound_id']}\n"
         f"🖥 پنل: {pname}\n\n"
         f"برای تغییر هر مورد، دکمه‌اش را بزنید."
@@ -405,7 +404,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return await update.message.reply_text("❌ خرید عمده فقط برای کاربران VIP فعال است.")
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             async with db.db_pool.acquire() as conn:
-                plans = await conn.fetch("SELECT * FROM plans ORDER BY bulk_price ASC")
+                plans = await conn.fetch("SELECT * FROM plans ORDER BY vip_bulk_price ASC")
             if not plans: return await update.message.reply_text("🛒 هیچ محصولی برای عمده موجود نیست.")
             kb = []
             for p in plans:
@@ -656,11 +655,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not text.isdigit():
             return await update.message.reply_text("❌ فقط آیدی عددی کاربر را بفرستید.")
         context.user_data['cp_uid'] = int(text)
-        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT id, name, price, bulk_price FROM plans ORDER BY id ASC")
+        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT id, name, price, vip_bulk_price FROM plans ORDER BY id ASC")
         if not plans:
             context.user_data['state'] = 'none'
             return await update.message.reply_text("❌ هیچ پلنی وجود ندارد.", reply_markup=await get_main_keyboard(user_id))
-        kb = [[InlineKeyboardButton(f"{p['name']} (پیش‌فرض {p['price']:,} / عمده {p['bulk_price']:,})", callback_data=f"cpplan_{p['id']}")] for p in plans]
+        kb = [[InlineKeyboardButton(f"{p['name']} (پیش‌فرض {p['price']:,} / عمده {p['vip_bulk_price']:,})", callback_data=f"cpplan_{p['id']}")] for p in plans]
         context.user_data['state'] = 'cp_choose'
         await update.message.reply_text("کدام پلن؟", reply_markup=InlineKeyboardMarkup(kb))
         return
@@ -746,14 +745,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("💎 **قیمت VIP (تکی)** را به تومان وارد کنید:", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'vipprice':
                 context.user_data['new_plan']['vip_price'] = clean_num(text)
-                context.user_data['state'] = 'plan_add_bulkprice'
-                await update.message.reply_text("📦 **قیمت عمده (برای کاربر عادی)** دونه‌ای چند تومان؟", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
-            elif step == 'bulkprice':
-                context.user_data['new_plan']['bulk_price'] = clean_num(text)
                 context.user_data['state'] = 'plan_add_vipbulkprice'
-                await update.message.reply_text("👑 **قیمت عمده VIP** دونه‌ای چند تومان؟", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+                await update.message.reply_text("📦 **قیمت عمده** (دونه‌ای، برای خرید عمده‌ی VIP) چند تومان؟", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'vipbulkprice':
-                context.user_data['new_plan']['vip_bulk_price'] = clean_num(text)
+                v = clean_num(text)
+                context.user_data['new_plan']['vip_bulk_price'] = v
+                context.user_data['new_plan']['bulk_price'] = v  # ستون قدیمی را هم‌مقدار نگه می‌داریم
                 context.user_data['state'] = 'plan_add_inbound'
                 await update.message.reply_text("⚙️ **آیدی اینباند (Inbound ID)** این پلن در پنل سنایی چند است؟ (مثلاً 1 یا 2)", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'inbound':
