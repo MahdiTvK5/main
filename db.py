@@ -172,28 +172,87 @@ async def credit_balance(user_id, amount, kind='شارژ حساب', description=
         return nb
 
 
-async def list_users(search=None, limit=100):
+async def list_users(search=None, limit=100, offset=0):
     async with db_pool.acquire() as conn:
         if search:
             like = f"%{search}%"
             return await conn.fetch(
-                "SELECT user_id, balance, nickname, role, can_bulk FROM users WHERE CAST(user_id AS TEXT) LIKE $1 OR nickname ILIKE $1 ORDER BY user_id DESC LIMIT $2",
-                like, limit,
+                "SELECT user_id, balance, nickname, role, can_bulk FROM users WHERE CAST(user_id AS TEXT) LIKE $1 OR nickname ILIKE $1 ORDER BY user_id DESC LIMIT $2 OFFSET $3",
+                like, limit, offset,
             )
-        return await conn.fetch("SELECT user_id, balance, nickname, role, can_bulk FROM users ORDER BY user_id DESC LIMIT $1", limit)
+        return await conn.fetch("SELECT user_id, balance, nickname, role, can_bulk FROM users ORDER BY user_id DESC LIMIT $1 OFFSET $2", limit, offset)
 
 
-async def list_recent_orders(limit=50, search=None):
+async def count_users(search=None):
     async with db_pool.acquire() as conn:
         if search:
             like = f"%{search}%"
-            return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders WHERE config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1 ORDER BY id DESC LIMIT $2", like, limit)
-        return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders ORDER BY id DESC LIMIT $1", limit)
+            return int(await conn.fetchval("SELECT COUNT(*) FROM users WHERE CAST(user_id AS TEXT) LIKE $1 OR nickname ILIKE $1", like) or 0)
+        return int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
 
 
-async def list_recent_transactions(limit=50):
+async def list_recent_orders(limit=50, search=None, offset=0):
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT user_id, amount, kind, description, date FROM transactions ORDER BY id DESC LIMIT $1", limit)
+        if search:
+            like = f"%{search}%"
+            return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders WHERE config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1 ORDER BY id DESC LIMIT $2 OFFSET $3", like, limit, offset)
+        return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders ORDER BY id DESC LIMIT $1 OFFSET $2", limit, offset)
+
+
+async def count_orders(search=None):
+    async with db_pool.acquire() as conn:
+        if search:
+            like = f"%{search}%"
+            return int(await conn.fetchval("SELECT COUNT(*) FROM orders WHERE config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1", like) or 0)
+        return int(await conn.fetchval("SELECT COUNT(*) FROM orders") or 0)
+
+
+async def get_orders_by_user(user_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1 ORDER BY id DESC", user_id)
+
+
+async def list_recent_transactions(limit=50, offset=0):
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT user_id, amount, kind, description, date FROM transactions ORDER BY id DESC LIMIT $1 OFFSET $2", limit, offset)
+
+
+async def count_transactions():
+    async with db_pool.acquire() as conn:
+        return int(await conn.fetchval("SELECT COUNT(*) FROM transactions") or 0)
+
+
+async def list_vips():
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT user_id, nickname, balance FROM users WHERE role = 'vip' ORDER BY user_id DESC")
+
+
+async def list_admin_rows():
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT user_id, name FROM admins ORDER BY user_id")
+
+
+async def get_user_detail(user_id):
+    """ردیف کامل کاربر همراه فیلدهای اکانت تست و دعوت (برای صفحه‌ی جزئیات در پنل وب)."""
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT user_id, balance, nickname, role, can_bulk, got_test, referred_by, ref_rewarded FROM users WHERE user_id = $1",
+            user_id,
+        )
+
+
+async def all_user_ids():
+    async with db_pool.acquire() as conn:
+        return [r['user_id'] for r in await conn.fetch("SELECT user_id FROM users")]
+
+
+async def set_user_role(user_id, role):
+    """نقش کاربر را تنظیم می‌کند (normal/vip) و در صورت نبود، کاربر را می‌سازد."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, role) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET role = $2",
+            user_id, role,
+        )
 
 
 async def list_plans():

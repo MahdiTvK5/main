@@ -514,8 +514,14 @@ def build_app():
     return app
 
 
-async def start_web():
-    """در صورت تنظیم رمز، سرور وب را داخل همان event loop ربات اجرا می‌کند و runner را برمی‌گرداند."""
+_BOT = None
+
+
+async def start_web(bot=None):
+    """در صورت تنظیم رمز، سرور وب را داخل همان event loop ربات اجرا می‌کند و runner را برمی‌گرداند.
+    bot برای قابلیت‌هایی مثل پیام همگانی از پنل وب نگه داشته می‌شود."""
+    global _BOT
+    _BOT = bot
     if not WEB_ADMIN_PASSWORD:
         logging.info("پنل وب غیرفعال است (WEB_ADMIN_PASSWORD تنظیم نشده).")
         return None
