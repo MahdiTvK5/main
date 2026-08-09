@@ -24,7 +24,7 @@ from db import (
     update_balance, deduct_balance, credit_balance, get_balance, add_order,
     get_order_by_id, order_belongs_to,
 )
-from panel import AsyncXuiAPI, build_xui, sub_link_for, build_vless_link
+from panel import AsyncXuiAPI, build_xui, sub_link_for, build_vless_link, build_share_link
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
 
@@ -336,10 +336,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not port:
                 return await update.message.reply_text("❌ اینباند اکانت تست پیدا نشد.", reply_markup=await get_main_keyboard(user_id))
             test_name = f"{user_id}_test_{str(uuid.uuid4())[:4]}"
-            new_uuid, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, 1)
-            if not new_uuid:
+            config_link, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, cfg_ip)
+            if not config_link:
                 return await update.message.reply_text(f"❌ ساخت اکانت تست ناموفق بود.\n{err}", reply_markup=await get_main_keyboard(user_id))
-            config_link = build_vless_link(new_uuid, cfg_ip, port, test_name)
             await add_order(user_id, config_link, opid)
             if not admin_status:
                 await db.mark_test_used(user_id)
@@ -511,11 +510,15 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                             continue
                         inbound_id, port, client_dict = await x.get_client_exact_info(email)
                         if client_dict:
-                            client_uuid = client_dict['id']
                             real_email_from_panel = client_dict.get('email', email)
                             pid = prow['id'] if prow else None
                             pname = prow['name'] if prow else "پیش‌فرض"
-                            config_link = build_vless_link(client_uuid, ip, port, real_email_from_panel)
+                            # لینک را مطابق پروتکل/تنظیماتِ همان اینباند می‌سازیم
+                            inbound = await x.get_inbound(inbound_id)
+                            if inbound:
+                                config_link = build_share_link(inbound, client_dict, ip)
+                            else:
+                                config_link = build_vless_link(client_dict.get('id', ''), ip, port, real_email_from_panel)
                             await add_order(target_user_id, config_link, pid)
                             existing_emails.add(real_email_from_panel.strip().lower())
                             per_panel[pname] = per_panel.get(pname, 0) + 1
@@ -1546,9 +1549,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
                 return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
 
-            new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), 1)
-            if new_uuid:
-                config_link = build_vless_link(new_uuid, cfg_ip, port, final_name)
+            config_link, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), cfg_ip)
+            if config_link:
                 await add_order(user_id, config_link, order_panel_id)
                 logging.info("PURCHASE user=%s plan=%s price=%s name=%s", user_id, plan_id, price, final_name)
 
@@ -1624,14 +1626,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await credit_balance(user_id, total_price, kind='برگشت وجه')  # برگشت کل وجه
                 return await query.edit_message_text(f"❌ خطا در لاگین پنل: {login_err}")
 
-            port = await xui.get_inbound_port(plan['inbound_id'])
+            # اینباند را یک‌بار می‌گیریم تا در حلقه بارها از پنل خوانده نشود
+            inbound = await xui.get_inbound(plan['inbound_id'])
+            if not inbound:
+                await credit_balance(user_id, total_price, kind='برگشت وجه')
+                return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
             success_configs = []
             last_err = "نامشخص"
             for i in range(start_n, end_n + 1):
                 name = f"{prefix}{i}{postfix}"
-                new_uuid, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), 1)
-                if new_uuid:
-                    link = build_vless_link(new_uuid, cfg_ip, port, name)
+                link, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), cfg_ip, inbound=inbound)
+                if link:
                     success_configs.append(link)
                     await add_order(user_id, link, order_panel_id)
                 else:
@@ -1801,7 +1806,7 @@ async def setup_db(app: Application):
     # اجرای پنل وب مدیریت (در صورت تنظیم WEB_ADMIN_PASSWORD) داخل همان event loop
     try:
         import webpanel
-        app.bot_data['web_runner'] = await webpanel.start_web()
+        app.bot_data['web_runner'] = await webpanel.start_web(app.bot)
     except Exception as e:
         logging.error("راه‌اندازی پنل وب ناموفق بود: %s", e)
     logging.info("🚀 ربات با موفقیت استارت شد...")
