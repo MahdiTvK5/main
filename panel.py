@@ -79,6 +79,20 @@ def _stream_params(stream):
         p['serviceName'] = g.get('serviceName', '') or ''
         if g.get('multiMode'):
             p['mode'] = 'multi'
+    elif net in ('xhttp', 'splithttp', 'http'):
+        # ترنسپورت xhttp/splithttp (و http قدیمی) — path/host/mode
+        xs = (stream.get('xhttpSettings') or stream.get('splithttpSettings')
+              or stream.get('httpSettings') or {})
+        p['path'] = xs.get('path', '/') or '/'
+        host = xs.get('host', '')
+        if not host:
+            hosts = xs.get('hosts') or xs.get('host') or []
+            if isinstance(hosts, list) and hosts:
+                host = hosts[0]
+        if host:
+            p['host'] = host
+        if xs.get('mode'):
+            p['mode'] = xs['mode']
     elif net in ('tcp', 'raw'):
         tcp = stream.get('tcpSettings') or stream.get('rawSettings') or {}
         header = (tcp.get('header', {}) or {}).get('type', 'none')
@@ -189,12 +203,16 @@ class AsyncXuiAPI:
     async def login(self):
         last_err = "آدرس پنل نامعتبر است"
         for base in self._candidate_urls():
-            async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False) as client:
+            # follow_redirects تا ریدایرکتِ http→https پنل خودکار دنبال شود
+            async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False, follow_redirects=True) as client:
                 try:
                     res = await client.post(f"{base}/login", data={"username": self.username, "password": self.password})
                     if res.status_code == 200 and res.json().get('success'):
-                        # آدرس کارآمد را برای درخواست‌های بعدی نگه می‌داریم
-                        self.url = base
+                        # آدرس نهایی (بعد از ریدایرکت‌ها) را مبنای درخواست‌های بعدی قرار می‌دهیم
+                        final = str(res.url)
+                        if final.endswith('/login'):
+                            final = final[:-len('/login')]
+                        self.url = final.rstrip('/') or base
                         self.cookies = res.cookies
                         return True, "OK"
                     # پاسخ گرفتیم ولی ناموفق (مثلاً یوزر/پس اشتباه یا مسیر نادرست)
