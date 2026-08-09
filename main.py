@@ -24,7 +24,7 @@ from db import (
     update_balance, deduct_balance, credit_balance, get_balance, add_order,
     get_order_by_id, order_belongs_to,
 )
-from panel import AsyncXuiAPI, build_xui, sub_link_for, build_vless_link
+from panel import AsyncXuiAPI, build_xui, sub_link_for, build_vless_link, build_share_link
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
 
@@ -39,6 +39,20 @@ def can_buy_bulk(role, admin_status):
     return admin_status or role == 'vip'
 
 
+def _plan_icon(plan):
+    """آیکون/ایموجی ابتدای دکمه‌ی پلن (اگر تنظیم شده باشد)."""
+    try:
+        icon = (plan['icon'] or '').strip()
+    except (KeyError, TypeError):
+        icon = ''
+    return f"{icon} " if icon else ""
+
+
+def plan_button_text(plan, price):
+    days = plan['duration_days'] or 30
+    return f"{_plan_icon(plan)}{plan['name']} | {plan['gb']}GB / {days}روز - {price:,} تومان"
+
+
 async def resolve_plan_price(user_id, plan, role, bulk=False):
     """قیمت پلن با اولویت: قیمت اختصاصی ← VIP ← عادی."""
     async with db.db_pool.acquire() as conn:
@@ -47,9 +61,10 @@ async def resolve_plan_price(user_id, plan, role, bulk=False):
             user_id, plan['id'],
         )
     if bulk:
+        # خرید عمده فقط برای VIP/ادمین است؛ یک قیمت عمده‌ی واحد (vip_bulk_price) داریم
         if custom and custom['bulk_price'] is not None:
             return int(custom['bulk_price'])
-        return int(plan['vip_bulk_price'] if role == 'vip' else plan['bulk_price'])
+        return int(plan['vip_bulk_price'])
     if custom and custom['price'] is not None:
         return int(custom['price'])
     return int(plan['vip_price'] if role == 'vip' else plan['price'])
@@ -80,10 +95,10 @@ PLAN_FIELDS = [
     ("name", "نام", "name", False),
     ("gb", "حجم (GB)", "gb", True),
     ("duration", "مدت (روز)", "duration_days", True),
+    ("icon", "آیکون/ایموجی", "icon", False),
     ("price", "قیمت عادی", "price", True),
     ("vipprice", "قیمت VIP", "vip_price", True),
-    ("bulk", "قیمت عمده", "bulk_price", True),
-    ("vipbulk", "عمده VIP", "vip_bulk_price", True),
+    ("vipbulk", "قیمت عمده", "vip_bulk_price", True),
     ("inbound", "اینباند", "inbound_id", True),
     ("panel", "پنل", "panel_id", True),
 ]
@@ -160,13 +175,13 @@ async def plan_edit_text(plan):
     pname = panel['name'] if panel else "—"
     return (
         f"✏️ **ویرایش پلن** (ID: `{plan['id']}`)\n\n"
+        f"{('آیکون: ' + plan['icon'] + chr(10)) if (plan['icon'] or '').strip() else ''}"
         f"📋 نام: {plan['name']}\n"
         f"💾 حجم: {plan['gb']} GB\n"
         f"📅 مدت: {plan['duration_days']} روز\n"
         f"💰 قیمت عادی: {plan['price']:,}\n"
         f"💎 قیمت VIP: {plan['vip_price']:,}\n"
-        f"📦 عمده: {plan['bulk_price']:,}\n"
-        f"👑 عمده VIP: {plan['vip_bulk_price']:,}\n"
+        f"📦 قیمت عمده: {plan['vip_bulk_price']:,}\n"
         f"⚙️ اینباند: {plan['inbound_id']}\n"
         f"🖥 پنل: {pname}\n\n"
         f"برای تغییر هر مورد، دکمه‌اش را بزنید."
@@ -336,10 +351,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not port:
                 return await update.message.reply_text("❌ اینباند اکانت تست پیدا نشد.", reply_markup=await get_main_keyboard(user_id))
             test_name = f"{user_id}_test_{str(uuid.uuid4())[:4]}"
-            new_uuid, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, 1)
-            if not new_uuid:
+            config_link, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, cfg_ip)
+            if not config_link:
                 return await update.message.reply_text(f"❌ ساخت اکانت تست ناموفق بود.\n{err}", reply_markup=await get_main_keyboard(user_id))
-            config_link = build_vless_link(new_uuid, cfg_ip, port, test_name)
             await add_order(user_id, config_link, opid)
             if not admin_status:
                 await db.mark_test_used(user_id)
@@ -392,13 +406,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif text == 'محصولات 🛍':
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             async with db.db_pool.acquire() as conn:
-                plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
+                plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
             if not plans: return await update.message.reply_text("🛒 هنوز هیچ محصولی اضافه نشده است.")
             kb = []
             for p in plans:
                 price = await resolve_plan_price(user_id, p, role, bulk=False)
-                days = p['duration_days'] or 30
-                kb.append([InlineKeyboardButton(f"{p['name']} | {p['gb']}GB / {days}روز - {price:,} تومان", callback_data=f"prebuy_{p['id']}")])
+                kb.append([InlineKeyboardButton(plan_button_text(p, price), callback_data=f"prebuy_{p['id']}")])
             await update.message.reply_text("🛍 محصول مورد نظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'خرید عمده 📦':
@@ -406,13 +419,13 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return await update.message.reply_text("❌ خرید عمده فقط برای کاربران VIP فعال است.")
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             async with db.db_pool.acquire() as conn:
-                plans = await conn.fetch("SELECT * FROM plans ORDER BY bulk_price ASC")
+                plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
             if not plans: return await update.message.reply_text("🛒 هیچ محصولی برای عمده موجود نیست.")
             kb = []
             for p in plans:
                 price = await resolve_plan_price(user_id, p, role, bulk=True)
                 days = p['duration_days'] or 30
-                kb.append([InlineKeyboardButton(f"عمده {p['name']} | {p['gb']}GB / {days}روز - دونه‌ای {price:,}T", callback_data=f"bulkbuy_{p['id']}")])
+                kb.append([InlineKeyboardButton(f"{_plan_icon(p)}عمده {p['name']} | {p['gb']}GB / {days}روز - دونه‌ای {price:,}T", callback_data=f"bulkbuy_{p['id']}")])
             await update.message.reply_text("📦 لطفاً پلن خرید گروهی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'سفارشات من 📦':
@@ -511,11 +524,15 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                             continue
                         inbound_id, port, client_dict = await x.get_client_exact_info(email)
                         if client_dict:
-                            client_uuid = client_dict['id']
                             real_email_from_panel = client_dict.get('email', email)
                             pid = prow['id'] if prow else None
                             pname = prow['name'] if prow else "پیش‌فرض"
-                            config_link = build_vless_link(client_uuid, ip, port, real_email_from_panel)
+                            # لینک را مطابق پروتکل/تنظیماتِ همان اینباند می‌سازیم
+                            inbound = await x.get_inbound(inbound_id)
+                            if inbound:
+                                config_link = build_share_link(inbound, client_dict, ip)
+                            else:
+                                config_link = build_vless_link(client_dict.get('id', ''), ip, port, real_email_from_panel)
                             await add_order(target_user_id, config_link, pid)
                             existing_emails.add(real_email_from_panel.strip().lower())
                             per_panel[pname] = per_panel.get(pname, 0) + 1
@@ -653,11 +670,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not text.isdigit():
             return await update.message.reply_text("❌ فقط آیدی عددی کاربر را بفرستید.")
         context.user_data['cp_uid'] = int(text)
-        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT id, name, price, bulk_price FROM plans ORDER BY id ASC")
+        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT id, name, price, vip_bulk_price FROM plans ORDER BY id ASC")
         if not plans:
             context.user_data['state'] = 'none'
             return await update.message.reply_text("❌ هیچ پلنی وجود ندارد.", reply_markup=await get_main_keyboard(user_id))
-        kb = [[InlineKeyboardButton(f"{p['name']} (پیش‌فرض {p['price']:,} / عمده {p['bulk_price']:,})", callback_data=f"cpplan_{p['id']}")] for p in plans]
+        kb = [[InlineKeyboardButton(f"{p['name']} (پیش‌فرض {p['price']:,} / عمده {p['vip_bulk_price']:,})", callback_data=f"cpplan_{p['id']}")] for p in plans]
         context.user_data['state'] = 'cp_choose'
         await update.message.reply_text("کدام پلن؟", reply_markup=InlineKeyboardMarkup(kb))
         return
@@ -743,14 +760,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("💎 **قیمت VIP (تکی)** را به تومان وارد کنید:", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'vipprice':
                 context.user_data['new_plan']['vip_price'] = clean_num(text)
-                context.user_data['state'] = 'plan_add_bulkprice'
-                await update.message.reply_text("📦 **قیمت عمده (برای کاربر عادی)** دونه‌ای چند تومان؟", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
-            elif step == 'bulkprice':
-                context.user_data['new_plan']['bulk_price'] = clean_num(text)
                 context.user_data['state'] = 'plan_add_vipbulkprice'
-                await update.message.reply_text("👑 **قیمت عمده VIP** دونه‌ای چند تومان؟", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+                await update.message.reply_text("📦 **قیمت عمده** (دونه‌ای، برای خرید عمده‌ی VIP) چند تومان؟", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'vipbulkprice':
-                context.user_data['new_plan']['vip_bulk_price'] = clean_num(text)
+                v = clean_num(text)
+                context.user_data['new_plan']['vip_bulk_price'] = v
+                context.user_data['new_plan']['bulk_price'] = v  # ستون قدیمی را هم‌مقدار نگه می‌داریم
                 context.user_data['state'] = 'plan_add_inbound'
                 await update.message.reply_text("⚙️ **آیدی اینباند (Inbound ID)** این پلن در پنل سنایی چند است؟ (مثلاً 1 یا 2)", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
             elif step == 'inbound':
@@ -1388,13 +1403,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("renew_menu_"):
         order_id = data.split("_")[2]
         if not await ensure_order_access(query, order_id, admin_status): return
-        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
+        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
         if not plans: return await query.answer("پلنی برای تمدید وجود ندارد!", show_alert=True)
         kb = []
         for p in plans:
             price = await resolve_plan_price(user_id, p, role, bulk=False)
-            days = p['duration_days'] or 30
-            kb.append([InlineKeyboardButton(f"{p['name']} | {p['gb']}GB / {days}روز - {price:,} T", callback_data=f"confirm_renew_{order_id}_{p['id']}")])
+            kb.append([InlineKeyboardButton(plan_button_text(p, price), callback_data=f"confirm_renew_{order_id}_{p['id']}")])
         kb.append([InlineKeyboardButton("🔙 انصراف", callback_data=f'show_order_{order_id}')])
         await query.edit_message_text(
             "🔄 **بخش تمدید سرویس**\nبا تمدید، حجم و زمان سرویس مطابق پلن انتخابی **ریست** می‌شود.\nلطفاً پلن را انتخاب کنید:",
@@ -1546,9 +1560,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
                 return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
 
-            new_uuid, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), 1)
-            if new_uuid:
-                config_link = build_vless_link(new_uuid, cfg_ip, port, final_name)
+            config_link, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), cfg_ip)
+            if config_link:
                 await add_order(user_id, config_link, order_panel_id)
                 logging.info("PURCHASE user=%s plan=%s price=%s name=%s", user_id, plan_id, price, final_name)
 
@@ -1624,14 +1637,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await credit_balance(user_id, total_price, kind='برگشت وجه')  # برگشت کل وجه
                 return await query.edit_message_text(f"❌ خطا در لاگین پنل: {login_err}")
 
-            port = await xui.get_inbound_port(plan['inbound_id'])
+            # اینباند را یک‌بار می‌گیریم تا در حلقه بارها از پنل خوانده نشود
+            inbound = await xui.get_inbound(plan['inbound_id'])
+            if not inbound:
+                await credit_balance(user_id, total_price, kind='برگشت وجه')
+                return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
             success_configs = []
             last_err = "نامشخص"
             for i in range(start_n, end_n + 1):
                 name = f"{prefix}{i}{postfix}"
-                new_uuid, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), 1)
-                if new_uuid:
-                    link = build_vless_link(new_uuid, cfg_ip, port, name)
+                link, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), cfg_ip, inbound=inbound)
+                if link:
                     success_configs.append(link)
                     await add_order(user_id, link, order_panel_id)
                 else:
@@ -1801,7 +1817,7 @@ async def setup_db(app: Application):
     # اجرای پنل وب مدیریت (در صورت تنظیم WEB_ADMIN_PASSWORD) داخل همان event loop
     try:
         import webpanel
-        app.bot_data['web_runner'] = await webpanel.start_web()
+        app.bot_data['web_runner'] = await webpanel.start_web(app.bot)
     except Exception as e:
         logging.error("راه‌اندازی پنل وب ناموفق بود: %s", e)
     logging.info("🚀 ربات با موفقیت استارت شد...")
