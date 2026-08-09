@@ -475,8 +475,9 @@ async def plans_page(request):
     pname = {p['id']: p['name'] for p in panels}
     rows = ""
     for p in plans:
+        icon = (p['icon'] or '').strip() if 'icon' in p else ''
         rows += (
-            f"<tr><td>{e(p['id'])}</td><td>{e(p['name'])}</td><td>{e(p['gb'])}</td><td>{e(p['duration_days'])}</td>"
+            f"<tr><td>{e(p['id'])}</td><td>{e(icon)}</td><td>{e(p['name'])}</td><td>{e(p['gb'])}</td><td>{e(p['duration_days'])}</td>"
             f"<td>{p['price']:,}</td><td>{p['vip_price']:,}</td><td>{p['vip_bulk_price']:,}</td><td>{e(p['inbound_id'])}</td>"
             f"<td>{e(pname.get(p['panel_id'], p['panel_id']))}</td>"
             f"<td class='actions'><a href='/plans/edit?id={e(p['id'])}'><button>✏️</button></a>"
@@ -484,8 +485,9 @@ async def plans_page(request):
             f"<input type='hidden' name='id' value='{e(p['id'])}'><button class='btn-danger'>🗑</button></form></td></tr>"
         )
     body = f"""<h2>پلن‌ها</h2>
+    <p class='muted'>پلن‌های جدید پایین‌تر نمایش داده می‌شوند. برای رنگی/دسته‌بندی‌شدن دکمه‌ها، در فیلد «آیکون» یک ایموجی بگذار (مثل 🟦 برای تانل، 🟥 برای مستقیم).</p>
     <a href='/plans/edit'><button>➕ افزودن پلن</button></a>
-    <table><tr><th>#</th><th>نام</th><th>حجم</th><th>روز</th><th>عادی</th><th>VIP</th><th>عمده</th><th>اینباند</th><th>پنل</th><th>عملیات</th></tr>{rows}</table>"""
+    <table><tr><th>#</th><th>آیکون</th><th>نام</th><th>حجم</th><th>روز</th><th>عادی</th><th>VIP</th><th>عمده</th><th>اینباند</th><th>پنل</th><th>عملیات</th></tr>{rows}</table>"""
     return layout("پلن‌ها", body, "/plans", request)
 
 
@@ -511,6 +513,7 @@ async def plan_edit_form(request):
     <div class='box'><form method='post' action='/plans/save'>{hidden_id}
       <div class='grid2'>
         <div><label>نام</label><input name='name' value='{val('name')}'></div>
+        <div><label>آیکون/ایموجی (اختیاری) مثل 🟦 یا 🟥</label><input name='icon' value='{val('icon')}'></div>
         <div><label>حجم (GB)</label><input name='gb' value='{val('gb','0')}'></div>
         <div><label>مدت (روز)</label><input name='duration_days' value='{val('duration_days','30')}'></div>
         <div><label>قیمت عادی</label><input name='price' value='{val('price','0')}'></div>
@@ -541,13 +544,14 @@ async def plan_save(request):
         raise _redirect("/plans", err="ورودی نامعتبر")
     if not name:
         raise _redirect("/plans", err="نام پلن الزامی است")
+    icon = (data.get("icon") or "").strip()
     # ستون عمده‌ی عادی حذف شده؛ همان قیمت عمده را در آن هم ذخیره می‌کنیم تا سازگاری حفظ شود
     bulk_price = vip_bulk_price
     pid = data.get("id")
     if pid and pid.isdigit():
-        await db.update_plan(int(pid), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id)
+        await db.update_plan(int(pid), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon)
     else:
-        await db.create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id)
+        await db.create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon)
     logging.info("WEB_PLAN_SAVE name=%s panel=%s", name, panel_id)
     raise _redirect("/plans", ok="پلن ذخیره شد")
 

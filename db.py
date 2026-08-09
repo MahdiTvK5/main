@@ -23,6 +23,10 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS plans (id SERIAL PRIMARY KEY, name TEXT, gb INT, price BIGINT, vip_price BIGINT, bulk_price BIGINT, vip_bulk_price BIGINT, inbound_id INT, duration_days INT DEFAULT 30)''')
         # مهاجرت برای دیتابیس‌های قدیمی که هنوز ستون مدت‌زمان را ندارند
         await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS duration_days INT DEFAULT 30")
+        # آیکون/ایموجی نمایشی ابتدای دکمه‌ی هر پلن (اختیاری)
+        await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS icon TEXT DEFAULT ''")
+        # ترتیب نمایش دلخواه؛ پیش‌فرض بر اساس آیدی (پلن‌های جدید پایین‌تر)
+        await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS sort_order INT")
         # جدول جدید برای قیمت‌های اختصاصی کاربران
         await conn.execute('''CREATE TABLE IF NOT EXISTS custom_prices (user_id BIGINT, plan_id INT, price BIGINT, bulk_price BIGINT, PRIMARY KEY(user_id, plan_id))''')
 
@@ -257,7 +261,7 @@ async def set_user_role(user_id, role):
 
 async def list_plans():
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT * FROM plans ORDER BY id ASC")
+        return await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
 
 
 async def get_plan(plan_id):
@@ -265,20 +269,20 @@ async def get_plan(plan_id):
         return await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
 
 
-async def create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id):
+async def create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon=''):
     async with db_pool.acquire() as conn:
         return await conn.fetchval(
-            """INSERT INTO plans (name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id""",
-            name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+            """INSERT INTO plans (name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id""",
+            name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon or '',
         )
 
 
-async def update_plan(plan_id, name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id):
+async def update_plan(plan_id, name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon=''):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """UPDATE plans SET name=$2, gb=$3, duration_days=$4, price=$5, vip_price=$6, bulk_price=$7, vip_bulk_price=$8, inbound_id=$9, panel_id=$10 WHERE id=$1""",
-            int(plan_id), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+            """UPDATE plans SET name=$2, gb=$3, duration_days=$4, price=$5, vip_price=$6, bulk_price=$7, vip_bulk_price=$8, inbound_id=$9, panel_id=$10, icon=$11 WHERE id=$1""",
+            int(plan_id), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon or '',
         )
 
 

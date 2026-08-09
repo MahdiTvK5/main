@@ -39,6 +39,20 @@ def can_buy_bulk(role, admin_status):
     return admin_status or role == 'vip'
 
 
+def _plan_icon(plan):
+    """آیکون/ایموجی ابتدای دکمه‌ی پلن (اگر تنظیم شده باشد)."""
+    try:
+        icon = (plan['icon'] or '').strip()
+    except (KeyError, TypeError):
+        icon = ''
+    return f"{icon} " if icon else ""
+
+
+def plan_button_text(plan, price):
+    days = plan['duration_days'] or 30
+    return f"{_plan_icon(plan)}{plan['name']} | {plan['gb']}GB / {days}روز - {price:,} تومان"
+
+
 async def resolve_plan_price(user_id, plan, role, bulk=False):
     """قیمت پلن با اولویت: قیمت اختصاصی ← VIP ← عادی."""
     async with db.db_pool.acquire() as conn:
@@ -81,6 +95,7 @@ PLAN_FIELDS = [
     ("name", "نام", "name", False),
     ("gb", "حجم (GB)", "gb", True),
     ("duration", "مدت (روز)", "duration_days", True),
+    ("icon", "آیکون/ایموجی", "icon", False),
     ("price", "قیمت عادی", "price", True),
     ("vipprice", "قیمت VIP", "vip_price", True),
     ("vipbulk", "قیمت عمده", "vip_bulk_price", True),
@@ -160,6 +175,7 @@ async def plan_edit_text(plan):
     pname = panel['name'] if panel else "—"
     return (
         f"✏️ **ویرایش پلن** (ID: `{plan['id']}`)\n\n"
+        f"{('آیکون: ' + plan['icon'] + chr(10)) if (plan['icon'] or '').strip() else ''}"
         f"📋 نام: {plan['name']}\n"
         f"💾 حجم: {plan['gb']} GB\n"
         f"📅 مدت: {plan['duration_days']} روز\n"
@@ -390,13 +406,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif text == 'محصولات 🛍':
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             async with db.db_pool.acquire() as conn:
-                plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
+                plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
             if not plans: return await update.message.reply_text("🛒 هنوز هیچ محصولی اضافه نشده است.")
             kb = []
             for p in plans:
                 price = await resolve_plan_price(user_id, p, role, bulk=False)
-                days = p['duration_days'] or 30
-                kb.append([InlineKeyboardButton(f"{p['name']} | {p['gb']}GB / {days}روز - {price:,} تومان", callback_data=f"prebuy_{p['id']}")])
+                kb.append([InlineKeyboardButton(plan_button_text(p, price), callback_data=f"prebuy_{p['id']}")])
             await update.message.reply_text("🛍 محصول مورد نظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'خرید عمده 📦':
@@ -404,13 +419,13 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return await update.message.reply_text("❌ خرید عمده فقط برای کاربران VIP فعال است.")
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             async with db.db_pool.acquire() as conn:
-                plans = await conn.fetch("SELECT * FROM plans ORDER BY vip_bulk_price ASC")
+                plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
             if not plans: return await update.message.reply_text("🛒 هیچ محصولی برای عمده موجود نیست.")
             kb = []
             for p in plans:
                 price = await resolve_plan_price(user_id, p, role, bulk=True)
                 days = p['duration_days'] or 30
-                kb.append([InlineKeyboardButton(f"عمده {p['name']} | {p['gb']}GB / {days}روز - دونه‌ای {price:,}T", callback_data=f"bulkbuy_{p['id']}")])
+                kb.append([InlineKeyboardButton(f"{_plan_icon(p)}عمده {p['name']} | {p['gb']}GB / {days}روز - دونه‌ای {price:,}T", callback_data=f"bulkbuy_{p['id']}")])
             await update.message.reply_text("📦 لطفاً پلن خرید گروهی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'سفارشات من 📦':
@@ -1388,13 +1403,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("renew_menu_"):
         order_id = data.split("_")[2]
         if not await ensure_order_access(query, order_id, admin_status): return
-        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY price ASC")
+        async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
         if not plans: return await query.answer("پلنی برای تمدید وجود ندارد!", show_alert=True)
         kb = []
         for p in plans:
             price = await resolve_plan_price(user_id, p, role, bulk=False)
-            days = p['duration_days'] or 30
-            kb.append([InlineKeyboardButton(f"{p['name']} | {p['gb']}GB / {days}روز - {price:,} T", callback_data=f"confirm_renew_{order_id}_{p['id']}")])
+            kb.append([InlineKeyboardButton(plan_button_text(p, price), callback_data=f"confirm_renew_{order_id}_{p['id']}")])
         kb.append([InlineKeyboardButton("🔙 انصراف", callback_data=f'show_order_{order_id}')])
         await query.edit_message_text(
             "🔄 **بخش تمدید سرویس**\nبا تمدید، حجم و زمان سرویس مطابق پلن انتخابی **ریست** می‌شود.\nلطفاً پلن را انتخاب کنید:",
