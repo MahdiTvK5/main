@@ -104,9 +104,8 @@ _RATE_WINDOW = 5.0      # در این بازه (ثانیه)
 _user_hits = defaultdict(deque)
 _last_rate_prune = 0.0
 
-# فاصله‌ی بین پیام‌های همگانی و کانفیگ‌های عمده (سقف تلگرام حدود ۳۰ پیام در ثانیه است)
+# فاصله‌ی بین پیام‌های همگانی (سقف تلگرام حدود ۳۰ پیام در ثانیه است)
 BROADCAST_DELAY = 0.05
-BULK_CHUNK = 5          # تعداد کانفیگی که هم‌زمان روی پنل ساخته می‌شود
 
 
 def _prune_rate_hits(now):
@@ -299,6 +298,89 @@ async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_m
             await progress_msg.edit_text(f"✅ پیام به {sent} کاربر ارسال شد." + (f"\n⚠️ ناموفق: {failed}" if failed else ""))
         except Exception:
             pass
+
+
+async def _run_bulk_creation(context, query, user_id, plan, names, cfg_ip, xui, inbound,
+                             order_panel_id, unit_price, total_price, prefix,
+                             nickname, role, admin_status):
+    """ساخت کانفیگ‌های عمده در پس‌زمینه، با گزارش پیشرفت و برگشت وجهِ موارد ناموفق."""
+    success_configs, last_err = [], "نامشخص"
+    try:
+        for i, name in enumerate(names, 1):
+            link, err = await xui.add_client(
+                plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), cfg_ip, inbound=inbound,
+            )
+            if link:
+                success_configs.append(link)
+                await add_order(user_id, link, order_panel_id, email=name, inbound_id=plan['inbound_id'])
+            else:
+                last_err = err
+            if len(names) > 10 and i % 10 == 0:
+                try:
+                    await query.edit_message_text(f"در حال ساخت کانفیگ‌ها... {i} از {len(names)} ⏳")
+                except Exception:
+                    pass
+
+        # برگشت وجهِ کانفیگ‌هایی که ساخته نشدند
+        actual_deduction = unit_price * len(success_configs)
+        refund = total_price - actual_deduction
+        if refund > 0:
+            await credit_balance(user_id, refund, kind='برگشت وجه', description='کانفیگ‌های ناموفق عمده')
+
+        if not success_configs:
+            try:
+                await query.edit_message_text(
+                    f"❌ سرور پنل سنایی اجازه ساخت هیچ کانفیگی را نداد!\n\nدلیل خطای پنل: `{last_err}`\n\n"
+                    "⚠️ راهنمایی: احتمالاً کانفیگی با این اسم از قبل در پنل وجود دارد.",
+                    parse_mode='Markdown',
+                )
+            except Exception as ex:
+                logging.warning("گزارش خطای خرید عمده ناموفق بود: %s", ex)
+            return
+
+        file_in_ram = io.BytesIO("\n\n".join(success_configs).encode('utf-8'))
+        file_in_ram.name = f"Configs_Bulk_{prefix}.txt"
+        await context.bot.send_document(
+            chat_id=user_id, document=file_in_ram,
+            caption=f"✅ عملیات موفق!\n📦 تعداد ساخته شده: {len(success_configs)}\n💰 مبلغ کسر شده: {actual_deduction:,} تومان",
+        )
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        logging.info("BULK_PURCHASE user=%s plan=%s ok=%s of=%s amount=%s", user_id, plan['id'], len(success_configs), len(names), actual_deduction)
+
+        # فاکتور برای همه‌ی ادمین‌ها
+        user_type = "ادمین 👑" if admin_status else ("VIP 💎" if role == 'vip' else "عادی")
+        invoice_text = (
+            f"🧾 **فاکتور فروش عمده**\n\n"
+            f"👤 **خریدار:** `{user_id}` ( {nickname or 'بدون نام'} )\n"
+            f"🔰 **سطح کاربری:** {user_type}\n"
+            f"🛍 **محصول:** {plan['name']}\n"
+            f"📦 **تعداد موفق:** {len(success_configs)} از {len(names)}\n"
+            f"💵 **قیمت واحد:** {unit_price:,} تومان\n"
+            f"💳 **جمع کل کسر شده:** {actual_deduction:,} تومان\n"
+            f"📅 **تاریخ:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        for adm in await get_all_admins():
+            if not adm:
+                continue
+            try:
+                await context.bot.send_message(chat_id=adm, text=invoice_text, parse_mode='Markdown')
+            except Exception as ex:
+                logging.warning("ارسال فاکتور به ادمین %s ناموفق بود: %s", adm, ex)
+    except Exception as ex:
+        logging.error("خرید عمده با خطا متوقف شد: %s", ex, exc_info=True)
+        # وجهِ کانفیگ‌های ساخته‌نشده برگشت داده می‌شود تا پول کاربر نسوزد
+        refund = total_price - unit_price * len(success_configs)
+        if refund > 0:
+            await credit_balance(user_id, refund, kind='برگشت وجه', description='خطا در خرید عمده')
+        try:
+            await context.bot.send_message(user_id, f"❌ خرید عمده با خطا متوقف شد. {len(success_configs)} کانفیگ ساخته شد و مابقی وجه برگشت داده شد.")
+        except Exception:
+            pass
+    finally:
+        context.user_data['processing'] = False
 
 
 async def find_stale_orders(orders):
@@ -1787,6 +1869,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get('processing'):
             return await safe_answer(query, "⏳ یک عملیات در حال انجام است، صبر کنید.", alert=True)
         context.user_data['processing'] = True
+        keep_processing = False
         try:
             # کل مبلغ به‌صورت اتمیک رزرو می‌شود؛ مابه‌التفاوت کانفیگ‌های ناموفق بعداً برگشت می‌خورد
             if await deduct_balance(user_id, total_price, kind='خرید عمده') is None:
@@ -1812,76 +1895,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not inbound:
                 await credit_balance(user_id, total_price, kind='برگشت وجه')
                 return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
-            success_configs = []
-            last_err = "نامشخص"
             names = [f"{prefix}{i}{postfix}" for i in range(start_n, end_n + 1)]
-            # ساخت دسته‌ای؛ ترتیبیِ قبلی برای ۱۰۰ کانفیگ ده‌ها ثانیه ربات را قفل می‌کرد
-            for pos in range(0, len(names), BULK_CHUNK):
-                batch = names[pos:pos + BULK_CHUNK]
-                results = await asyncio.gather(*[
-                    xui.add_client(plan['inbound_id'], nm, plan['gb'], (plan['duration_days'] or 30), cfg_ip, inbound=inbound)
-                    for nm in batch
-                ], return_exceptions=True)
-                for nm, res in zip(batch, results):
-                    if isinstance(res, Exception):
-                        last_err = str(res)
-                        continue
-                    link, err = res
-                    if link:
-                        success_configs.append(link)
-                        await add_order(user_id, link, order_panel_id, email=nm, inbound_id=plan['inbound_id'])
-                    else:
-                        last_err = err
-                if len(names) > BULK_CHUNK:
-                    try:
-                        await query.edit_message_text(f"در حال ساخت کانفیگ‌ها... {min(pos + BULK_CHUNK, len(names))} از {len(names)} ⏳")
-                    except Exception:
-                        pass
-
-            # برگشت وجهِ کانفیگ‌هایی که ساخته نشدند
-            actual_deduction = unit_price * len(success_configs)
-            refund = total_price - actual_deduction
-            if refund > 0:
-                await credit_balance(user_id, refund, kind='برگشت وجه', description='کانفیگ‌های ناموفق عمده')
-
-            if success_configs:
-                configs_text = "\n\n".join(success_configs)
-                file_in_ram = io.BytesIO(configs_text.encode('utf-8'))
-                file_in_ram.name = f"Configs_Bulk_{prefix}.txt"
-                
-                await context.bot.send_document(
-                    chat_id=user_id, 
-                    document=file_in_ram, 
-                    caption=f"✅ عملیات موفق!\n📦 تعداد ساخته شده: {len(success_configs)}\n💰 مبلغ کسر شده: {actual_deduction:,} تومان"
-                )
-                await query.delete_message()
-                
-                # --- سیستم فاکتور دقیق برای مدیریت (هر کسی خرید عمده زد) ---
-                admins = await get_all_admins()
-                u_nick = nickname if nickname else "بدون نام"
-                user_type = "ادمین 👑" if admin_status else ("VIP 💎" if role == 'vip' else "عادی")
-                
-                invoice_text = (
-                    f"🧾 **فاکتور فروش عمده**\n\n"
-                    f"👤 **خریدار:** `{user_id}` ( {u_nick} )\n"
-                    f"🔰 **سطح کاربری:** {user_type}\n"
-                    f"🛍 **محصول:** {plan['name']}\n"
-                    f"📦 **تعداد موفق:** {len(success_configs)} از {count}\n"
-                    f"💵 **قیمت واحد:** {unit_price:,} تومان\n"
-                    f"💳 **جمع کل کسر شده:** {actual_deduction:,} تومان\n"
-                    f"📅 **تاریخ:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                )
-                
-                for adm in admins:
-                    if adm != 0:
-                        try: await context.bot.send_message(chat_id=adm, text=invoice_text, parse_mode='Markdown')
-                        except Exception as ex:
-                            logging.warning("ارسال فاکتور به ادمین %s ناموفق بود: %s", adm, ex)
-                # -------------------------------------------------------------
-            else: 
-                await query.edit_message_text(f"❌ سرور پنل سنایی اجازه ساخت هیچ کانفیگی را نداد!\n\nدلیل خطای پنل: `{last_err}`\n\n⚠️ راهنمایی: احتمالاً کانفیگی با این اسم از قبل در پنل وجود دارد.", parse_mode='Markdown')
+            # ساخت در پس‌زمینه ادامه پیدا می‌کند تا ربات برای بقیه‌ی کاربران قفل نشود.
+            # عمداً ترتیبی است: addClient تنظیمات اینباند را می‌خواند و بازنویسی می‌کند،
+            # پس درخواست‌های هم‌زمان می‌توانند کانفیگ‌های همدیگر را از بین ببرند.
+            context.application.create_task(_run_bulk_creation(
+                context=context, query=query, user_id=user_id, plan=plan, names=names,
+                cfg_ip=cfg_ip, xui=xui, inbound=inbound, order_panel_id=order_panel_id,
+                unit_price=unit_price, total_price=total_price, prefix=prefix,
+                nickname=nickname, role=role, admin_status=admin_status,
+            ))
+            keep_processing = True
         finally:
-            context.user_data['processing'] = False
+            # پرچم فقط وقتی آزاد می‌شود که کاری در پس‌زمینه شروع نشده باشد
+            if not keep_processing:
+                context.user_data['processing'] = False
 
     elif data.startswith("show_order_") or data.startswith("refresh_order_"):
         order_id = data.split("_")[2]
