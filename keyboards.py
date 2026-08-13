@@ -1,10 +1,10 @@
 import time
-from urllib.parse import unquote
 
 from telegram import ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 
 import db
 from db import get_user, is_admin, get_setting, has_test
+from links import order_email
 from panel import build_xui
 from config import PANEL_URL
 
@@ -33,18 +33,18 @@ CANCEL_MARKUP = ReplyKeyboardMarkup([['لغو ❌']], resize_keyboard=True)
 
 
 async def generate_orders_keyboard(orders, page=0, page_size=8, search=None):
-    """orders: لیستی از ردیف‌ها شامل (id, config_link, date, panel_id).
+    """orders: ردیف‌های سفارش از db.get_orders_by_user (شامل id, config_link, email, panel_id).
     با صفحه‌بندی و جستجو. آمار هر پنل فقط یک‌بار برای آیتم‌های همان صفحه گرفته می‌شود."""
     keyboard = [[InlineKeyboardButton("وضعیت 🔎", callback_data='ignore'), InlineKeyboardButton("عنوان 📋", callback_data='ignore')]]
 
-    def _email_of(link, oid):
-        return unquote(link.split("#")[-1]) if "#" in link else f"سرویس {oid}"
+    def _label(order):
+        return order_email(order) or f"سرویس {order['id']}"
 
-    # جدیدترین‌ها اول
-    items = list(orders)[::-1]
+    # جدیدترین‌ها اول (get_orders_by_user نزولی برمی‌گرداند، ولی برای سازگاری مرتب می‌کنیم)
+    items = sorted(orders, key=lambda o: o['id'], reverse=True)
     if search:
         s = search.strip().lower()
-        items = [o for o in items if s in _email_of(o[1], o[0]).lower()]
+        items = [o for o in items if s in _label(o).lower()]
 
     total = len(items)
     pages = max(1, (total + page_size - 1) // page_size)
@@ -54,7 +54,7 @@ async def generate_orders_keyboard(orders, page=0, page_size=8, search=None):
 
     # برای هر پنلِ درگیر در این صفحه، یک‌بار آمار همه‌ی کلاینت‌ها را می‌گیریم
     stats_by_panel = {}
-    for panel_id in {o[3] for o in chunk}:
+    for panel_id in {o['panel_id'] for o in chunk}:
         panel = await db.get_panel(panel_id) if panel_id else None
         if panel is None and not PANEL_URL:
             stats_by_panel[panel_id] = None
@@ -63,9 +63,10 @@ async def generate_orders_keyboard(orders, page=0, page_size=8, search=None):
         is_login, _ = await xui.login()
         stats_by_panel[panel_id] = await xui.get_all_client_stats() if is_login else None
 
-    for order_id, link, _date, panel_id in chunk:
-        email = _email_of(link, order_id)
-        stats_map = stats_by_panel.get(panel_id)
+    for order in chunk:
+        order_id = order['id']
+        email = _label(order)
+        stats_map = stats_by_panel.get(order['panel_id'])
         if stats_map is None:
             status_text = "خطا ⚠️"
         else:

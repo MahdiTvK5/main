@@ -15,6 +15,7 @@ from urllib.parse import quote
 from aiohttp import web
 
 import db
+from links import order_email
 from config import (
     WEB_ADMIN_PASSWORD, WEB_PORT, WEB_HOST,
     DB_USER, DB_PASS, DB_NAME, DB_HOST, DB_PORT,
@@ -280,8 +281,7 @@ async def user_view(request):
 
     o_rows = ""
     for o in orders:
-        link = o['config_link']
-        email = link.split("#")[-1] if "#" in link else ""
+        email = order_email(o)
         o_rows += (
             f"<tr><td>{e(o['id'])}</td><td>{e(email)}</td><td>{e(o['date'])}</td><td>{e(o['panel_id'])}</td>"
             f"<td><form class='inline' method='post' action='/orders/delete' onsubmit=\"return confirm('حذف سفارش؟')\">"
@@ -423,8 +423,7 @@ async def orders_page(request):
     orders = await db.list_recent_orders(limit=PER_PAGE, search=search, offset=(page - 1) * PER_PAGE)
     rows = ""
     for o in orders:
-        link = o['config_link']
-        email = link.split("#")[-1] if "#" in link else ""
+        email = order_email(o)
         rows += (
             f"<tr><td>{e(o['id'])}</td><td><a href='/users/view?id={e(o['user_id'])}'>{e(o['user_id'])}</a></td>"
             f"<td>{e(email)}</td><td>{e(o['date'])}</td><td>{e(o['panel_id'])}</td>"
