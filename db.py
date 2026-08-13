@@ -89,7 +89,9 @@ async def init_db():
         # ===== بکاپ خودکار =====
         await conn.execute("INSERT INTO settings (key, value) VALUES ('backup_enabled', 'off') ON CONFLICT DO NOTHING")
 
-        await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '6274-8817-0038-7946') ON CONFLICT DO NOTHING")
+        # شماره کارت عمداً خالی است تا اطلاعات بانکیِ واقعی داخل سورس نباشد؛
+        # از منوی مدیریت یا پنل وب تنظیم می‌شود.
+        await conn.execute("INSERT INTO settings (key, value) VALUES ('card_number', '') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('sales_status', 'open') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('support_id', '@khodehamed') ON CONFLICT DO NOTHING")
         # تنظیمات پیش‌فرض اکانت تست
@@ -98,6 +100,16 @@ async def init_db():
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_days', '1') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_panel_id', '') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_inbound_id', '') ON CONFLICT DO NOTHING")
+
+        # ===== ایندکس‌ها =====
+        # این کوئری‌ها در هر «سفارشات من»، هر گزارش و هر هشدار انقضا اجرا می‌شوند.
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_panel ON orders(panel_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_email ON orders(LOWER(email))")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id, id DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_kind ON transactions(kind)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_ref ON users(referred_by)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_plans_panel ON plans(panel_id)")
 
 
 async def _backfill_order_emails(conn):
@@ -134,8 +146,12 @@ async def get_setting(key):
 
 
 async def update_setting(key, value):
+    """ذخیره‌ی تنظیم. اگر کلید وجود نداشته باشد ساخته می‌شود (قبلاً بی‌صدا گم می‌شد)."""
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE settings SET value = $1 WHERE key = $2", str(value), key)
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
+            key, str(value),
+        )
 
 
 async def get_user(user_id):
@@ -166,10 +182,22 @@ async def save_user(user_id, nickname, role, can_bulk, balance):
 
 
 async def delete_user(user_id):
+    """حذف کاربر همراه داده‌های وابسته.
+
+    تراکنش‌ها عمداً نگه داشته می‌شوند چون سند مالی هستند و گزارش فروش را تغییر
+    نمی‌دهند. خروجی: تعداد سفارش‌هایی که از لیست پاک شد.
+    """
     async with db_pool.acquire() as conn:
         async with conn.transaction():
+            status = await conn.execute("DELETE FROM orders WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM custom_prices WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM gift_redemptions WHERE user_id = $1", user_id)
+            await conn.execute("UPDATE users SET referred_by = NULL WHERE referred_by = $1", user_id)
             await conn.execute("DELETE FROM users WHERE user_id = $1", user_id)
+    try:
+        return int(status.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
 
 
 async def deduct_balance(user_id, amount, kind='خرید', description=''):

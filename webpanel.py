@@ -6,9 +6,10 @@
 import os
 import html
 import hmac
+import time
 import asyncio
-import hashlib
 import logging
+import secrets
 import datetime
 from urllib.parse import quote
 
@@ -17,7 +18,7 @@ from aiohttp import web
 import db
 from links import order_email
 from config import (
-    WEB_ADMIN_PASSWORD, WEB_PORT, WEB_HOST,
+    WEB_ADMIN_PASSWORD, WEB_PORT, WEB_HOST, WEB_SESSION_TTL,
     DB_USER, DB_PASS, DB_NAME, DB_HOST, DB_PORT,
 )
 
@@ -25,20 +26,64 @@ from config import (
 _BOT = None
 PER_PAGE = 20
 
+# تسک‌های پس‌زمینه (مثل پیام همگانی) نگه داشته می‌شوند تا زودتر از موعد جمع نشوند
+_TASKS = set()
 
 # ================= احراز هویت =================
-def _secret():
-    return hashlib.sha256((WEB_ADMIN_PASSWORD or "no-secret").encode()).digest()
+# نشست‌ها تصادفی و دارای انقضا هستند. قبلاً توکن یک مقدار ثابتِ مشتق از رمز بود؛
+# یعنی هرگز باطل نمی‌شد، خروج از حساب کاری نمی‌کرد و لو رفتنِ کوکی دسترسیِ دائمی می‌داد.
+_SESSIONS = {}  # token -> expires_at (monotonic)
+
+# محدودیت تلاش ورود به‌ازای هر IP (جلوگیری از حدس زدن رمز)
+_LOGIN_FAILS = {}  # ip -> (تعداد تلاش ناموفق، زمان آزادسازی)
+_MAX_LOGIN_FAILS = 5
+_LOGIN_BLOCK_SECONDS = 300
 
 
-def _token():
-    return hmac.new(_secret(), b"admin-session-v1", hashlib.sha256).hexdigest()
+def _prune_sessions():
+    now = time.monotonic()
+    for tok in [t for t, exp in _SESSIONS.items() if exp <= now]:
+        _SESSIONS.pop(tok, None)
+
+
+def _new_session():
+    _prune_sessions()
+    token = secrets.token_urlsafe(32)
+    _SESSIONS[token] = time.monotonic() + WEB_SESSION_TTL
+    return token
 
 
 def _authed(request):
     if not WEB_ADMIN_PASSWORD:
         return False
-    return hmac.compare_digest(request.cookies.get("session", ""), _token())
+    token = request.cookies.get("session", "")
+    if not token:
+        return False
+    exp = _SESSIONS.get(token)
+    if exp is None:
+        return False
+    if exp <= time.monotonic():
+        _SESSIONS.pop(token, None)
+        return False
+    return True
+
+
+def _login_blocked(ip):
+    fails, until = _LOGIN_FAILS.get(ip, (0, 0.0))
+    if fails >= _MAX_LOGIN_FAILS and time.monotonic() < until:
+        return int(until - time.monotonic()) + 1
+    return 0
+
+
+def _note_login_fail(ip):
+    fails, _until = _LOGIN_FAILS.get(ip, (0, 0.0))
+    fails += 1
+    _LOGIN_FAILS[ip] = (fails, time.monotonic() + _LOGIN_BLOCK_SECONDS)
+    return fails
+
+
+def _is_https(request):
+    return request.scheme == "https" or request.headers.get("X-Forwarded-Proto", "") == "https"
 
 
 def require_auth(handler):
@@ -47,6 +92,14 @@ def require_auth(handler):
             raise web.HTTPFound("/login")
         return await handler(request)
     return wrapper
+
+
+def money(value):
+    """نمایش مبلغ با جداکننده‌ی هزارگان؛ NULL را صفر در نظر می‌گیرد."""
+    try:
+        return f"{int(value or 0):,}"
+    except (TypeError, ValueError):
+        return "0"
 
 
 def e(v):
@@ -177,7 +230,11 @@ def _page_arg(request):
 async def login_get(request):
     if _authed(request):
         raise web.HTTPFound("/")
-    err = "<p style='color:#ff9aa6'>رمز اشتباه است.</p>" if request.query.get("err") else ""
+    blocked = _login_blocked(request.remote)
+    if blocked:
+        err = f"<p style='color:#ff9aa6'>تلاش‌های ناموفق زیاد بود. {blocked} ثانیه دیگر تلاش کنید.</p>"
+    else:
+        err = "<p style='color:#ff9aa6'>رمز اشتباه است.</p>" if request.query.get("err") else ""
     body = f"""{PAGE_CSS}
     <div style='max-width:360px;margin:14vh auto;text-align:center'>
       <div class='box'>
@@ -192,17 +249,31 @@ async def login_get(request):
 
 
 async def login_post(request):
+    ip = request.remote
+    blocked = _login_blocked(ip)
+    if blocked:
+        logging.warning("WEB_LOGIN blocked from %s (%ss left)", ip, blocked)
+        raise web.HTTPFound("/login")
     data = await request.post()
-    if WEB_ADMIN_PASSWORD and hmac.compare_digest(data.get("password", ""), WEB_ADMIN_PASSWORD):
+    if WEB_ADMIN_PASSWORD and hmac.compare_digest(str(data.get("password", "")), WEB_ADMIN_PASSWORD):
+        _LOGIN_FAILS.pop(ip, None)
         resp = web.HTTPFound("/")
-        resp.set_cookie("session", _token(), httponly=True, max_age=86400, samesite="Lax")
-        logging.info("WEB_LOGIN success from %s", request.remote)
+        resp.set_cookie(
+            "session", _new_session(), httponly=True, max_age=WEB_SESSION_TTL,
+            samesite="Lax", secure=_is_https(request),
+        )
+        logging.info("WEB_LOGIN success from %s", ip)
         return resp
-    logging.warning("WEB_LOGIN failed from %s", request.remote)
+    fails = _note_login_fail(ip)
+    logging.warning("WEB_LOGIN failed from %s (attempt %s)", ip, fails)
+    # تأخیر کوچک تا حدس زدن رمز پرهزینه‌تر شود
+    await asyncio.sleep(1.0)
     raise web.HTTPFound("/login?err=1")
 
 
 async def logout(request):
+    # نشست سمت سرور هم باطل می‌شود، نه فقط کوکی مرورگر
+    _SESSIONS.pop(request.cookies.get("session", ""), None)
     resp = web.HTTPFound("/login")
     resp.del_cookie("session")
     return resp
@@ -250,7 +321,7 @@ async def users_page(request):
     rows = ""
     for u in users:
         rows += (
-            f"<tr><td>{e(u['user_id'])}</td><td>{e(u['nickname'])}</td><td>{u['balance']:,}</td>"
+            f"<tr><td>{e(u['user_id'])}</td><td>{e(u['nickname'])}</td><td>{money(u['balance'])}</td>"
             f"<td>{_role_badge(u['role'])}</td>"
             f"<td class='actions'><a href='/users/view?id={e(u['user_id'])}'><button class='btn-ghost'>👁 جزئیات</button></a>"
             f"<a href='/users/edit?id={e(u['user_id'])}'><button>✏️</button></a></td></tr>"
@@ -305,7 +376,7 @@ async def user_view(request):
         <h3>اطلاعات</h3>
         <p>نام: <b>{e(u['nickname'] or '—')}</b></p>
         <p>نقش: {_role_badge(u['role'])}</p>
-        <p>موجودی: <b>{u['balance']:,}</b> تومان</p>
+        <p>موجودی: <b>{money(u['balance'])}</b> تومان</p>
         <p>اکانت تست گرفته: {'بله' if u['got_test'] else 'خیر'}</p>
         <p>دعوت‌کننده: {e(u['referred_by'] or '—')} | تعداد دعوت‌های او: {ref_count}</p>
         <div class='row' style='margin-top:10px'>
@@ -377,14 +448,13 @@ async def user_save(request):
 @require_auth
 async def user_delete(request):
     data = await request.post()
-    back = data.get("back") or "/users"
     try:
         uid = int(data.get("user_id"))
-        await db.delete_user(uid)
-        logging.info("WEB_USER_DELETE user=%s", uid)
     except (TypeError, ValueError):
         raise _redirect("/users", err="آیدی نامعتبر")
-    raise _redirect("/users", ok="کاربر حذف شد")
+    removed = await db.delete_user(uid)
+    logging.info("WEB_USER_DELETE user=%s orders=%s", uid, removed)
+    raise _redirect("/users", ok=f"کاربر حذف شد ({removed} سفارش هم از لیست پاک شد)")
 
 
 @require_auth
@@ -396,7 +466,14 @@ async def users_adjust(request):
         amount = int(data.get("amount"))
     except (TypeError, ValueError):
         raise _redirect(back, err="مبلغ نامعتبر")
-    await db.credit_balance(uid, amount, kind="تنظیم مدیریت", description="پنل وب")
+    if amount == 0:
+        raise _redirect(back, err="مبلغ صفر است")
+    if amount < 0:
+        # کسر از طریق مسیر اتمیک انجام می‌شود تا موجودی منفی نشود
+        if await db.deduct_balance(uid, -amount, kind="تنظیم مدیریت", description="پنل وب") is None:
+            raise _redirect(back, err="موجودی کاربر برای این کسر کافی نیست")
+    else:
+        await db.credit_balance(uid, amount, kind="تنظیم مدیریت", description="پنل وب")
     logging.info("WEB_BALANCE_ADJUST user=%s amount=%s", uid, amount)
     raise _redirect(back, ok="موجودی به‌روزرسانی شد")
 
@@ -477,7 +554,7 @@ async def plans_page(request):
         icon = (p['icon'] or '').strip() if 'icon' in p else ''
         rows += (
             f"<tr><td>{e(p['id'])}</td><td>{e(icon)}</td><td>{e(p['name'])}</td><td>{e(p['gb'])}</td><td>{e(p['duration_days'])}</td>"
-            f"<td>{p['price']:,}</td><td>{p['vip_price']:,}</td><td>{p['vip_bulk_price']:,}</td><td>{e(p['inbound_id'])}</td>"
+            f"<td>{money(p['price'])}</td><td>{money(p['vip_price'])}</td><td>{money(p['vip_bulk_price'])}</td><td>{e(p['inbound_id'])}</td>"
             f"<td>{e(pname.get(p['panel_id'], p['panel_id']))}</td>"
             f"<td class='actions'><a href='/plans/edit?id={e(p['id'])}'><button>✏️</button></a>"
             f"<form class='inline' method='post' action='/plans/delete' onsubmit=\"return confirm('حذف پلن؟')\">"
@@ -600,7 +677,7 @@ async def panel_edit_form(request):
         <div><label>نام</label><input name='name' value='{val('name')}'></div>
         <div><label>آدرس پنل (URL کامل با https:// و پورت)</label><input name='url' value='{val('url')}'></div>
         <div><label>نام کاربری</label><input name='username' value='{val('username')}'></div>
-        <div><label>رمز عبور</label><input name='password' value='{val('password')}'></div>
+        <div><label>رمز عبور {'(خالی بگذارید تا تغییر نکند)' if not is_new else ''}</label><input type='password' name='password' placeholder='{'••••••••' if not is_new else ''}'></div>
         <div><label>IP کانفیگ (sni/host)</label><input name='config_ip' value='{val('config_ip')}'></div>
         <div><label>لینک ساب (اختیاری)</label><input name='sub_url' value='{val('sub_url')}'></div>
       </div>
@@ -622,6 +699,10 @@ async def panel_save(request):
         raise _redirect("/panels", err="نام و URL الزامی است")
     pid = data.get("id")
     if pid and pid.isdigit():
+        # فرم رمز را از پیش پر نمی‌کند؛ خالی بودن یعنی «رمز فعلی حفظ شود»
+        if not password:
+            current = await db.get_panel(int(pid))
+            password = current['password'] if current else ""
         await db.update_panel(int(pid), name, url, username, password, config_ip, sub_url)
     else:
         await db.add_panel(name, url, username, password, config_ip, sub_url)
@@ -710,17 +791,24 @@ async def broadcast_send(request):
     ids = await db.all_user_ids()
 
     async def _run():
-        sent = 0
+        sent, failed = 0, 0
         for uid in ids:
             try:
                 await _BOT.send_message(chat_id=uid, text=text)
                 sent += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-        logging.info("WEB_BROADCAST sent=%s/%s", sent, len(ids))
+            except Exception as ex:
+                failed += 1
+                # محدودیت نرخ تلگرام: به مدت خواسته‌شده صبر می‌کنیم
+                retry_after = getattr(ex, "retry_after", None)
+                if retry_after:
+                    await asyncio.sleep(float(retry_after) + 1)
+            await asyncio.sleep(0.05)  # حدود ۲۰ پیام در ثانیه، زیر سقف تلگرام
+        logging.info("WEB_BROADCAST sent=%s failed=%s total=%s", sent, failed, len(ids))
 
-    asyncio.create_task(_run())
+    # نگه‌داشتن مرجع تسک لازم است؛ وگرنه ممکن است وسط کار توسط GC جمع شود
+    task = asyncio.create_task(_run())
+    _TASKS.add(task)
+    task.add_done_callback(_TASKS.discard)
     raise _redirect("/broadcast", ok=f"ارسال برای {len(ids)} کاربر آغاز شد")
 
 
@@ -732,7 +820,7 @@ async def specials_page(request):
     v_rows = ""
     for v in vips:
         v_rows += (
-            f"<tr><td>{e(v['user_id'])}</td><td>{e(v['nickname'])}</td><td>{v['balance']:,}</td>"
+            f"<tr><td>{e(v['user_id'])}</td><td>{e(v['nickname'])}</td><td>{money(v['balance'])}</td>"
             f"<td><form class='inline' method='post' action='/specials/vip_remove'>"
             f"<input type='hidden' name='user_id' value='{e(v['user_id'])}'><button class='btn-danger'>حذف VIP</button></form></td></tr>"
         )
