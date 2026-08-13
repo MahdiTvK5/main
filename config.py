@@ -26,7 +26,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
 
 DB_USER = os.getenv("DB_USER", "overwall_user")
-DB_PASS = os.getenv("DB_PASS", "OverWall@12345")
+# بدون مقدار پیش‌فرض؛ رمز باید در .env تنظیم شود (رمز پیش‌فرضِ قبلی در تاریخچه‌ی گیت لو رفته بود)
+DB_PASS = os.getenv("DB_PASS", "")
 DB_NAME = os.getenv("DB_NAME", "overwall_db")
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -48,7 +49,13 @@ try:
     WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 except ValueError:
     WEB_PORT = 8080
-WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+# پیش‌فرض فقط لوکال‌هاست: پنل روی HTTP ساده کار می‌کند، پس نباید مستقیم روی
+# اینترنت باز باشد. برای دسترسی از بیرون، Nginx با TLS جلوی آن بگذارید.
+WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
+try:
+    WEB_SESSION_TTL = int(os.getenv("WEB_SESSION_TTL", "43200"))  # ثانیه (پیش‌فرض ۱۲ ساعت)
+except ValueError:
+    WEB_SESSION_TTL = 43200
 
 SECURITY_WARNING = "\n\n⚠️ **هشدار امنیتی بسیار مهم:**\nلطفاً از ارسال لینک در پیام‌رسان‌های داخلی جداً خودداری کنید."
 
