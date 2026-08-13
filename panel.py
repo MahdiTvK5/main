@@ -174,7 +174,7 @@ def build_share_link(inbound, client, host):
 
 def sub_link_for(panel, email):
     """در صورتی که پنل آدرس اشتراک داشته باشد، لینک ساب را برمی‌گرداند؛ وگرنه None."""
-    if not panel:
+    if not panel or not email:
         return None
     try:
         sub = panel['sub_url']
@@ -182,7 +182,7 @@ def sub_link_for(panel, email):
         sub = None
     if not sub:
         return None
-    return sub.rstrip('/') + '/' + email
+    return sub.rstrip('/') + '/' + quote(str(email), safe="")
 
 
 # ================= پنل X-UI =================
@@ -192,6 +192,9 @@ class AsyncXuiAPI:
         self.username = username
         self.password = password
         self.cookies = None
+        # لیست اینباندها در طول یک عملیات ثابت است؛ کش می‌کنیم تا هر متد
+        # درخواست تکراری به پنل نفرستد (هر نمونه فقط برای یک عملیات ساخته می‌شود).
+        self._inbounds_cache = None
 
     def _candidate_urls(self):
         """اگر آدرس پنل اسکیم نداشته باشد، اول https و بعد http امتحان می‌شود."""
@@ -221,29 +224,37 @@ class AsyncXuiAPI:
                     last_err = f"{base}/login → {type(e).__name__}: {e}"
         return False, last_err
 
-    async def get_inbound_port(self, inbound_id):
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
-            try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/list")
-                if res.status_code == 200:
-                    for inbound in res.json().get('obj', []):
-                        if int(inbound.get('id')) == int(inbound_id):
-                            return inbound.get('port')
-            except Exception as e:
-                logging.warning("get_inbound_port failed: %s", e)
-        return None
-
-    async def get_inbound(self, inbound_id):
-        """ردیف کاملِ یک اینباند (شامل protocol و streamSettings) را برمی‌گرداند."""
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
+    async def _fetch_inbounds(self):
+        """لیست اینباندها را یک‌بار می‌گیرد و کش می‌کند. خروجی: list یا None در صورت خطا."""
+        if self._inbounds_cache is not None:
+            return self._inbounds_cache
+        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=15.0, trust_env=False) as client:
             try:
                 res = await client.get(f"{self.url}/panel/api/inbounds/list")
                 if res.status_code == 200 and res.json().get('success'):
-                    for inbound in res.json().get('obj', []):
-                        if int(inbound.get('id')) == int(inbound_id):
-                            return inbound
+                    self._inbounds_cache = res.json().get('obj', []) or []
+                    return self._inbounds_cache
+                logging.warning("inbounds/list → HTTP %s", res.status_code)
             except Exception as e:
-                logging.warning("get_inbound failed: %s", e)
+                logging.warning("inbounds/list failed: %s", e)
+        return None
+
+    def _invalidate_cache(self):
+        self._inbounds_cache = None
+
+    async def get_inbound_port(self, inbound_id):
+        inbound = await self.get_inbound(inbound_id)
+        return inbound.get('port') if inbound else None
+
+    async def get_inbound(self, inbound_id):
+        """ردیف کاملِ یک اینباند (شامل protocol و streamSettings) را برمی‌گرداند."""
+        inbounds = await self._fetch_inbounds()
+        for inbound in inbounds or []:
+            try:
+                if int(inbound.get('id')) == int(inbound_id):
+                    return inbound
+            except (TypeError, ValueError):
+                continue
         return None
 
     async def add_client(self, inbound_id, client_email, total_gb, expire_days, host, limit_ip=1, inbound=None):
@@ -279,16 +290,19 @@ class AsyncXuiAPI:
                 res = await c.post(f"{self.url}/panel/api/inbounds/addClient", json=payload, headers={'Accept': 'application/json'})
                 data = res.json()
                 if res.status_code == 200 and data.get('success'):
+                    self._invalidate_cache()
                     return build_share_link(inbound, client, host), None
                 return None, data.get('msg', res.text)
             except Exception as e:
                 return None, str(e)
 
     async def get_client_stats(self, email):
-        target_email = str(email).strip().lower()
+        safe_email = quote(str(email).strip(), safe="")
+        if not safe_email:
+            return None
         async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
             try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/getClientTraffics/{email}")
+                res = await client.get(f"{self.url}/panel/api/inbounds/getClientTraffics/{safe_email}")
                 if res.status_code == 200 and res.json().get('success'):
                     return res.json().get('obj', {})
             except Exception as e:
@@ -298,43 +312,64 @@ class AsyncXuiAPI:
     async def get_all_client_stats(self):
         """با یک درخواست، آمار تمام کلاینت‌ها را برمی‌گرداند.
         خروجی: dict با کلید ایمیلِ lowercase و مقدارِ دیکشنری آمار (مشابه get_client_stats)."""
+        inbounds = await self._fetch_inbounds()
+        if inbounds is None:
+            return None
         result = {}
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=15.0, trust_env=False) as client:
-            try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/list")
-                if res.status_code == 200 and res.json().get('success'):
-                    for inbound in res.json().get('obj', []):
-                        for cs in inbound.get('clientStats', []) or []:
-                            email = str(cs.get('email', '')).strip().lower()
-                            if email:
-                                result[email] = cs
-            except Exception as e:
-                logging.warning("get_all_client_stats failed: %s", e)
-                return None
+        for inbound in inbounds:
+            for cs in inbound.get('clientStats', []) or []:
+                email = str(cs.get('email', '')).strip().lower()
+                if email:
+                    result[email] = cs
         return result
+
+    async def get_all_client_emails(self):
+        """مجموعه‌ی ایمیلِ تمام کلاینت‌های *تعریف‌شده* روی پنل.
+
+        برخلاف clientStats (که فقط شامل کلاینت‌های دارای رکورد ترافیک است) این متد
+        از settings هر اینباند می‌خواند؛ پس کلاینت تازه‌ساخته و بدون مصرف را هم می‌بیند.
+        خروجی: set یا None در صورت خطا (تا صدازننده اشتباهاً «وجود ندارد» برداشت نکند).
+        """
+        inbounds = await self._fetch_inbounds()
+        if inbounds is None:
+            return None
+        emails = set()
+        for inbound in inbounds:
+            try:
+                clients = json.loads(inbound.get('settings', '{}')).get('clients', []) or []
+            except Exception:
+                continue
+            for c in clients:
+                email = str(c.get('email', '')).strip().lower()
+                if email:
+                    emails.add(email)
+        return emails
 
     async def get_client_exact_info(self, email):
         target_email = str(email).strip().lower()
-        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
+        if not target_email:
+            return None, None, None
+        inbounds = await self._fetch_inbounds()
+        for inbound in inbounds or []:
             try:
-                res = await client.get(f"{self.url}/panel/api/inbounds/list")
-                if res.status_code == 200 and res.json().get('success'):
-                    for inbound in res.json().get('obj', []):
-                        settings = json.loads(inbound.get('settings', '{}'))
-                        for c in settings.get('clients', []):
-                            c_email = str(c.get('email', '')).strip().lower()
-                            if c_email == target_email:
-                                return inbound.get('id'), inbound.get('port'), c
-            except Exception as e:
-                logging.warning("get_client_exact_info failed: %s", e)
+                clients = json.loads(inbound.get('settings', '{}')).get('clients', []) or []
+            except Exception:
+                continue
+            for c in clients:
+                if str(c.get('email', '')).strip().lower() == target_email:
+                    return inbound.get('id'), inbound.get('port'), c
         return None, None, None
 
-    async def update_client(self, inbound_id, old_uuid, client_dict):
+    async def update_client(self, inbound_id, old_key, client_dict):
+        """به‌روزرسانی کلاینت. old_key برای vless/vmess همان uuid و برای trojan همان password است."""
         payload = {"id": inbound_id, "settings": json.dumps({"clients": [client_dict]})}
         async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as client:
             try:
-                res = await client.post(f"{self.url}/panel/api/inbounds/updateClient/{old_uuid}", json=payload, headers={'Accept': 'application/json'})
-                return res.status_code == 200 and res.json().get('success', False)
+                res = await client.post(f"{self.url}/panel/api/inbounds/updateClient/{quote(str(old_key), safe='')}", json=payload, headers={'Accept': 'application/json'})
+                ok = res.status_code == 200 and res.json().get('success', False)
+                if ok:
+                    self._invalidate_cache()
+                return ok
             except Exception as e:
                 logging.warning("update_client failed: %s", e)
                 return False
