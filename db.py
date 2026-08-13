@@ -1,10 +1,13 @@
 import datetime
+import logging
+
 import asyncpg
 
 from config import (
     DB_USER, DB_PASS, DB_NAME, DB_HOST, DB_PORT, SUPER_ADMIN_ID,
     PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP,
 )
+from links import email_from_link
 
 # استخر اتصال دیتابیس؛ در init_db مقداردهی می‌شود و سایر ماژول‌ها با db.db_pool به آن دسترسی دارند.
 db_pool = None
@@ -50,6 +53,13 @@ async def init_db():
             await conn.execute("UPDATE plans SET panel_id = $1 WHERE panel_id IS NULL", default_panel_id)
             await conn.execute("UPDATE orders SET panel_id = $1 WHERE panel_id IS NULL", default_panel_id)
 
+        # ===== شناسه‌ی سرویس روی سفارش =====
+        # نام سرویس (email) و اینباند دیگر از روی متنِ لینک حدس زده نمی‌شوند، چون
+        # لینک vmess فرگمنت # ندارد و همه‌چیز داخل Base64 است.
+        await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS email TEXT")
+        await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS inbound_id INT")
+        await _backfill_order_emails(conn)
+
         # ===== اکانت تست =====
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS got_test BOOLEAN DEFAULT FALSE")
 
@@ -88,6 +98,20 @@ async def init_db():
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_days', '1') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_panel_id', '') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_inbound_id', '') ON CONFLICT DO NOTHING")
+
+
+async def _backfill_order_emails(conn):
+    """برای سفارش‌های قدیمی، نام سرویس را یک‌بار از لینک استخراج و ذخیره می‌کند."""
+    rows = await conn.fetch("SELECT id, config_link FROM orders WHERE email IS NULL OR email = ''")
+    if not rows:
+        return
+    filled = 0
+    for r in rows:
+        email = email_from_link(r['config_link'])
+        if email:
+            await conn.execute("UPDATE orders SET email = $1 WHERE id = $2", email, r['id'])
+            filled += 1
+    logging.info("backfill: نام سرویس برای %s سفارش از %s مورد پر شد.", filled, len(rows))
 
 
 async def is_admin(user_id):
@@ -199,21 +223,25 @@ async def list_recent_orders(limit=50, search=None, offset=0):
     async with db_pool.acquire() as conn:
         if search:
             like = f"%{search}%"
-            return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders WHERE config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1 ORDER BY id DESC LIMIT $2 OFFSET $3", like, limit, offset)
-        return await conn.fetch("SELECT id, user_id, config_link, date, panel_id FROM orders ORDER BY id DESC LIMIT $1 OFFSET $2", limit, offset)
+            return await conn.fetch("SELECT id, user_id, config_link, email, date, panel_id FROM orders WHERE email ILIKE $1 OR config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1 ORDER BY id DESC LIMIT $2 OFFSET $3", like, limit, offset)
+        return await conn.fetch("SELECT id, user_id, config_link, email, date, panel_id FROM orders ORDER BY id DESC LIMIT $1 OFFSET $2", limit, offset)
 
 
 async def count_orders(search=None):
     async with db_pool.acquire() as conn:
         if search:
             like = f"%{search}%"
-            return int(await conn.fetchval("SELECT COUNT(*) FROM orders WHERE config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1", like) or 0)
+            return int(await conn.fetchval("SELECT COUNT(*) FROM orders WHERE email ILIKE $1 OR config_link ILIKE $1 OR CAST(user_id AS TEXT) LIKE $1", like) or 0)
         return int(await conn.fetchval("SELECT COUNT(*) FROM orders") or 0)
 
 
 async def get_orders_by_user(user_id):
+    """سفارش‌های یک کاربر؛ همان ستون‌هایی که کیبورد سفارش‌ها و پنل وب لازم دارند."""
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT id, config_link, date, panel_id FROM orders WHERE user_id = $1 ORDER BY id DESC", user_id)
+        return await conn.fetch(
+            "SELECT id, config_link, email, date, panel_id, inbound_id FROM orders WHERE user_id = $1 ORDER BY id DESC",
+            user_id,
+        )
 
 
 async def list_recent_transactions(limit=50, offset=0):
@@ -259,9 +287,15 @@ async def set_user_role(user_id, role):
         )
 
 
-async def list_plans():
+PLAN_ORDER = "ORDER BY COALESCE(sort_order, id) ASC, id ASC"
+
+
+async def list_plans(panel_id=None):
+    """لیست پلن‌ها به ترتیب نمایش. با panel_id فقط پلن‌های همان پنل برگردانده می‌شود."""
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
+        if panel_id is None:
+            return await conn.fetch(f"SELECT * FROM plans {PLAN_ORDER}")
+        return await conn.fetch(f"SELECT * FROM plans WHERE panel_id = $1 {PLAN_ORDER}", int(panel_id))
 
 
 async def get_plan(plan_id):
@@ -324,9 +358,15 @@ async def get_balance(user_id):
         return await conn.fetchval("SELECT balance FROM users WHERE user_id = $1", user_id) or 0
 
 
-async def add_order(user_id, config_link, panel_id=None):
+async def add_order(user_id, config_link, panel_id=None, email=None, inbound_id=None):
+    """ثبت سفارش. نام سرویس و اینباند صریحاً ذخیره می‌شوند تا بعداً از لینک حدس زده نشوند."""
+    if not email:
+        email = email_from_link(config_link)
     async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO orders (user_id, config_link, date, panel_id) VALUES ($1, $2, $3, $4)", user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), panel_id)
+        await conn.execute(
+            "INSERT INTO orders (user_id, config_link, date, panel_id, email, inbound_id) VALUES ($1, $2, $3, $4, $5, $6)",
+            user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), panel_id, email, inbound_id,
+        )
 
 
 async def delete_order(order_id):
@@ -340,6 +380,29 @@ async def get_order_by_id(order_id):
         return (row['config_link'], row['date']) if row else None
 
 
+async def get_order(order_id):
+    """ردیف کاملِ سفارش (شامل نام سرویس و اینباند)؛ مبنای همه‌ی عملیات روی سرویس."""
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, user_id, config_link, email, date, panel_id, inbound_id FROM orders WHERE id = $1",
+            int(order_id),
+        )
+
+
+async def update_order_service(order_id, config_link=None, email=None, inbound_id=None):
+    """به‌روزرسانی لینک/نام/اینباند سفارش بعد از تغییرات روی پنل."""
+    sets, args = [], []
+    for col, val in (("config_link", config_link), ("email", email), ("inbound_id", inbound_id)):
+        if val is not None:
+            args.append(val)
+            sets.append(f"{col} = ${len(args)}")
+    if not sets:
+        return
+    args.append(int(order_id))
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"UPDATE orders SET {', '.join(sets)} WHERE id = ${len(args)}", *args)
+
+
 async def get_order_panel_id(order_id):
     async with db_pool.acquire() as conn:
         return await conn.fetchval("SELECT panel_id FROM orders WHERE id = $1", int(order_id))
@@ -347,7 +410,7 @@ async def get_order_panel_id(order_id):
 
 async def get_orders_for_notify():
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT id, user_id, config_link, panel_id, expiry_notified, lowdata_notified FROM orders")
+        return await conn.fetch("SELECT id, user_id, config_link, email, panel_id, expiry_notified, lowdata_notified FROM orders")
 
 
 async def mark_notified(order_id, field):
