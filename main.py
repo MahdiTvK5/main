@@ -77,14 +77,23 @@ async def resolve_plan_price(user_id, plan, role, bulk=False):
             "SELECT price, bulk_price FROM custom_prices WHERE user_id=$1 AND plan_id=$2",
             user_id, plan['id'],
         )
+    # پلن‌های ساخته‌شده قبل از افزودن ستون‌های جدید ممکن است NULL باشند
+    def _num(*candidates):
+        for c in candidates:
+            if c is not None:
+                return int(c)
+        return 0
+
     if bulk:
         # خرید عمده فقط برای VIP/ادمین است؛ یک قیمت عمده‌ی واحد (vip_bulk_price) داریم
         if custom and custom['bulk_price'] is not None:
             return int(custom['bulk_price'])
-        return int(plan['vip_bulk_price'])
+        return _num(plan['vip_bulk_price'], plan['price'])
     if custom and custom['price'] is not None:
         return int(custom['price'])
-    return int(plan['vip_price'] if role == 'vip' else plan['price'])
+    if role == 'vip':
+        return _num(plan['vip_price'], plan['price'])
+    return _num(plan['price'])
 
 
 # ================= محدودیت نرخ (ضدِ اسپم) =================
@@ -93,11 +102,27 @@ from collections import defaultdict, deque
 _RATE_LIMIT = 10        # حداکثر تعداد رویداد
 _RATE_WINDOW = 5.0      # در این بازه (ثانیه)
 _user_hits = defaultdict(deque)
+_last_rate_prune = 0.0
+
+# فاصله‌ی بین پیام‌های همگانی و کانفیگ‌های عمده (سقف تلگرام حدود ۳۰ پیام در ثانیه است)
+BROADCAST_DELAY = 0.05
+BULK_CHUNK = 5          # تعداد کانفیگی که هم‌زمان روی پنل ساخته می‌شود
+
+
+def _prune_rate_hits(now):
+    """حذف کاربرانی که مدتی فعال نبوده‌اند تا دیکشنری بی‌نهایت رشد نکند."""
+    global _last_rate_prune
+    if now - _last_rate_prune < 300:
+        return
+    _last_rate_prune = now
+    for uid in [u for u, dq in _user_hits.items() if not dq or now - dq[-1] > 600]:
+        _user_hits.pop(uid, None)
 
 
 def _rate_ok(user_id):
     """پنجره‌ی لغزان ساده برای جلوگیری از اسپم و فشار روی دیتابیس/پنل."""
     now = time.monotonic()
+    _prune_rate_hits(now)
     dq = _user_hits[user_id]
     while dq and now - dq[0] > _RATE_WINDOW:
         dq.popleft()
@@ -120,6 +145,27 @@ PLAN_FIELDS = [
     ("panel", "پنل", "panel_id", True),
 ]
 PLAN_FIELD_MAP = {f[0]: f for f in PLAN_FIELDS}
+
+
+async def admin_menu_markup(user_id):
+    """کیبورد پنل مدیریت (یک منبع واحد؛ قبلاً در دو جا کپی شده بود و از هم فاصله می‌گرفت)."""
+    status_text = "🟢 باز" if (await get_setting('sales_status')) == 'open' else "🔴 بسته"
+    kb = [
+        [InlineKeyboardButton("محصولات و پلن‌ها 🛒", callback_data='admin_manage_plans')],
+        [InlineKeyboardButton("لیست VIP و ادمین‌ها 📋", callback_data='admin_list_specials')],
+        [InlineKeyboardButton("قیمت اختصاصی کاربر 💎", callback_data='admin_custom_price'), InlineKeyboardButton("کارت 💳", callback_data='admin_set_card')],
+        [InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
+        [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast')],
+        [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
+        [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
+        [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
+        [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
+        [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
+        [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')],
+    ]
+    if user_id == SUPER_ADMIN_ID:
+        kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
+    return InlineKeyboardMarkup(kb)
 
 
 def plan_edit_markup(plan_id):
@@ -187,6 +233,14 @@ async def render_test_menu(query):
         pass
 
 
+def money(value):
+    """نمایش مبلغ با جداکننده‌ی هزارگان؛ مقدار NULL را به صفر تبدیل می‌کند."""
+    try:
+        return f"{int(value or 0):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
 async def plan_edit_text(plan):
     panel = await db.get_panel(plan['panel_id']) if plan['panel_id'] else None
     pname = panel['name'] if panel else "—"
@@ -196,9 +250,9 @@ async def plan_edit_text(plan):
         f"📋 نام: {plan['name']}\n"
         f"💾 حجم: {plan['gb']} GB\n"
         f"📅 مدت: {plan['duration_days']} روز\n"
-        f"💰 قیمت عادی: {plan['price']:,}\n"
-        f"💎 قیمت VIP: {plan['vip_price']:,}\n"
-        f"📦 قیمت عمده: {plan['vip_bulk_price']:,}\n"
+        f"💰 قیمت عادی: {money(plan['price'])}\n"
+        f"💎 قیمت VIP: {money(plan['vip_price'])}\n"
+        f"📦 قیمت عمده: {money(plan['vip_bulk_price'])}\n"
         f"⚙️ اینباند: {plan['inbound_id']}\n"
         f"🖥 پنل: {pname}\n\n"
         f"برای تغییر هر مورد، دکمه‌اش را بزنید."
@@ -219,6 +273,32 @@ async def load_order_service(order_id):
     if not row:
         return None, ""
     return row, order_email(row)
+
+
+async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_msg=None):
+    """ارسال پیام همگانی با کنترل نرخ و گزارش پیشرفت (خارج از مسیر پردازش آپدیت‌ها)."""
+    sent = failed = 0
+    for i, uid in enumerate(user_ids, 1):
+        try:
+            await context.bot.copy_message(chat_id=uid, from_chat_id=from_chat_id, message_id=message_id)
+            sent += 1
+        except Exception as ex:
+            failed += 1
+            retry_after = getattr(ex, 'retry_after', None)
+            if retry_after:  # محدودیت نرخ تلگرام
+                await asyncio.sleep(float(retry_after) + 1)
+        await asyncio.sleep(BROADCAST_DELAY)
+        if progress_msg and i % 50 == 0:
+            try:
+                await progress_msg.edit_text(f"📢 در حال ارسال... {i} از {len(user_ids)}")
+            except Exception:
+                pass
+    logging.info("BROADCAST sent=%s failed=%s total=%s", sent, failed, len(user_ids))
+    if progress_msg:
+        try:
+            await progress_msg.edit_text(f"✅ پیام به {sent} کاربر ارسال شد." + (f"\n⚠️ ناموفق: {failed}" if failed else ""))
+        except Exception:
+            pass
 
 
 async def find_stale_orders(orders):
@@ -383,16 +463,13 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # 📢 Broadcast
     if state == 'admin_waiting_broadcast' and admin_status:
-        async with db.db_pool.acquire() as conn: users = [r['user_id'] for r in await conn.fetch("SELECT user_id FROM users")]
-        success = 0
-        wait_msg = await update.message.reply_text("در حال ارسال پیام همگانی... ⏳")
-        for u in users:
-            try: 
-                await context.bot.copy_message(chat_id=u, from_chat_id=user_id, message_id=update.message.message_id)
-                success += 1
-            except: pass
+        users = await db.all_user_ids()
         context.user_data['state'] = 'none'
-        await wait_msg.edit_text(f"✅ پیام با موفقیت به {success} کاربر ارسال شد.")
+        wait_msg = await update.message.reply_text(f"📢 ارسال به {len(users)} کاربر در پس‌زمینه آغاز شد...")
+        # در پس‌زمینه اجرا می‌شود؛ وگرنه تا پایان ارسال، ربات به هیچ کاربر دیگری پاسخ نمی‌داد
+        context.application.create_task(
+            _run_broadcast(context, users, user_id, update.message.message_id, wait_msg)
+        )
         return
 
     # 📸 Receipts
@@ -411,7 +488,8 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             try: 
                 await context.bot.send_photo(chat_id=adm, photo=update.message.photo[-1].file_id, caption=f"رسید کاربر: `{user_id}`\nمبلغ: {int(amount):,}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
                 sent = True
-            except: pass
+            except Exception as ex:
+                logging.warning("ارسال رسید به ادمین %s ناموفق بود: %s", adm, ex)
                 
         context.user_data['state'] = 'none'
         msg = "✅ رسید در صف بررسی قرار گرفت." if sent else "⚠️ سیستم نتوانست رسید را بفرستد."
@@ -479,24 +557,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['state'] = 'none'
             
         if text == 'مدیریت ⚙️' and admin_status:
-            status = await get_setting('sales_status')
-            status_text = "🟢 باز" if status == 'open' else "🔴 بسته"
-            kb = [
-                [InlineKeyboardButton("محصولات و پلن‌ها 🛒", callback_data='admin_manage_plans')],
-                [InlineKeyboardButton("لیست VIP و ادمین‌ها 📋", callback_data='admin_list_specials')],
-                [InlineKeyboardButton("قیمت اختصاصی کاربر 💎", callback_data='admin_custom_price'), InlineKeyboardButton("کارت 💳", callback_data='admin_set_card')],
-                [InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
-                [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast')],
-                [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
-                [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
-                [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
-                [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
-                [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
-                [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
-            ]
-            if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
-            await update.message.reply_text("⚙️ پنل مدیریت اختصاصی:\n(خرید عمده فقط برای کاربران VIP فعال است)", reply_markup=InlineKeyboardMarkup(kb))
-            
+            await update.message.reply_text(
+                "⚙️ پنل مدیریت اختصاصی:\n(خرید عمده فقط برای کاربران VIP فعال است)",
+                reply_markup=await admin_menu_markup(user_id),
+            )
+
+
         elif text == 'کیف پول من 💰':
             kb = [
                 [InlineKeyboardButton("📜 تاریخچه تراکنش‌ها", callback_data='wallet_history')],
@@ -569,8 +635,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             if amount < 1000:
                 await update.message.reply_text("❌ مبلغ نامعتبر! (حداقل 1000 تومان)")
                 return
+            card = (await get_setting('card_number') or '').strip()
+            if not card:
+                context.user_data['state'] = 'none'
+                return await update.message.reply_text("⛔️ شماره کارت هنوز توسط مدیریت تنظیم نشده است. لطفاً به پشتیبانی اطلاع دهید.", reply_markup=await get_main_keyboard(user_id))
             context.user_data['state'] = f'waiting_receipt_{amount}'
-            card = await get_setting('card_number')
             await update.message.reply_text(f"💳 لطفاً مبلغ **{amount:,} تومان** را به شماره کارت زیر واریز کنید:\n\n`{card}`\n\n📸 سپس **عکس رسید واریزی** را همینجا ارسال کنید.", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
         except ValueError:
             await update.message.reply_text("❌ لطفاً مبلغ را فقط به صورت عدد (بدون حروف) وارد کنید:")
@@ -780,7 +849,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not plans:
             context.user_data['state'] = 'none'
             return await update.message.reply_text("❌ هیچ پلنی وجود ندارد.", reply_markup=await get_main_keyboard(user_id))
-        kb = [[InlineKeyboardButton(f"{p['name']} (پیش‌فرض {p['price']:,} / عمده {p['vip_bulk_price']:,})", callback_data=f"cpplan_{p['id']}")] for p in plans]
+        kb = [[InlineKeyboardButton(f"{p['name']} (پیش‌فرض {money(p['price'])} / عمده {money(p['vip_bulk_price'])})", callback_data=f"cpplan_{p['id']}")] for p in plans]
         context.user_data['state'] = 'cp_choose'
         await update.message.reply_text("کدام پلن؟", reply_markup=InlineKeyboardMarkup(kb))
         return
@@ -1152,24 +1221,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'admin_toggle_sales' and admin_status:
         current = await get_setting('sales_status')
-        new_status = 'closed' if current == 'open' else 'open'
-        await update_setting('sales_status', new_status)
-        status_text = "🟢 باز" if new_status == 'open' else "🔴 بسته"
-        kb = [
-            [InlineKeyboardButton("محصولات و پلن‌ها 🛒", callback_data='admin_manage_plans')],
-            [InlineKeyboardButton("لیست VIP و ادمین‌ها 📋", callback_data='admin_list_specials')],
-            [InlineKeyboardButton("قیمت اختصاصی کاربر 💎", callback_data='admin_custom_price'), InlineKeyboardButton("کارت 💳", callback_data='admin_set_card')],
-            [InlineKeyboardButton("افزودن VIP 🟢", callback_data='admin_add_vip'), InlineKeyboardButton("حذف VIP 🔴", callback_data='admin_rem_vip')],
-            [InlineKeyboardButton("ارسال پیام 📢", callback_data='admin_broadcast')],
-            [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
-            [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
-            [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
-            [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
-            [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
-            [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')]
-        ]
-        if user_id == SUPER_ADMIN_ID: kb.append([InlineKeyboardButton("افزودن ادمین 👮‍♂️", callback_data='superadmin_add_admin'), InlineKeyboardButton("حذف ادمین ⛔️", callback_data='superadmin_rem_admin')])
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
+        await update_setting('sales_status', 'closed' if current == 'open' else 'open')
+        await query.edit_message_reply_markup(reply_markup=await admin_menu_markup(user_id))
     
     elif data == 'admin_manage_plans' and admin_status:
         kb = [
@@ -1178,7 +1231,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         async with db.db_pool.acquire() as conn: plans = await conn.fetch("SELECT * FROM plans ORDER BY id ASC")
         msg = "📋 **لیست محصولات فعلی:**\n\n"
-        for p in plans: msg += f"🆔 `ID:{p['id']}` | {p['name']} | عادی: {p['price']:,} | مدت: {p['duration_days']}روز | اینباند: {p['inbound_id']}\n"
+        for p in plans: msg += f"🆔 `ID:{p['id']}` | {p['name']} | عادی: {money(p['price'])} | مدت: {p['duration_days']}روز | اینباند: {p['inbound_id']}\n"
         await query.edit_message_text(msg if plans else "محصولی یافت نشد.", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     elif data == 'admin_edit_plan' and admin_status:
@@ -1199,7 +1252,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'pe_done':
         try: await query.edit_message_text("✅ ویرایش پلن به پایان رسید.")
-        except: pass
+        except Exception: pass
 
     elif data.startswith('pef_') and admin_status:
         parts = data.split('_')
@@ -1315,7 +1368,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'redeem_gift'
         await query.message.reply_text("🎟 کد هدیه را وارد کنید:", reply_markup=CANCEL_MARKUP)
         try: await query.delete_message()
-        except: pass
+        except Exception: pass
 
     elif data == 'admin_report' and admin_status:
         r = await db.get_sales_report()
@@ -1430,9 +1483,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'admin_waiting_del_plan'
         await query.message.reply_text("🗑 آیدی (ID) پلنی که می‌خواهید حذف شود را بفرستید:", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
-
-    elif data == 'admin_toggle_bulk' and admin_status:
-        await safe_answer(query, "خرید عمده فقط با نقش VIP فعال است. کاربر را VIP کنید.", alert=True)
 
     elif data == 'admin_add_vip' and admin_status:
         context.user_data['state'] = 'admin_waiting_vip_id'
@@ -1643,6 +1693,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not plan: return await query.edit_message_text("❌ پلن یافت نشد.")
 
+        # منویی که قبل از بستن فروش باز مانده نباید همچنان خرید انجام دهد
+        if await get_setting('sales_status') == 'closed':
+            return await query.edit_message_text("⛔️ فروش در حال حاضر بسته است.")
+
         price = await resolve_plan_price(user_id, plan, role, bulk=False)
 
         if context.user_data.get('processing'):
@@ -1691,7 +1745,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown')
                     await query.delete_message()
-                except:
+                except Exception:
                     await query.edit_message_text(caption, parse_mode='Markdown')
             else:
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه چون ساخت کانفیگ ناموفق بود
@@ -1724,6 +1778,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
         if not plan:
             return await query.edit_message_text("❌ پلن یافت نشد.")
+        if await get_setting('sales_status') == 'closed':
+            return await query.edit_message_text("⛔️ فروش در حال حاضر بسته است.")
 
         unit_price = await resolve_plan_price(user_id, plan, role, bulk=True)
         total_price = unit_price * count
@@ -1758,14 +1814,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
             success_configs = []
             last_err = "نامشخص"
-            for i in range(start_n, end_n + 1):
-                name = f"{prefix}{i}{postfix}"
-                link, err = await xui.add_client(plan['inbound_id'], name, plan['gb'], (plan['duration_days'] or 30), cfg_ip, inbound=inbound)
-                if link:
-                    success_configs.append(link)
-                    await add_order(user_id, link, order_panel_id, email=name, inbound_id=plan['inbound_id'])
-                else:
-                    last_err = err
+            names = [f"{prefix}{i}{postfix}" for i in range(start_n, end_n + 1)]
+            # ساخت دسته‌ای؛ ترتیبیِ قبلی برای ۱۰۰ کانفیگ ده‌ها ثانیه ربات را قفل می‌کرد
+            for pos in range(0, len(names), BULK_CHUNK):
+                batch = names[pos:pos + BULK_CHUNK]
+                results = await asyncio.gather(*[
+                    xui.add_client(plan['inbound_id'], nm, plan['gb'], (plan['duration_days'] or 30), cfg_ip, inbound=inbound)
+                    for nm in batch
+                ], return_exceptions=True)
+                for nm, res in zip(batch, results):
+                    if isinstance(res, Exception):
+                        last_err = str(res)
+                        continue
+                    link, err = res
+                    if link:
+                        success_configs.append(link)
+                        await add_order(user_id, link, order_panel_id, email=nm, inbound_id=plan['inbound_id'])
+                    else:
+                        last_err = err
+                if len(names) > BULK_CHUNK:
+                    try:
+                        await query.edit_message_text(f"در حال ساخت کانفیگ‌ها... {min(pos + BULK_CHUNK, len(names))} از {len(names)} ⏳")
+                    except Exception:
+                        pass
 
             # برگشت وجهِ کانفیگ‌هایی که ساخته نشدند
             actual_deduction = unit_price * len(success_configs)
@@ -1804,7 +1875,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for adm in admins:
                     if adm != 0:
                         try: await context.bot.send_message(chat_id=adm, text=invoice_text, parse_mode='Markdown')
-                        except: pass
+                        except Exception as ex:
+                            logging.warning("ارسال فاکتور به ادمین %s ناموفق بود: %s", adm, ex)
                 # -------------------------------------------------------------
             else: 
                 await query.edit_message_text(f"❌ سرور پنل سنایی اجازه ساخت هیچ کانفیگی را نداد!\n\nدلیل خطای پنل: `{last_err}`\n\n⚠️ راهنمایی: احتمالاً کانفیگی با این اسم از قبل در پنل وجود دارد.", parse_mode='Markdown')
@@ -1906,13 +1978,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info("CHARGE_APPROVED admin=%s user=%s amount=%s receipt=%s", user_id, uid, amt, receipt_id)
         await query.edit_message_caption(caption="✅ تایید شد.")
         try: await context.bot.send_message(chat_id=uid, text=f"🎉 حساب شما {amt:,} شارژ شد.")
-        except: pass
+        except Exception as ex:
+            logging.warning("اطلاع شارژ به کاربر %s ناموفق بود: %s", uid, ex)
         # پاداش معرف بعد از اولین شارژِ تاییدشده
         reward = await db.try_reward_referrer(uid)
         if reward:
             referrer_id, bonus = reward
             try: await context.bot.send_message(chat_id=referrer_id, text=f"🎁 یکی از دعوت‌شدگان شما شارژ کرد! {bonus:,} تومان پاداش به حساب شما اضافه شد.")
-            except: pass
+            except Exception as ex:
+                logging.warning("اطلاع پاداش دعوت به %s ناموفق بود: %s", referrer_id, ex)
 
     elif data.startswith("reject_") and admin_status:
         parts = data.split("_")
@@ -1924,7 +1998,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await conn.execute("UPDATE receipts SET status = 'rejected' WHERE id = $1", receipt_id)
         await query.edit_message_caption(caption="❌ رد شد.")
         try: await context.bot.send_message(chat_id=uid, text="❌ رسید شما تایید نشد.")
-        except: pass
+        except Exception as ex:
+            logging.warning("اطلاع رد رسید به کاربر %s ناموفق بود: %s", uid, ex)
 
 async def setup_db(app: Application):
     await init_db()
@@ -2060,15 +2135,28 @@ async def notify_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده است.")
-    # تنظیم درخواست با pool بزرگ‌تر و درخواست اختصاصی getUpdates (پایداری بیشتر روی سرور ایران)
-    req = HTTPXRequest(connection_pool_size=20, proxy=PROXY_URL, connect_timeout=30.0, read_timeout=30.0) if PROXY_URL else HTTPXRequest(connection_pool_size=20, connect_timeout=30.0)
+    if not DB_PASS:
+        raise SystemExit("❌ متغیر محیطی DB_PASS تنظیم نشده است. مقدار آن را در فایل .env بگذارید.")
+
+    # دو نمونه‌ی جدا: long-polling نباید اتصالی از pool درخواست‌های معمولی را اشغال کند.
+    # تایم‌اوت‌ها برای شبکه‌های کند یکسان تنظیم شده‌اند (قبلاً بدون پروکسی ۵ ثانیه بود).
+    def _request():
+        kwargs = dict(connection_pool_size=20, connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
+        if PROXY_URL:
+            kwargs['proxy'] = PROXY_URL
+        return HTTPXRequest(**kwargs)
 
     # ساخت ربات و اعمال تنظیمات
-    app = Application.builder().token(TOKEN).request(req).get_updates_request(req).post_init(setup_db).post_shutdown(on_shutdown).build()
-    
+    app = (
+        Application.builder().token(TOKEN)
+        .request(_request()).get_updates_request(_request())
+        .post_init(setup_db).post_shutdown(on_shutdown).build()
+    )
+
     app.add_error_handler(error_handler)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_all_messages))
+    app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    # فقط چت خصوصی: اگر ربات به گروهی اضافه شود نباید هر پیام گروه پردازش و ثبت شود
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_all_messages))
     app.add_handler(CallbackQueryHandler(button_handler))
     # اجرای دوره‌ای هشدار انقضا/اتمام حجم (هر ۶ ساعت)
     if app.job_queue:
