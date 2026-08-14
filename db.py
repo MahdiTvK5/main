@@ -101,6 +101,9 @@ async def init_db():
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_panel_id', '') ON CONFLICT DO NOTHING")
         await conn.execute("INSERT INTO settings (key, value) VALUES ('test_inbound_id', '') ON CONFLICT DO NOTHING")
 
+        # ===== سطح‌بندی قیمت، آفرها و فروش (فاز ۲۴) =====
+        await _init_pricing(conn)
+
         # ===== ایندکس‌ها =====
         # این کوئری‌ها در هر «سفارشات من»، هر گزارش و هر هشدار انقضا اجرا می‌شوند.
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
@@ -110,6 +113,141 @@ async def init_db():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_kind ON transactions(kind)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_ref ON users(referred_by)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_plans_panel ON plans(panel_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(created_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_user ON sales(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+
+
+# پلن‌های پیش‌فرضِ فروشگاه: (حجم، روز، همکاری، VIP، عادی، تمدید، خرید اول، آیکون)
+DEFAULT_PLANS = [
+    (10, 30, 80_000, 95_000, 110_000, 95_000, 79_000, '🟦'),
+    (20, 30, 110_000, 130_000, 150_000, 130_000, 99_000, '🟦'),
+    (30, 30, 140_000, 165_000, 190_000, 169_000, 129_000, '🟦'),
+    (40, 30, 170_000, 195_000, 220_000, 199_000, 159_000, '🟦'),
+    (50, 30, 200_000, 230_000, 260_000, 239_000, 189_000, '🟦'),
+    (80, 60, 290_000, 325_000, 360_000, 329_000, 279_000, '🟪'),
+    (120, 90, 400_000, 450_000, 500_000, 459_000, 389_000, '🟨'),
+]
+
+PRICING_SETTINGS = {
+    'first_offer_enabled': 'on',      # آفر خرید اول
+    'renew_offer_enabled': 'on',      # قیمت ویژه‌ی تمدید
+    'reseller_bonus_enabled': 'on',   # هدیه‌ی اولین شارژ نماینده
+    'reseller_bonus_min': '1000000',  # حداقل مبلغ شارژ برای دریافت هدیه
+    'reseller_bonus_percent': '10',   # درصد هدیه
+    'reseller_t2_min': '1000000',     # آستانه‌ی سطح ۲ (شارژ ۳۰ روز اخیر)
+    'reseller_t2_discount': '5',      # درصد تخفیف اضافه‌ی سطح ۲
+    'reseller_t3_min': '3000000',     # آستانه‌ی سطح VIP نماینده
+    'reseller_t3_discount': '8',      # درصد تخفیف اضافه‌ی سطح VIP نماینده
+}
+
+
+async def _init_pricing(conn):
+    """مهاجرت‌های سیستم قیمت‌گذاری/آفر/گزارش.
+
+    همه‌ی تغییرات افزایشی و idempotent هستند؛ ستون‌ها و جدول‌های قبلی دست نمی‌خورند
+    تا سرویس‌ها و سفارش‌های فعلی بدون تغییر باقی بمانند.
+    """
+    # --- سطوح قیمت روی پلن ---
+    await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS reseller_price BIGINT")
+    await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS renew_price BIGINT")
+    await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS first_price BIGINT")
+    await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE")
+    await conn.execute("UPDATE plans SET is_active = TRUE WHERE is_active IS NULL")
+
+    # --- وضعیت آفرها روی کاربر ---
+    await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_offer_used BOOLEAN DEFAULT FALSE")
+    await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reseller_bonus_used BOOLEAN DEFAULT FALSE")
+    # مشتریان فعلی که قبلاً خرید کرده‌اند نباید مشمول «آفر خرید اول» شوند
+    await conn.execute(
+        """UPDATE users SET first_offer_used = TRUE
+           WHERE first_offer_used = FALSE AND user_id IN (SELECT DISTINCT user_id FROM orders)"""
+    )
+
+    # --- قیمتِ منجمدشده روی سفارش (تغییر قیمت‌های بعدی نباید سفارش قبلی را عوض کند) ---
+    await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS plan_id INT")
+    await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS price BIGINT")
+    await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS base_price BIGINT")
+    await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount BIGINT DEFAULT 0")
+    await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS purchase_kind TEXT")
+    await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS user_role TEXT")
+
+    # --- آفرهای قابل مدیریت ---
+    await conn.execute('''CREATE TABLE IF NOT EXISTS offers (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        kind TEXT DEFAULT 'percent',      -- percent | fixed
+        value BIGINT DEFAULT 0,           -- درصد یا مبلغ ثابت
+        audience TEXT DEFAULT 'all',      -- all | new | existing | vip | reseller
+        plan_id INT,                      -- خالی یعنی همه‌ی پلن‌ها
+        starts_at TIMESTAMP,
+        ends_at TIMESTAMP,
+        max_uses INT DEFAULT 0,           -- صفر یعنی نامحدود
+        per_user_limit INT DEFAULT 1,
+        used_count INT DEFAULT 0,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT NOW()
+    )''')
+    await conn.execute('''CREATE TABLE IF NOT EXISTS offer_redemptions (
+        id SERIAL PRIMARY KEY,
+        offer_id INT,
+        user_id BIGINT,
+        created_at TIMESTAMP DEFAULT NOW()
+    )''')
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_offer_redemptions ON offer_redemptions(offer_id, user_id)")
+
+    # --- دفتر فروش برای گزارش مالی (تمدید سفارش جدید نمی‌سازد، پس جدا ثبت می‌شود) ---
+    await conn.execute('''CREATE TABLE IF NOT EXISTS sales (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT,
+        order_id INT,
+        plan_id INT,
+        kind TEXT,                        -- buy | renew | bulk
+        user_role TEXT,
+        base_price BIGINT DEFAULT 0,
+        price BIGINT DEFAULT 0,
+        discount BIGINT DEFAULT 0,
+        offer_id INT,
+        first_offer BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+    )''')
+
+    # --- تنظیمات پیش‌فرض ---
+    for key, value in PRICING_SETTINGS.items():
+        await conn.execute("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING", key, value)
+
+    # --- پلن‌های پیش‌فرض فقط روی نصب تازه (اگر هیچ پلنی وجود ندارد) ---
+    if not await conn.fetchval("SELECT 1 FROM plans LIMIT 1"):
+        panel_id = await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
+        await _insert_default_plans(conn, panel_id)
+        logging.info("پلن‌های پیش‌فرض قیمت‌گذاری ساخته شدند (%s مورد).", len(DEFAULT_PLANS))
+
+
+async def _insert_default_plans(conn, panel_id, inbound_id=1):
+    """درج پلن‌های پیش‌فرض. پلن‌هایی که هم‌نامشان وجود دارد رد می‌شوند."""
+    created = 0
+    for gb, days, reseller, vip, normal, renew, first, icon in DEFAULT_PLANS:
+        name = f"{gb}GB - {days} روزه"
+        if await conn.fetchval("SELECT 1 FROM plans WHERE name = $1", name):
+            continue
+        await conn.execute(
+            """INSERT INTO plans (name, gb, duration_days, price, vip_price, reseller_price,
+                                  bulk_price, vip_bulk_price, renew_price, first_price,
+                                  inbound_id, panel_id, icon, sort_order, is_active)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,TRUE)""",
+            name, gb, days, normal, vip, reseller, reseller, renew, first,
+            inbound_id, panel_id, icon, gb,
+        )
+        created += 1
+    return created
+
+
+async def seed_default_plans(inbound_id=1, panel_id=None):
+    """درج پلن‌های پیش‌فرض از پنل مدیریت (بدون دست‌زدن به پلن‌های موجود)."""
+    async with db_pool.acquire() as conn:
+        if panel_id is None:
+            panel_id = await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
+        return await _insert_default_plans(conn, panel_id, inbound_id)
 
 
 async def _backfill_order_emails(conn):
@@ -282,9 +420,11 @@ async def count_transactions():
         return int(await conn.fetchval("SELECT COUNT(*) FROM transactions") or 0)
 
 
-async def list_vips():
+async def list_vips(role='vip'):
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT user_id, nickname, balance FROM users WHERE role = 'vip' ORDER BY user_id DESC")
+        return await conn.fetch(
+            "SELECT user_id, nickname, balance FROM users WHERE role = $1 ORDER BY user_id DESC", role,
+        )
 
 
 async def list_admin_rows():
@@ -318,12 +458,45 @@ async def set_user_role(user_id, role):
 PLAN_ORDER = "ORDER BY COALESCE(sort_order, id) ASC, id ASC"
 
 
-async def list_plans(panel_id=None):
-    """لیست پلن‌ها به ترتیب نمایش. با panel_id فقط پلن‌های همان پنل برگردانده می‌شود."""
+async def list_plans(panel_id=None, only_active=False):
+    """لیست پلن‌ها به ترتیب نمایش.
+
+    panel_id: فقط پلن‌های همان پنل. only_active: فقط پلن‌های فعال (برای منوی فروش).
+    """
+    where, args = [], []
+    if panel_id is not None:
+        args.append(int(panel_id))
+        where.append(f"panel_id = ${len(args)}")
+    if only_active:
+        where.append("COALESCE(is_active, TRUE) = TRUE")
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
     async with db_pool.acquire() as conn:
-        if panel_id is None:
-            return await conn.fetch(f"SELECT * FROM plans {PLAN_ORDER}")
-        return await conn.fetch(f"SELECT * FROM plans WHERE panel_id = $1 {PLAN_ORDER}", int(panel_id))
+        return await conn.fetch(f"SELECT * FROM plans {clause} {PLAN_ORDER}", *args)
+
+
+PLAN_PRICE_COLUMNS = {
+    'gb', 'duration_days', 'price', 'vip_price', 'reseller_price',
+    'vip_bulk_price', 'bulk_price', 'renew_price', 'first_price',
+    'name', 'icon', 'inbound_id', 'panel_id', 'sort_order', 'is_active',
+}
+
+
+async def update_plan_field(plan_id, col, value):
+    """به‌روزرسانی یک فیلد پلن. نام ستون از لیست ثابت بالا می‌آید."""
+    if col not in PLAN_PRICE_COLUMNS:
+        return False
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"UPDATE plans SET {col} = $1 WHERE id = $2", value, int(plan_id))
+    return True
+
+
+async def toggle_plan_active(plan_id):
+    """فعال/غیرفعال کردن پلن. خروجی: وضعیت جدید."""
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            "UPDATE plans SET is_active = NOT COALESCE(is_active, TRUE) WHERE id = $1 RETURNING is_active",
+            int(plan_id),
+        )
 
 
 async def get_plan(plan_id):
@@ -331,20 +504,28 @@ async def get_plan(plan_id):
         return await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
 
 
-async def create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon=''):
+async def create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+                      icon='', reseller_price=None, renew_price=None, first_price=None, is_active=True):
     async with db_pool.acquire() as conn:
         return await conn.fetchval(
-            """INSERT INTO plans (name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id""",
-            name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon or '',
+            """INSERT INTO plans (name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price,
+                                  inbound_id, panel_id, icon, reseller_price, renew_price, first_price, is_active)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id""",
+            name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+            icon or '', reseller_price, renew_price, first_price, bool(is_active),
         )
 
 
-async def update_plan(plan_id, name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon=''):
+async def update_plan(plan_id, name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+                      icon='', reseller_price=None, renew_price=None, first_price=None, is_active=True):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """UPDATE plans SET name=$2, gb=$3, duration_days=$4, price=$5, vip_price=$6, bulk_price=$7, vip_bulk_price=$8, inbound_id=$9, panel_id=$10, icon=$11 WHERE id=$1""",
-            int(plan_id), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon or '',
+            """UPDATE plans SET name=$2, gb=$3, duration_days=$4, price=$5, vip_price=$6, bulk_price=$7,
+                   vip_bulk_price=$8, inbound_id=$9, panel_id=$10, icon=$11,
+                   reseller_price=$12, renew_price=$13, first_price=$14, is_active=$15
+               WHERE id=$1""",
+            int(plan_id), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
+            icon or '', reseller_price, renew_price, first_price, bool(is_active),
         )
 
 
@@ -386,14 +567,24 @@ async def get_balance(user_id):
         return await conn.fetchval("SELECT balance FROM users WHERE user_id = $1", user_id) or 0
 
 
-async def add_order(user_id, config_link, panel_id=None, email=None, inbound_id=None):
-    """ثبت سفارش. نام سرویس و اینباند صریحاً ذخیره می‌شوند تا بعداً از لینک حدس زده نشوند."""
+async def add_order(user_id, config_link, panel_id=None, email=None, inbound_id=None,
+                    plan_id=None, price=None, base_price=None, discount=0,
+                    purchase_kind=None, user_role=None):
+    """ثبت سفارش.
+
+    نام سرویس و اینباند صریحاً ذخیره می‌شوند تا بعداً از لینک حدس زده نشوند، و قیمتِ
+    پرداخت‌شده روی خود سفارش می‌نشیند تا تغییر قیمت‌های بعدی سفارش‌های قبلی را عوض نکند.
+    خروجی: شناسه‌ی سفارش.
+    """
     if not email:
         email = email_from_link(config_link)
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO orders (user_id, config_link, date, panel_id, email, inbound_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        return await conn.fetchval(
+            """INSERT INTO orders (user_id, config_link, date, panel_id, email, inbound_id,
+                                   plan_id, price, base_price, discount, purchase_kind, user_role)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id""",
             user_id, config_link, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), panel_id, email, inbound_id,
+            plan_id, price, base_price, int(discount or 0), purchase_kind, user_role,
         )
 
 
@@ -451,6 +642,203 @@ async def mark_notified(order_id, field):
 async def reset_notify(order_id):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE orders SET expiry_notified = FALSE, lowdata_notified = FALSE WHERE id = $1", int(order_id))
+
+
+# ================= قیمت‌گذاری، آفر و فروش =================
+async def get_pricing_profile(user_id):
+    """اطلاعات لازم برای قیمت‌گذاریِ یک کاربر، با یک رفت‌وبرگشت به دیتابیس.
+
+    خروجی: dict شامل نقش، وضعیت آفر خرید اول، تعداد خریدهای قبلی و شارژ ۳۰ روز اخیر.
+    """
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+        row = await conn.fetchrow(
+            """SELECT u.role, u.balance, u.nickname,
+                      COALESCE(u.first_offer_used, FALSE) AS first_offer_used,
+                      COALESCE(u.reseller_bonus_used, FALSE) AS reseller_bonus_used,
+                      (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.user_id) AS order_count,
+                      (SELECT COALESCE(SUM(t.amount), 0) FROM transactions t
+                         WHERE t.user_id = u.user_id AND t.amount > 0
+                           AND t.kind IN ('شارژ حساب', 'کد هدیه')
+                           AND t.date >= NOW() - INTERVAL '30 days') AS monthly_topup
+               FROM users u WHERE u.user_id = $1""",
+            user_id,
+        )
+    return dict(row) if row else {}
+
+
+async def mark_first_offer_used(user_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET first_offer_used = TRUE WHERE user_id = $1", user_id)
+
+
+async def claim_reseller_bonus(user_id):
+    """پرچم «هدیه‌ی اولین شارژ نماینده» را اتمیک برمی‌دارد.
+
+    خروجی True یعنی این فراخوانی صاحب هدیه است؛ فراخوانی‌های بعدی False می‌گیرند.
+    """
+    async with db_pool.acquire() as conn:
+        return bool(await conn.fetchval(
+            """UPDATE users SET reseller_bonus_used = TRUE
+               WHERE user_id = $1 AND COALESCE(reseller_bonus_used, FALSE) = FALSE
+               RETURNING TRUE""",
+            user_id,
+        ))
+
+
+async def count_users_by_role():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT COALESCE(role, 'normal') AS role, COUNT(*) AS n FROM users GROUP BY 1")
+    return {r['role']: int(r['n']) for r in rows}
+
+
+# ---------- آفرها ----------
+async def list_offers(active_only=False):
+    async with db_pool.acquire() as conn:
+        if active_only:
+            return await conn.fetch(
+                """SELECT * FROM offers
+                   WHERE COALESCE(is_active, FALSE) = TRUE
+                     AND (starts_at IS NULL OR starts_at <= NOW())
+                     AND (ends_at IS NULL OR ends_at >= NOW())
+                     AND (max_uses = 0 OR COALESCE(used_count, 0) < max_uses)
+                   ORDER BY id DESC"""
+            )
+        return await conn.fetch("SELECT * FROM offers ORDER BY id DESC")
+
+
+async def get_offer(offer_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM offers WHERE id = $1", int(offer_id))
+
+
+async def save_offer(offer_id, name, kind, value, audience, plan_id, starts_at, ends_at,
+                     max_uses, per_user_limit, is_active):
+    async with db_pool.acquire() as conn:
+        if offer_id:
+            await conn.execute(
+                """UPDATE offers SET name=$2, kind=$3, value=$4, audience=$5, plan_id=$6,
+                       starts_at=$7, ends_at=$8, max_uses=$9, per_user_limit=$10, is_active=$11
+                   WHERE id=$1""",
+                int(offer_id), name, kind, value, audience, plan_id, starts_at, ends_at,
+                max_uses, per_user_limit, bool(is_active),
+            )
+            return int(offer_id)
+        return await conn.fetchval(
+            """INSERT INTO offers (name, kind, value, audience, plan_id, starts_at, ends_at,
+                                   max_uses, per_user_limit, is_active)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+            name, kind, value, audience, plan_id, starts_at, ends_at, max_uses, per_user_limit, bool(is_active),
+        )
+
+
+async def delete_offer(offer_id):
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM offer_redemptions WHERE offer_id = $1", int(offer_id))
+            await conn.execute("DELETE FROM offers WHERE id = $1", int(offer_id))
+
+
+async def toggle_offer_active(offer_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            "UPDATE offers SET is_active = NOT COALESCE(is_active, FALSE) WHERE id = $1 RETURNING is_active",
+            int(offer_id),
+        )
+
+
+async def offer_uses_by_user(user_id):
+    """تعداد دفعاتی که این کاربر از هر آفر استفاده کرده: {offer_id: count}."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT offer_id, COUNT(*) AS n FROM offer_redemptions WHERE user_id = $1 GROUP BY 1", user_id,
+        )
+    return {r['offer_id']: int(r['n']) for r in rows}
+
+
+async def redeem_offer(offer_id, user_id, per_user_limit=1, max_uses=0):
+    """ثبت اتمیک استفاده از آفر با رعایت سقف کل و سقف هر کاربر.
+
+    خروجی: True اگر ثبت شد. تصمیم‌گیری داخل یک تراکنش انجام می‌شود تا دو درخواست
+    هم‌زمان نتوانند از سقف عبور کنند.
+    """
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("SELECT max_uses, per_user_limit, used_count FROM offers WHERE id = $1 FOR UPDATE", int(offer_id))
+            if not row:
+                return False
+            total_limit = row['max_uses'] if row['max_uses'] is not None else max_uses
+            user_limit = row['per_user_limit'] if row['per_user_limit'] is not None else per_user_limit
+            if total_limit and int(row['used_count'] or 0) >= int(total_limit):
+                return False
+            if user_limit:
+                used = await conn.fetchval(
+                    "SELECT COUNT(*) FROM offer_redemptions WHERE offer_id = $1 AND user_id = $2", int(offer_id), user_id,
+                )
+                if int(used or 0) >= int(user_limit):
+                    return False
+            await conn.execute("INSERT INTO offer_redemptions (offer_id, user_id) VALUES ($1, $2)", int(offer_id), user_id)
+            await conn.execute("UPDATE offers SET used_count = COALESCE(used_count, 0) + 1 WHERE id = $1", int(offer_id))
+            return True
+
+
+# ---------- دفتر فروش ----------
+async def record_sale(user_id, kind, user_role, base_price, price, discount,
+                      plan_id=None, order_id=None, offer_id=None, first_offer=False):
+    """ثبت یک فروش برای گزارش مالی (تمدید سفارش جدید نمی‌سازد، پس اینجا ثبت می‌شود)."""
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            """INSERT INTO sales (user_id, order_id, plan_id, kind, user_role, base_price, price, discount, offer_id, first_offer)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+            user_id, order_id, plan_id, kind, user_role,
+            int(base_price or 0), int(price or 0), int(discount or 0), offer_id, bool(first_offer),
+        )
+
+
+async def get_financial_report():
+    """گزارش مالی کامل: تفکیک کاربران، فروش دوره‌ای، تفکیک نقش، آفرها و تخفیف‌ها."""
+    async with db_pool.acquire() as conn:
+        roles = await conn.fetch("SELECT COALESCE(role,'normal') AS role, COUNT(*) AS n FROM users GROUP BY 1")
+        periods = await conn.fetchrow(
+            """SELECT
+                 COALESCE(SUM(price) FILTER (WHERE created_at::date = CURRENT_DATE), 0) AS today,
+                 COALESCE(SUM(price) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days'), 0) AS week,
+                 COALESCE(SUM(price) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days'), 0) AS month,
+                 COALESCE(SUM(price), 0) AS total,
+                 COALESCE(SUM(discount), 0) AS discount,
+                 COUNT(*) FILTER (WHERE kind = 'renew') AS renewals,
+                 COUNT(*) FILTER (WHERE first_offer) AS first_offers,
+                 COUNT(*) AS sales_count
+               FROM sales"""
+        )
+        by_role = await conn.fetch(
+            "SELECT COALESCE(user_role,'normal') AS role, COALESCE(SUM(price),0) AS total, COUNT(*) AS n FROM sales GROUP BY 1"
+        )
+        refunds = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'برگشت وجه'")
+        topup = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'شارژ حساب'")
+        bonus = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'هدیه نمایندگی'")
+
+    users_by_role = {r['role']: int(r['n']) for r in roles}
+    sales_by_role = {r['role']: {'total': int(r['total']), 'count': int(r['n'])} for r in by_role}
+    total = int(periods['total'])
+    discount = int(periods['discount'])
+    return {
+        'users': users_by_role,
+        'today': int(periods['today']),
+        'week': int(periods['week']),
+        'month': int(periods['month']),
+        'total': total,
+        'discount': discount,
+        'renewals': int(periods['renewals']),
+        'first_offers': int(periods['first_offers']),
+        'sales_count': int(periods['sales_count']),
+        'by_role': sales_by_role,
+        'refunds': int(refunds or 0),
+        'topup': int(topup or 0),
+        'bonus': int(bonus or 0),
+        # درآمد خالص: فروش ثبت‌شده منهای برگشت وجه و هدایای اعتباری
+        'net': total - int(refunds or 0) - int(bonus or 0),
+    }
 
 
 # ================= پنل‌ها =================

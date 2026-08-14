@@ -16,6 +16,7 @@ from urllib.parse import quote
 from aiohttp import web
 
 import db
+import pricing
 from links import order_email
 from config import (
     WEB_ADMIN_PASSWORD, WEB_PORT, WEB_HOST, WEB_SESSION_TTL,
@@ -28,6 +29,10 @@ PER_PAGE = 20
 
 # تسک‌های پس‌زمینه (مثل پیام همگانی) نگه داشته می‌شوند تا زودتر از موعد جمع نشوند
 _TASKS = set()
+
+# سطوح کاربر و مخاطب آفرها از موتور قیمت‌گذاری می‌آیند تا یک منبع واحد داشته باشیم
+ROLE_LABELS = {pricing.NORMAL: 'عادی', pricing.VIP: 'VIP', pricing.RESELLER: 'نماینده'}
+AUDIENCE_LABELS = pricing.AUDIENCES
 
 # ================= احراز هویت =================
 # نشست‌ها تصادفی و دارای انقضا هستند. قبلاً توکن یک مقدار ثابتِ مشتق از رمز بود؛
@@ -167,14 +172,16 @@ label{display:block;margin:10px 0 4px;color:#c7d2e0;font-size:13px}
 
 NAV = [
     ("/", "📊 داشبورد"),
+    ("/finance", "📈 گزارش مالی"),
     ("/users", "👥 کاربران"),
     ("/orders", "📦 سفارش‌ها"),
     ("/transactions", "💳 تراکنش‌ها"),
-    ("/plans", "🛒 پلن‌ها"),
+    ("/plans", "🛒 پلن‌ها و قیمت‌ها"),
+    ("/offers", "🎯 آفرها"),
     ("/panels", "🖥 پنل‌ها"),
     ("/giftcodes", "🎟 کدهای هدیه"),
     ("/broadcast", "📢 پیام همگانی"),
-    ("/specials", "💎 VIP و ادمین"),
+    ("/specials", "💎 VIP و نمایندگان"),
     ("/settings", "⚙️ تنظیمات"),
 ]
 
@@ -298,8 +305,10 @@ async def dashboard(request):
     )
     quick = """
     <div class='box'><h3>دسترسی سریع</h3><div class='row'>
+      <a href='/finance'><button class='btn-ghost'>📈 گزارش مالی</button></a>
+      <a href='/plans'><button class='btn-ghost'>💰 مدیریت قیمت‌ها</button></a>
+      <a href='/offers'><button class='btn-ghost'>🎯 آفرها</button></a>
       <a href='/users'><button class='btn-ghost'>👥 کاربران</button></a>
-      <a href='/plans/edit'><button class='btn-ghost'>➕ افزودن پلن</button></a>
       <a href='/broadcast'><button class='btn-ghost'>📢 پیام همگانی</button></a>
       <a href='/backup'><button class='btn-ghost'>💾 دانلود بکاپ</button></a>
       <a href='/settings'><button class='btn-ghost'>⚙️ تنظیمات</button></a>
@@ -309,7 +318,24 @@ async def dashboard(request):
 
 # ================= کاربران =================
 def _role_badge(role):
-    return "<span class='badge vip'>VIP 💎</span>" if role == "vip" else "<span class='badge norm'>عادی</span>"
+    role = pricing.normalize_role(role)
+    if role == pricing.VIP:
+        return "<span class='badge vip'>VIP 💎</span>"
+    if role == pricing.RESELLER:
+        return "<span class='badge on'>نماینده 🤝</span>"
+    return "<span class='badge norm'>عادی</span>"
+
+
+def _role_options(current):
+    current = pricing.normalize_role(current)
+    return "".join(
+        f"<option value='{key}' {_sel(current, key)}>{e(label)}</option>"
+        for key, label in ROLE_LABELS.items()
+    )
+
+
+def _valid_role(value):
+    return value if value in ROLE_LABELS else pricing.NORMAL
 
 
 @require_auth
@@ -368,8 +394,16 @@ async def user_view(request):
         t_rows += f"<tr><td>{sign} {abs(t['amount']):,}</td><td>{e(t['kind'])}</td><td>{e(t['description'])}</td><td>{e(d)}</td></tr>"
     t_table = f"<table><tr><th>مبلغ</th><th>نوع</th><th>توضیح</th><th>تاریخ</th></tr>{t_rows}</table>" if txns else "<p class='muted'>تراکنشی ندارد.</p>"
 
-    other_role = "normal" if u['role'] == "vip" else "vip"
-    other_label = "تبدیل به عادی" if u['role'] == "vip" else "ارتقا به VIP 💎"
+    profile = await db.get_pricing_profile(int(uid))
+    tier, tier_discount, tier_title = pricing.reseller_tier(profile.get('monthly_topup'), await pricing.load_config())
+    reseller_box = ""
+    if pricing.normalize_role(u['role']) == pricing.RESELLER:
+        reseller_box = (
+            f"<p>پله‌ی نمایندگی: <b>{e(tier_title)}</b> (تخفیف اضافه: {tier_discount}٪)</p>"
+            f"<p>شارژ ۳۰ روز اخیر: <b>{money(profile.get('monthly_topup'))}</b> تومان</p>"
+            f"<p>هدیه‌ی اولین شارژ: {'مصرف شده' if profile.get('reseller_bonus_used') else 'استفاده نشده'}</p>"
+        )
+    first_offer = 'مصرف شده' if profile.get('first_offer_used') else 'در دسترس'
     body = f"""<h2>کاربر {e(uid)}</h2>
     <div class='grid2'>
       <div class='box'>
@@ -378,6 +412,8 @@ async def user_view(request):
         <p>نقش: {_role_badge(u['role'])}</p>
         <p>موجودی: <b>{money(u['balance'])}</b> تومان</p>
         <p>اکانت تست گرفته: {'بله' if u['got_test'] else 'خیر'}</p>
+        <p>آفر خرید اول: <b>{e(first_offer)}</b> | تعداد سفارش‌ها: {len(orders)}</p>
+        {reseller_box}
         <p>دعوت‌کننده: {e(u['referred_by'] or '—')} | تعداد دعوت‌های او: {ref_count}</p>
         <div class='row' style='margin-top:10px'>
           <form class='inline' method='post' action='/users/adjust'>
@@ -387,8 +423,8 @@ async def user_view(request):
           </form>
           <form class='inline' method='post' action='/users/role'>
             <input type='hidden' name='user_id' value='{e(uid)}'>
-            <input type='hidden' name='role' value='{other_role}'>
-            <button class='btn-ghost'>{other_label}</button>
+            <select name='role'>{_role_options(u['role'])}</select>
+            <button class='btn-ghost'>تغییر سطح</button>
           </form>
           <form class='inline' method='post' action='/users/delete' onsubmit="return confirm('حذف کامل کاربر؟')">
             <input type='hidden' name='user_id' value='{e(uid)}'>
@@ -420,11 +456,8 @@ async def user_edit_form(request):
       <label>آیدی کاربر</label>{uid_field}
       <label>نام</label><input name='nickname' value='{nick_v}'>
       <label>موجودی (تومان)</label><input name='balance' value='{bal_v}'>
-      <label>نقش</label><select name='role'>
-        <option value='normal' {'selected' if role_v=='normal' else ''}>عادی</option>
-        <option value='vip' {'selected' if role_v=='vip' else ''}>VIP</option>
-      </select>
-      <p class='muted'>خرید عمده فقط با نقش VIP فعال می‌شود.</p>
+      <label>نقش</label><select name='role'>{_role_options(role_v)}</select>
+      <p class='muted'>خرید عمده برای نقش VIP و نماینده فعال است. نماینده قیمت همکاری و پله‌های تخفیف را می‌گیرد.</p>
       <div class='row'><button type='submit'>💾 ذخیره</button> <a href='/users'>انصراف</a></div>
     </form></div>"""
     return layout(title, body, "/users", request)
@@ -439,7 +472,7 @@ async def user_save(request):
     except (TypeError, ValueError):
         raise _redirect("/users", err="ورودی نامعتبر")
     nickname = (data.get("nickname") or "").strip() or None
-    role = data.get("role") if data.get("role") in ("normal", "vip") else "normal"
+    role = _valid_role(data.get("role"))
     await db.save_user(uid, nickname, role, False, balance)
     logging.info("WEB_USER_SAVE user=%s role=%s balance=%s", uid, role, balance)
     raise _redirect("/users", ok="کاربر ذخیره شد")
@@ -485,7 +518,7 @@ async def user_role(request):
         uid = int(data.get("user_id"))
     except (TypeError, ValueError):
         raise _redirect("/users", err="آیدی نامعتبر")
-    role = data.get("role") if data.get("role") in ("normal", "vip") else "normal"
+    role = _valid_role(data.get("role"))
     await db.set_user_role(uid, role)
     logging.info("WEB_USER_ROLE user=%s role=%s", uid, role)
     raise _redirect(f"/users/view?id={uid}", ok="نقش کاربر تغییر کرد")
@@ -552,19 +585,31 @@ async def plans_page(request):
     rows = ""
     for p in plans:
         icon = (p['icon'] or '').strip() if 'icon' in p else ''
+        active = bool(p['is_active'])
+        badge = "<span class='badge on'>فعال</span>" if active else "<span class='badge off'>غیرفعال</span>"
         rows += (
             f"<tr><td>{e(p['id'])}</td><td>{e(icon)}</td><td>{e(p['name'])}</td><td>{e(p['gb'])}</td><td>{e(p['duration_days'])}</td>"
-            f"<td>{money(p['price'])}</td><td>{money(p['vip_price'])}</td><td>{money(p['vip_bulk_price'])}</td><td>{e(p['inbound_id'])}</td>"
-            f"<td>{e(pname.get(p['panel_id'], p['panel_id']))}</td>"
+            f"<td>{money(p['price'])}</td><td>{money(p['vip_price'])}</td><td>{money(p['reseller_price'])}</td>"
+            f"<td>{money(p['renew_price'])}</td><td>{money(p['first_price'])}</td><td>{money(p['vip_bulk_price'])}</td>"
+            f"<td>{e(p['inbound_id'])}</td><td>{e(pname.get(p['panel_id'], p['panel_id']))}</td><td>{badge}</td>"
             f"<td class='actions'><a href='/plans/edit?id={e(p['id'])}'><button>✏️</button></a>"
+            f"<form class='inline' method='post' action='/plans/toggle'>"
+            f"<input type='hidden' name='id' value='{e(p['id'])}'><button class='btn-ghost'>{'⏸' if active else '▶️'}</button></form>"
             f"<form class='inline' method='post' action='/plans/delete' onsubmit=\"return confirm('حذف پلن؟')\">"
             f"<input type='hidden' name='id' value='{e(p['id'])}'><button class='btn-danger'>🗑</button></form></td></tr>"
         )
-    body = f"""<h2>پلن‌ها</h2>
-    <p class='muted'>پلن‌های جدید پایین‌تر نمایش داده می‌شوند. برای رنگی/دسته‌بندی‌شدن دکمه‌ها، در فیلد «آیکون» یک ایموجی بگذار (مثل 🟦 برای تانل، 🟥 برای مستقیم).</p>
-    <a href='/plans/edit'><button>➕ افزودن پلن</button></a>
-    <table><tr><th>#</th><th>آیکون</th><th>نام</th><th>حجم</th><th>روز</th><th>عادی</th><th>VIP</th><th>عمده</th><th>اینباند</th><th>پنل</th><th>عملیات</th></tr>{rows}</table>"""
-    return layout("پلن‌ها", body, "/plans", request)
+    body = f"""<h2>پلن‌ها و قیمت‌ها</h2>
+    <p class='muted'>سه سطح قیمت داریم: عادی، VIP و همکاری (نماینده). قیمت تمدید و قیمت آفر خرید اول هم برای هر پلن جداگانه تنظیم می‌شوند.
+    پلن غیرفعال از منوی فروش ربات حذف می‌شود ولی سرویس‌های فروخته‌شده‌ی آن دست‌نخورده باقی می‌مانند.</p>
+    <div class='row'>
+      <a href='/plans/edit'><button>➕ افزودن پلن</button></a>
+      <form class='inline' method='post' action='/plans/seed' onsubmit="return confirm('پلن‌های پیش‌فرض ساخته شوند؟ پلن‌های موجود دست نمی‌خورند.')">
+        <button class='btn-ghost'>📥 ساخت پلن‌های پیش‌فرض</button>
+      </form>
+    </div>
+    <table><tr><th>#</th><th>آیکون</th><th>نام</th><th>حجم</th><th>روز</th><th>عادی</th><th>VIP</th><th>همکاری</th>
+      <th>تمدید</th><th>خرید اول</th><th>عمده</th><th>اینباند</th><th>پنل</th><th>وضعیت</th><th>عملیات</th></tr>{rows}</table>"""
+    return layout("پلن‌ها و قیمت‌ها", body, "/plans", request)
 
 
 @require_auth
@@ -592,13 +637,21 @@ async def plan_edit_form(request):
         <div><label>آیکون/ایموجی (اختیاری) مثل 🟦 یا 🟥</label><input name='icon' value='{val('icon')}'></div>
         <div><label>حجم (GB)</label><input name='gb' value='{val('gb','0')}'></div>
         <div><label>مدت (روز)</label><input name='duration_days' value='{val('duration_days','30')}'></div>
-        <div><label>قیمت عادی</label><input name='price' value='{val('price','0')}'></div>
+        <div><label>قیمت عادی (Normal)</label><input name='price' value='{val('price','0')}'></div>
         <div><label>قیمت VIP</label><input name='vip_price' value='{val('vip_price','0')}'></div>
-        <div><label>قیمت عمده (VIP)</label><input name='vip_bulk_price' value='{val('vip_bulk_price','0')}'></div>
+        <div><label>قیمت همکاری (Reseller)</label><input name='reseller_price' value='{val('reseller_price','0')}'></div>
+        <div><label>قیمت تمدید (Renewal)</label><input name='renew_price' value='{val('renew_price','0')}'></div>
+        <div><label>قیمت آفر خرید اول</label><input name='first_price' value='{val('first_price','0')}'></div>
+        <div><label>قیمت عمده (VIP/نماینده)</label><input name='vip_bulk_price' value='{val('vip_bulk_price','0')}'></div>
         <div><label>اینباند (Inbound ID)</label><input name='inbound_id' value='{val('inbound_id','1')}'></div>
         <div><label>پنل</label><select name='panel_id'>{options}</select></div>
+        <div><label>وضعیت</label><select name='is_active'>
+          <option value='1' {'selected' if (p is None or p['is_active']) else ''}>فعال</option>
+          <option value='0' {'selected' if (p is not None and not p['is_active']) else ''}>غیرفعال</option>
+        </select></div>
       </div>
-      <p class='muted'>قیمت عمده فقط برای کاربران VIP اعمال می‌شود.</p>
+      <p class='muted'>قیمت خالی یا صفر یعنی «تنظیم نشده»؛ در این حالت به سطح بالاتر برمی‌گردد (همکاری ← VIP ← عادی).
+      قیمت تمدید و آفر خرید اول فقط وقتی اعمال می‌شوند که از قیمت سطح کاربر کمتر باشند.</p>
       <div class='row'><button type='submit'>💾 ذخیره</button> <a href='/plans'>انصراف</a></div>
     </form></div>"""
     return layout(title, body, "/plans", request)
@@ -613,6 +666,9 @@ async def plan_save(request):
         duration_days = int(data.get("duration_days") or 30)
         price = int(data.get("price") or 0)
         vip_price = int(data.get("vip_price") or 0)
+        reseller_price = int(data.get("reseller_price") or 0)
+        renew_price = int(data.get("renew_price") or 0)
+        first_price = int(data.get("first_price") or 0)
         vip_bulk_price = int(data.get("vip_bulk_price") or 0)
         inbound_id = int(data.get("inbound_id") or 0)
         panel_id = int(data.get("panel_id")) if data.get("panel_id") else None
@@ -621,15 +677,37 @@ async def plan_save(request):
     if not name:
         raise _redirect("/plans", err="نام پلن الزامی است")
     icon = (data.get("icon") or "").strip()
+    is_active = data.get("is_active", "1") == "1"
     # ستون عمده‌ی عادی حذف شده؛ همان قیمت عمده را در آن هم ذخیره می‌کنیم تا سازگاری حفظ شود
     bulk_price = vip_bulk_price
     pid = data.get("id")
+    args = (name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id)
+    kwargs = dict(icon=icon, reseller_price=reseller_price, renew_price=renew_price,
+                  first_price=first_price, is_active=is_active)
     if pid and pid.isdigit():
-        await db.update_plan(int(pid), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon)
+        await db.update_plan(int(pid), *args, **kwargs)
     else:
-        await db.create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id, icon)
-    logging.info("WEB_PLAN_SAVE name=%s panel=%s", name, panel_id)
+        await db.create_plan(*args, **kwargs)
+    logging.info("WEB_PLAN_SAVE name=%s panel=%s active=%s", name, panel_id, is_active)
     raise _redirect("/plans", ok="پلن ذخیره شد")
+
+
+@require_auth
+async def plan_toggle(request):
+    data = await request.post()
+    pid = data.get("id")
+    if not (pid and str(pid).isdigit()):
+        raise _redirect("/plans", err="آیدی نامعتبر")
+    state = await db.toggle_plan_active(int(pid))
+    logging.info("WEB_PLAN_TOGGLE id=%s active=%s", pid, state)
+    raise _redirect("/plans", ok="پلن فعال شد" if state else "پلن غیرفعال شد")
+
+
+@require_auth
+async def plans_seed(request):
+    created = await db.seed_default_plans()
+    logging.info("WEB_PLANS_SEED created=%s", created)
+    raise _redirect("/plans", ok=f"{created} پلن پیش‌فرض اضافه شد" if created else "پلن‌های پیش‌فرض از قبل وجود دارند")
 
 
 @require_auth
@@ -640,6 +718,220 @@ async def plan_delete(request):
         await db.delete_plan(int(pid))
         logging.info("WEB_PLAN_DELETE id=%s", pid)
     raise _redirect("/plans", ok="پلن حذف شد")
+
+
+# ================= آفرها =================
+OFFER_KINDS = {'percent': 'درصدی', 'fixed': 'قیمت ثابت'}
+
+
+def _dt(value):
+    """ورودی datetime-local را به datetime تبدیل می‌کند (خالی → None)."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _dt_input(value):
+    return value.strftime("%Y-%m-%dT%H:%M") if value else ""
+
+
+@require_auth
+async def offers_page(request):
+    offers = await db.list_offers()
+    plans = await db.list_plans()
+    plan_names = {p['id']: p['name'] for p in plans}
+    rows = ""
+    for o in offers:
+        active = bool(o['is_active'])
+        value = f"{o['value']}٪" if (o['kind'] or 'percent') == 'percent' else f"{money(o['value'])} تومان"
+        window = f"{o['starts_at'].strftime('%Y-%m-%d') if o['starts_at'] else '—'} تا {o['ends_at'].strftime('%Y-%m-%d') if o['ends_at'] else '—'}"
+        limit = "نامحدود" if not o['max_uses'] else f"{o['used_count']}/{o['max_uses']}"
+        rows += (
+            f"<tr><td>{e(o['id'])}</td><td>{e(o['name'])}</td><td>{e(OFFER_KINDS.get(o['kind'], o['kind']))}</td><td>{e(value)}</td>"
+            f"<td>{e(AUDIENCE_LABELS.get(o['audience'], o['audience']))}</td>"
+            f"<td>{e(plan_names.get(o['plan_id'], 'همه'))}</td><td>{e(window)}</td>"
+            f"<td>{e(limit)}</td><td>{e(o['per_user_limit'])}</td>"
+            f"<td>{'<span class=\"badge on\">فعال</span>' if active else '<span class=\"badge off\">غیرفعال</span>'}</td>"
+            f"<td class='actions'><a href='/offers/edit?id={e(o['id'])}'><button>✏️</button></a>"
+            f"<form class='inline' method='post' action='/offers/toggle'>"
+            f"<input type='hidden' name='id' value='{e(o['id'])}'><button class='btn-ghost'>{'⏸' if active else '▶️'}</button></form>"
+            f"<form class='inline' method='post' action='/offers/delete' onsubmit=\"return confirm('حذف آفر؟')\">"
+            f"<input type='hidden' name='id' value='{e(o['id'])}'><button class='btn-danger'>🗑</button></form></td></tr>"
+        )
+    first_offer = await db.get_setting("first_offer_enabled")
+    renew_offer = await db.get_setting("renew_offer_enabled")
+    body = f"""<h2>مدیریت آفرها</h2>
+    <div class='box'><h3>آفرهای داخلی</h3>
+      <form class='row' method='post' action='/offers/builtin'>
+        <div><label>آفر خرید اول</label><select name='first_offer_enabled'>
+          <option value='on' {_sel(first_offer,'on')}>فعال</option><option value='off' {_sel(first_offer,'off')}>غیرفعال</option>
+        </select></div>
+        <div><label>قیمت ویژه‌ی تمدید</label><select name='renew_offer_enabled'>
+          <option value='on' {_sel(renew_offer,'on')}>فعال</option><option value='off' {_sel(renew_offer,'off')}>غیرفعال</option>
+        </select></div>
+        <div style='align-self:end'><button>💾 ذخیره</button></div>
+      </form>
+      <p class='muted'>مبلغ این دو آفر در صفحه‌ی «پلن‌ها و قیمت‌ها» و به‌ازای هر پلن تنظیم می‌شود.
+      آفر خرید اول فقط برای کاربری فعال است که هیچ سرویسی نگرفته باشد و فقط یک‌بار مصرف می‌شود.</p>
+    </div>
+    <div class='row' style='margin-top:14px'><a href='/offers/edit'><button>➕ افزودن آفر</button></a></div>
+    <table><tr><th>#</th><th>نام</th><th>نوع</th><th>مقدار</th><th>مخاطب</th><th>پلن</th><th>بازه</th>
+      <th>استفاده</th><th>سقف هر کاربر</th><th>وضعیت</th><th>عملیات</th></tr>{rows}</table>"""
+    return layout("آفرها", body, "/offers", request)
+
+
+@require_auth
+async def offer_edit_form(request):
+    oid = request.query.get("id")
+    o = await db.get_offer(int(oid)) if oid and oid.isdigit() else None
+    is_new = o is None
+    title = "افزودن آفر" if is_new else f"ویرایش آفر {oid}"
+    plans = await db.list_plans()
+
+    def val(key, default=""):
+        if not o:
+            return default
+        return e(o[key]) if o[key] is not None else default
+
+    kind = o['kind'] if o else 'percent'
+    audience = o['audience'] if o else 'all'
+    plan_opts = "<option value=''>همه‌ی پلن‌ها</option>" + "".join(
+        f"<option value='{e(p['id'])}' {'selected' if o and o['plan_id'] == p['id'] else ''}>{e(p['name'])}</option>"
+        for p in plans
+    )
+    kind_opts = "".join(
+        f"<option value='{k}' {_sel(kind, k)}>{e(label)}</option>" for k, label in OFFER_KINDS.items()
+    )
+    aud_opts = "".join(
+        f"<option value='{k}' {_sel(audience, k)}>{e(label)}</option>" for k, label in AUDIENCE_LABELS.items()
+    )
+    hidden_id = "" if is_new else f"<input type='hidden' name='id' value='{e(oid)}'>"
+    body = f"""<h2>{e(title)}</h2>
+    <div class='box'><form method='post' action='/offers/save'>{hidden_id}
+      <div class='grid2'>
+        <div><label>نام آفر</label><input name='name' value='{val('name')}' placeholder='مثلاً جشنواره نوروز'></div>
+        <div><label>نوع</label><select name='kind'>{kind_opts}</select></div>
+        <div><label>مقدار (درصد یا مبلغ ثابت)</label><input name='value' value='{val('value','0')}'></div>
+        <div><label>مخاطب</label><select name='audience'>{aud_opts}</select></div>
+        <div><label>پلن</label><select name='plan_id'>{plan_opts}</select></div>
+        <div><label>تاریخ شروع</label><input type='datetime-local' name='starts_at' value='{_dt_input(o['starts_at']) if o else ''}'></div>
+        <div><label>تاریخ پایان</label><input type='datetime-local' name='ends_at' value='{_dt_input(o['ends_at']) if o else ''}'></div>
+        <div><label>سقف کل استفاده (۰ = نامحدود)</label><input name='max_uses' value='{val('max_uses','0')}'></div>
+        <div><label>سقف استفاده هر کاربر</label><input name='per_user_limit' value='{val('per_user_limit','1')}'></div>
+        <div><label>وضعیت</label><select name='is_active'>
+          <option value='1' {'selected' if (o is None or o['is_active']) else ''}>فعال</option>
+          <option value='0' {'selected' if (o is not None and not o['is_active']) else ''}>غیرفعال</option>
+        </select></div>
+      </div>
+      <p class='muted'>آفر فقط وقتی اعمال می‌شود که قیمت حاصل از قیمت فعلیِ کاربر کمتر باشد؛ بین چند آفرِ واجد شرایط، ارزان‌ترین انتخاب می‌شود.</p>
+      <div class='row'><button type='submit'>💾 ذخیره</button> <a href='/offers'>انصراف</a></div>
+    </form></div>"""
+    return layout(title, body, "/offers", request)
+
+
+@require_auth
+async def offer_save(request):
+    data = await request.post()
+    try:
+        value = int(data.get("value") or 0)
+        max_uses = max(0, int(data.get("max_uses") or 0))
+        per_user_limit = max(0, int(data.get("per_user_limit") or 1))
+        plan_id = int(data.get("plan_id")) if (data.get("plan_id") or "").strip() else None
+    except (TypeError, ValueError):
+        raise _redirect("/offers", err="ورودی نامعتبر")
+    name = (data.get("name") or "").strip()
+    if not name:
+        raise _redirect("/offers", err="نام آفر الزامی است")
+    kind = data.get("kind") if data.get("kind") in OFFER_KINDS else "percent"
+    audience = data.get("audience") if data.get("audience") in AUDIENCE_LABELS else "all"
+    if kind == "percent" and not (0 <= value <= 100):
+        raise _redirect("/offers", err="درصد تخفیف باید بین ۰ تا ۱۰۰ باشد")
+    oid = data.get("id")
+    await db.save_offer(
+        int(oid) if oid and oid.isdigit() else None,
+        name, kind, value, audience, plan_id,
+        _dt(data.get("starts_at")), _dt(data.get("ends_at")),
+        max_uses, per_user_limit, data.get("is_active", "1") == "1",
+    )
+    logging.info("WEB_OFFER_SAVE name=%s kind=%s value=%s audience=%s", name, kind, value, audience)
+    raise _redirect("/offers", ok="آفر ذخیره شد")
+
+
+@require_auth
+async def offer_toggle(request):
+    data = await request.post()
+    oid = data.get("id")
+    if not (oid and str(oid).isdigit()):
+        raise _redirect("/offers", err="آیدی نامعتبر")
+    state = await db.toggle_offer_active(int(oid))
+    raise _redirect("/offers", ok="آفر فعال شد" if state else "آفر غیرفعال شد")
+
+
+@require_auth
+async def offer_delete(request):
+    data = await request.post()
+    oid = data.get("id")
+    if oid and str(oid).isdigit():
+        await db.delete_offer(int(oid))
+        logging.info("WEB_OFFER_DELETE id=%s", oid)
+    raise _redirect("/offers", ok="آفر حذف شد")
+
+
+@require_auth
+async def offers_builtin(request):
+    data = await request.post()
+    for key in ("first_offer_enabled", "renew_offer_enabled"):
+        await db.update_setting(key, "on" if data.get(key) == "on" else "off")
+    raise _redirect("/offers", ok="آفرهای داخلی به‌روزرسانی شد")
+
+
+# ================= گزارش مالی =================
+@require_auth
+async def finance_page(request):
+    r = await db.get_financial_report()
+    users, by_role = r['users'], r['by_role']
+
+    def card(icon, label, value):
+        return f"<div class='card'><div class='i'>{icon}</div><div class='n'>{e(value)}</div><div class='l'>{e(label)}</div></div>"
+
+    def role_row(key, label):
+        item = by_role.get(key, {'total': 0, 'count': 0})
+        return f"<tr><td>{e(label)}</td><td>{users.get(key, 0):,}</td><td>{money(item['total'])}</td><td>{item['count']:,}</td></tr>"
+
+    cards = "".join([
+        card("📅", "فروش امروز", money(r['today'])),
+        card("🗓", "فروش ۷ روز اخیر", money(r['week'])),
+        card("📆", "فروش ۳۰ روز اخیر", money(r['month'])),
+        card("💰", "فروش کل", money(r['total'])),
+        card("🎁", "مجموع تخفیف داده‌شده", money(r['discount'])),
+        card("🤝", "هدیه‌ی نمایندگی", money(r['bonus'])),
+        card("↩️", "برگشت وجه", money(r['refunds'])),
+        card("🏦", "درآمد خالص", money(r['net'])),
+    ])
+    body = f"""<h2>گزارش مالی</h2>
+    <div class='cards'>{cards}</div>
+    <div class='box'><h3>تفکیک بر اساس سطح کاربر</h3>
+      <table><tr><th>سطح</th><th>تعداد کاربر</th><th>مبلغ فروش</th><th>تعداد فروش</th></tr>
+        {role_row('normal', 'عادی')}{role_row('vip', 'VIP')}{role_row('reseller', 'نماینده')}
+      </table>
+    </div>
+    <div class='box'><h3>آفرها و تمدیدها</h3>
+      <table>
+        <tr><td>استفاده از آفر خرید اول</td><td>{r['first_offers']:,}</td></tr>
+        <tr><td>تعداد تمدیدها</td><td>{r['renewals']:,}</td></tr>
+        <tr><td>تعداد کل فروش‌ها</td><td>{r['sales_count']:,}</td></tr>
+        <tr><td>کل شارژ حساب‌ها</td><td>{money(r['topup'])} تومان</td></tr>
+      </table>
+      <p class='muted'>درآمد خالص = مجموع فروش‌های ثبت‌شده منهای برگشت وجه و اعتبار هدیه‌ی نمایندگی.
+      فروش‌ها از لحظه‌ی نصب این نسخه ثبت می‌شوند؛ سفارش‌های قدیمی‌تر مبلغ ثبت‌شده ندارند.</p>
+    </div>"""
+    return layout("گزارش مالی", body, "/finance", request)
 
 
 # ================= پنل‌ها =================
@@ -815,29 +1107,40 @@ async def broadcast_send(request):
 # ================= VIP و ادمین =================
 @require_auth
 async def specials_page(request):
-    vips = await db.list_vips()
+    vips = await db.list_vips(role=pricing.VIP)
+    resellers = await db.list_vips(role=pricing.RESELLER)
     admins = await db.list_admin_rows()
-    v_rows = ""
-    for v in vips:
-        v_rows += (
-            f"<tr><td>{e(v['user_id'])}</td><td>{e(v['nickname'])}</td><td>{money(v['balance'])}</td>"
-            f"<td><form class='inline' method='post' action='/specials/vip_remove'>"
-            f"<input type='hidden' name='user_id' value='{e(v['user_id'])}'><button class='btn-danger'>حذف VIP</button></form></td></tr>"
-        )
+    cfg = await pricing.load_config()
+
+    def member_rows(rows, label):
+        out = ""
+        for v in rows:
+            out += (
+                f"<tr><td>{e(v['user_id'])}</td><td>{e(v['nickname'])}</td><td>{money(v['balance'])}</td>"
+                f"<td><form class='inline' method='post' action='/specials/vip_remove'>"
+                f"<input type='hidden' name='user_id' value='{e(v['user_id'])}'><button class='btn-danger'>{e(label)}</button></form></td></tr>"
+            )
+        return out or '<tr><td colspan=4>موردی نیست</td></tr>'
+
     a_rows = "".join(f"<tr><td>{e(a['user_id'])}</td><td>{e(a['name'])}</td></tr>" for a in admins)
-    body = f"""<h2>VIP و ادمین</h2>
-    <div class='box'><h3>افزودن VIP</h3>
+    body = f"""<h2>VIP و نمایندگان</h2>
+    <div class='box'><h3>ارتقای کاربر</h3>
       <form class='row' method='post' action='/specials/vip_add'>
         <input name='user_id' placeholder='آیدی عددی کاربر'>
         <input name='nickname' placeholder='نام (اختیاری)'>
-        <button>💎 افزودن VIP</button>
+        <select name='role'><option value='vip'>VIP 💎</option><option value='reseller'>نماینده 🤝</option></select>
+        <button>⬆️ ارتقا</button>
       </form>
+      <p class='muted'>نماینده قیمت همکاری می‌گیرد و بر اساس شارژ ۳۰ روز اخیر، تخفیف پله‌ای هم می‌گیرد:
+      از {money(cfg.reseller_t2_min)} تومان → {cfg.reseller_t2_discount}٪ و از {money(cfg.reseller_t3_min)} تومان → {cfg.reseller_t3_discount}٪.</p>
     </div>
-    <h3>لیست VIP‌ها</h3>
-    <table><tr><th>آیدی</th><th>نام</th><th>موجودی</th><th></th></tr>{v_rows or '<tr><td colspan=4>موردی نیست</td></tr>'}</table>
-    <h3>لیست ادمین‌ها (مدیریت از داخل ربات)</h3>
+    <h3>نمایندگان ({len(resellers)})</h3>
+    <table><tr><th>آیدی</th><th>نام</th><th>موجودی</th><th></th></tr>{member_rows(resellers, 'حذف نمایندگی')}</table>
+    <h3>کاربران VIP ({len(vips)})</h3>
+    <table><tr><th>آیدی</th><th>نام</th><th>موجودی</th><th></th></tr>{member_rows(vips, 'حذف VIP')}</table>
+    <h3>ادمین‌ها (مدیریت از داخل ربات)</h3>
     <table><tr><th>آیدی</th><th>نام</th></tr>{a_rows or '<tr><td colspan=2>موردی نیست</td></tr>'}</table>"""
-    return layout("VIP و ادمین", body, "/specials", request)
+    return layout("VIP و نمایندگان", body, "/specials", request)
 
 
 @require_auth
@@ -848,13 +1151,15 @@ async def vip_add(request):
     except (TypeError, ValueError):
         raise _redirect("/specials", err="آیدی نامعتبر")
     nickname = (data.get("nickname") or "").strip() or None
+    role = _valid_role(data.get("role"))
     async with db.db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO users (user_id, nickname, role) VALUES ($1, $2, 'vip') ON CONFLICT (user_id) DO UPDATE SET role='vip', nickname=COALESCE($2, users.nickname)",
-            uid, nickname,
+            """INSERT INTO users (user_id, nickname, role) VALUES ($1, $2, $3)
+               ON CONFLICT (user_id) DO UPDATE SET role=$3, nickname=COALESCE($2, users.nickname)""",
+            uid, nickname, role,
         )
-    logging.info("WEB_VIP_ADD user=%s", uid)
-    raise _redirect("/specials", ok="کاربر VIP شد")
+    logging.info("WEB_ROLE_UPGRADE user=%s role=%s", uid, role)
+    raise _redirect("/specials", ok=f"کاربر به {ROLE_LABELS.get(role, role)} تغییر کرد")
 
 
 @require_auth
@@ -887,6 +1192,13 @@ async def settings_page(request):
     test_days = await db.get_setting("test_days")
     test_panel_id = await db.get_setting("test_panel_id")
     test_inbound_id = await db.get_setting("test_inbound_id")
+    res_bonus = await db.get_setting("reseller_bonus_enabled")
+    res_min = await db.get_setting("reseller_bonus_min")
+    res_percent = await db.get_setting("reseller_bonus_percent")
+    t2_min = await db.get_setting("reseller_t2_min")
+    t2_disc = await db.get_setting("reseller_t2_discount")
+    t3_min = await db.get_setting("reseller_t3_min")
+    t3_disc = await db.get_setting("reseller_t3_discount")
     panels = await db.get_panels()
     opts = "<option value=''>—</option>" + "".join(
         f"<option value='{e(p['id'])}' {_sel(str(test_panel_id or ''), str(p['id']))}>{e(p['id'])} - {e(p['name'])}</option>"
@@ -908,6 +1220,21 @@ async def settings_page(request):
           <option value='off' {_sel(backup_enabled,'off')}>خاموش</option>
         </select></div>
       </div>
+      <h3 style='margin-top:16px'>نمایندگان و آفرها</h3>
+      <div class='grid2'>
+        <div><label>هدیه‌ی اولین شارژ نماینده</label><select name='reseller_bonus_enabled'>
+          <option value='on' {_sel(res_bonus,'on')}>فعال</option>
+          <option value='off' {_sel(res_bonus,'off')}>غیرفعال</option>
+        </select></div>
+        <div><label>حداقل مبلغ شارژ برای هدیه (تومان)</label><input name='reseller_bonus_min' value='{e(res_min)}'></div>
+        <div><label>درصد هدیه</label><input name='reseller_bonus_percent' value='{e(res_percent)}'></div>
+        <div><label>آستانه‌ی سطح ۲ نماینده (شارژ ۳۰ روز)</label><input name='reseller_t2_min' value='{e(t2_min)}'></div>
+        <div><label>درصد تخفیف سطح ۲</label><input name='reseller_t2_discount' value='{e(t2_disc)}'></div>
+        <div><label>آستانه‌ی نماینده VIP</label><input name='reseller_t3_min' value='{e(t3_min)}'></div>
+        <div><label>درصد تخفیف نماینده VIP</label><input name='reseller_t3_discount' value='{e(t3_disc)}'></div>
+      </div>
+      <p class='muted'>مثال: با تنظیمات فعلی، شارژ {money(res_min)} تومانیِ اولِ یک نماینده {money(int(res_min or 0) * int(res_percent or 0) // 100)} تومان اعتبار هدیه می‌گیرد.</p>
+
       <h3 style='margin-top:16px'>اکانت تست رایگان</h3>
       <div class='grid2'>
         <div><label>وضعیت</label><select name='test_enabled'>
@@ -934,10 +1261,17 @@ async def settings_save(request):
     await db.update_setting("sales_status", sales)
     await db.update_setting("card_number", (data.get("card_number") or "").strip())
     await db.update_setting("support_id", (data.get("support_id") or "").strip())
-    for key in ("notify_days", "ref_bonus", "test_gb", "test_days"):
+    numeric_keys = (
+        "notify_days", "ref_bonus", "test_gb", "test_days",
+        "reseller_bonus_min", "reseller_bonus_percent",
+        "reseller_t2_min", "reseller_t2_discount",
+        "reseller_t3_min", "reseller_t3_discount",
+    )
+    for key in numeric_keys:
         raw = (data.get(key) or "").strip()
         if raw.isdigit():
             await db.update_setting(key, raw)
+    await db.update_setting("reseller_bonus_enabled", "on" if data.get("reseller_bonus_enabled") == "on" else "off")
     await db.update_setting("backup_enabled", "on" if data.get("backup_enabled") == "on" else "off")
     await db.update_setting("test_enabled", "on" if data.get("test_enabled") == "on" else "off")
     tp = (data.get("test_panel_id") or "").strip()
@@ -1002,6 +1336,15 @@ def build_app():
         web.get("/plans/edit", plan_edit_form),
         web.post("/plans/save", plan_save),
         web.post("/plans/delete", plan_delete),
+        web.post("/plans/toggle", plan_toggle),
+        web.post("/plans/seed", plans_seed),
+        web.get("/offers", offers_page),
+        web.get("/offers/edit", offer_edit_form),
+        web.post("/offers/save", offer_save),
+        web.post("/offers/toggle", offer_toggle),
+        web.post("/offers/delete", offer_delete),
+        web.post("/offers/builtin", offers_builtin),
+        web.get("/finance", finance_page),
         web.get("/panels", panels_page),
         web.get("/panels/edit", panel_edit_form),
         web.post("/panels/save", panel_save),

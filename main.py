@@ -23,6 +23,8 @@ from db import (
     deduct_balance, credit_balance, add_order, order_belongs_to,
 )
 from links import order_email, email_from_link, client_key, new_client_key
+import pricing
+from pricing import KIND_BUY, KIND_BULK, KIND_RENEW
 from panel import build_xui, sub_link_for, build_vless_link, build_share_link
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
@@ -52,8 +54,8 @@ async def safe_answer(query, text=None, alert=False):
 
 
 def can_buy_bulk(role, admin_status):
-    """خرید عمده فقط برای VIP و ادمین."""
-    return admin_status or role == 'vip'
+    """خرید عمده برای ادمین، VIP و نماینده."""
+    return pricing.can_buy_bulk(role, admin_status)
 
 
 def _plan_icon(plan):
@@ -70,30 +72,39 @@ def plan_button_text(plan, price):
     return f"{_plan_icon(plan)}{plan['name']} | {plan['gb']}GB / {days}روز - {price:,} تومان"
 
 
-async def resolve_plan_price(user_id, plan, role, bulk=False):
-    """قیمت پلن با اولویت: قیمت اختصاصی ← VIP ← عادی."""
-    async with db.db_pool.acquire() as conn:
-        custom = await conn.fetchrow(
-            "SELECT price, bulk_price FROM custom_prices WHERE user_id=$1 AND plan_id=$2",
-            user_id, plan['id'],
-        )
-    # پلن‌های ساخته‌شده قبل از افزودن ستون‌های جدید ممکن است NULL باشند
-    def _num(*candidates):
-        for c in candidates:
-            if c is not None:
-                return int(c)
-        return 0
+def remember_quote(context, plan_id, kind, quote):
+    """قیمتِ نمایش‌داده‌شده را نگه می‌دارد تا در لحظه‌ی تایید همان مبلغ کسر شود."""
+    context.user_data['quote'] = {'plan_id': int(plan_id), 'kind': kind, 'quote': quote}
 
-    if bulk:
-        # خرید عمده فقط برای VIP/ادمین است؛ یک قیمت عمده‌ی واحد (vip_bulk_price) داریم
-        if custom and custom['bulk_price'] is not None:
-            return int(custom['bulk_price'])
-        return _num(plan['vip_bulk_price'], plan['price'])
-    if custom and custom['price'] is not None:
-        return int(custom['price'])
-    if role == 'vip':
-        return _num(plan['vip_price'], plan['price'])
-    return _num(plan['price'])
+
+def recall_quote(context, plan_id, kind):
+    """قیمت ذخیره‌شده‌ی همین پلن؛ اگر نبود None (صدازننده دوباره محاسبه می‌کند)."""
+    saved = context.user_data.get('quote')
+    if saved and saved.get('plan_id') == int(plan_id) and saved.get('kind') == kind:
+        return saved.get('quote')
+    return None
+
+
+def products_header(role, quoted):
+    """سربرگ منوی محصولات: سطح کاربر و اطلاع‌رسانی آفر فعال."""
+    lines = [f"🛍 **محصولات** (سطح شما: {pricing.role_label(role)})"]
+    if any(q.first_offer for _p, q in quoted):
+        lines.append("🔥 آفر خرید اول برای شما فعال است؛ فقط یک‌بار قابل استفاده.")
+    elif any(q.has_discount for _p, q in quoted):
+        lines.append("🎯 قیمت‌های ویژه برای شما اعمال شده است.")
+    lines.append("\nمحصول مورد نظر را انتخاب کنید:")
+    return "\n".join(lines)
+
+
+async def resolve_plan_price(user_id, plan, role, bulk=False):
+    """قیمت نهایی پلن برای این کاربر (سازگار با فراخوانی‌های قدیمی).
+
+    محاسبه به موتور `pricing` سپرده می‌شود تا سطح کاربر، آفر خرید اول، قیمت تمدید و
+    پله‌ی تخفیف نمایندگی همه‌جا یکسان اعمال شوند.
+    """
+    kind = pricing.KIND_BULK if bulk else pricing.KIND_BUY
+    quote = await pricing.quote_for_user(user_id, plan, kind=kind)
+    return quote.price
 
 
 # ================= محدودیت نرخ (ضدِ اسپم) =================
@@ -139,6 +150,9 @@ PLAN_FIELDS = [
     ("icon", "آیکون/ایموجی", "icon", False),
     ("price", "قیمت عادی", "price", True),
     ("vipprice", "قیمت VIP", "vip_price", True),
+    ("resprice", "قیمت همکاری", "reseller_price", True),
+    ("renewprice", "قیمت تمدید", "renew_price", True),
+    ("firstprice", "قیمت آفر خرید اول", "first_price", True),
     ("vipbulk", "قیمت عمده", "vip_bulk_price", True),
     ("inbound", "اینباند", "inbound_id", True),
     ("panel", "پنل", "panel_id", True),
@@ -159,6 +173,8 @@ async def admin_menu_markup(user_id):
         [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
         [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
         [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
+        [InlineKeyboardButton("💰 مدیریت قیمت‌ها", callback_data='admin_pricing'), InlineKeyboardButton("🎯 مدیریت آفرها", callback_data='admin_offers')],
+        [InlineKeyboardButton("📈 گزارش مالی", callback_data='admin_finance'), InlineKeyboardButton("🤝 نمایندگان", callback_data='admin_resellers')],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
         [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')],
     ]
@@ -171,6 +187,135 @@ def plan_edit_markup(plan_id):
     rows = [[InlineKeyboardButton(f"✏️ {label}", callback_data=f"pef_{key}_{plan_id}")] for key, label, _col, _isnum in PLAN_FIELDS]
     rows.append([InlineKeyboardButton("✅ پایان", callback_data="pe_done")])
     return InlineKeyboardMarkup(rows)
+
+
+# ================= مدیریت قیمت‌ها / آفرها / گزارش مالی =================
+async def render_pricing_menu(query):
+    """جدول قیمت همه‌ی پلن‌ها در سه سطح، به‌همراه قیمت تمدید و آفر خرید اول."""
+    plans = await db.list_plans()
+    lines = ["💰 **مدیریت قیمت‌ها**", "", "`ID | حجم/روز | همکاری | VIP | عادی | تمدید | خرید‌اول`"]
+    for p in plans:
+        state = "" if p['is_active'] else " ⛔️"
+        lines.append(
+            f"`{p['id']}` {_plan_icon(p)}{p['gb']}GB/{p['duration_days']}روز{state}\n"
+            f"   🤝 {money(p['reseller_price'])} | 💎 {money(p['vip_price'])} | 👤 {money(p['price'])}"
+            f" | ♻️ {money(p['renew_price'])} | 🔥 {money(p['first_price'])}"
+        )
+    if not plans:
+        lines.append("\nهنوز پلنی تعریف نشده است.")
+    kb = [
+        [InlineKeyboardButton("✏️ ویرایش پلن", callback_data='admin_edit_plan'), InlineKeyboardButton("➕ افزودن پلن", callback_data='admin_add_plan')],
+        [InlineKeyboardButton("🔁 فعال/غیرفعال کردن پلن", callback_data='admin_toggle_plan')],
+        [InlineKeyboardButton("📥 ساخت پلن‌های پیش‌فرض", callback_data='admin_seed_plans')],
+        [InlineKeyboardButton("🎯 مدیریت آفرها", callback_data='admin_offers')],
+    ]
+    await _edit_or_send(query, "\n".join(lines), InlineKeyboardMarkup(kb))
+
+
+async def render_offers_menu(query):
+    """فهرست آفرها با وضعیت، مخاطب، بازه و سقف استفاده."""
+    offers = await db.list_offers()
+    cfg = await pricing.load_config()
+    lines = ["🎯 **مدیریت آفرها**", ""]
+    lines.append(f"🔥 آفر خرید اول: {'🟢 روشن' if cfg.first_offer_enabled else '🔴 خاموش'}")
+    lines.append(f"♻️ قیمت ویژه‌ی تمدید: {'🟢 روشن' if cfg.renew_offer_enabled else '🔴 خاموش'}")
+    lines.append("")
+    if offers:
+        for o in offers:
+            value = f"{o['value']}٪" if (o['kind'] or 'percent') == 'percent' else f"{money(o['value'])} تومان"
+            window = ""
+            if o['starts_at'] or o['ends_at']:
+                window = f"\n   📅 {o['starts_at'].strftime('%Y-%m-%d') if o['starts_at'] else '—'} تا {o['ends_at'].strftime('%Y-%m-%d') if o['ends_at'] else '—'}"
+            limit = "نامحدود" if not o['max_uses'] else f"{o['used_count']}/{o['max_uses']}"
+            lines.append(
+                f"`{o['id']}` {'🟢' if o['is_active'] else '🔴'} **{o['name']}** — {value}\n"
+                f"   👥 {pricing.AUDIENCES.get(o['audience'], o['audience'])} | استفاده: {limit}{window}"
+            )
+    else:
+        lines.append("هنوز آفری ثبت نشده است. آفرهای سفارشی از پنل وب ساخته می‌شوند.")
+    kb = [
+        [InlineKeyboardButton(("🔴 خاموش‌کردن آفر خرید اول" if cfg.first_offer_enabled else "🟢 روشن‌کردن آفر خرید اول"), callback_data='admin_toggle_firstoffer')],
+        [InlineKeyboardButton(("🔴 خاموش‌کردن قیمت تمدید" if cfg.renew_offer_enabled else "🟢 روشن‌کردن قیمت تمدید"), callback_data='admin_toggle_renewoffer')],
+        [InlineKeyboardButton("🔁 فعال/غیرفعال کردن یک آفر", callback_data='admin_toggle_offer')],
+        [InlineKeyboardButton("💰 مدیریت قیمت‌ها", callback_data='admin_pricing')],
+    ]
+    await _edit_or_send(query, "\n".join(lines), InlineKeyboardMarkup(kb))
+
+
+async def render_finance_report(query):
+    """گزارش مالی: تفکیک کاربران، فروش دوره‌ای، سهم هر سطح، آفرها و درآمد خالص."""
+    r = await db.get_financial_report()
+    users = r['users']
+    by_role = r['by_role']
+
+    def role_sales(key):
+        item = by_role.get(key, {'total': 0, 'count': 0})
+        return f"{money(item['total'])} تومان ({item['count']} فروش)"
+
+    msg = (
+        f"📈 **گزارش مالی**\n\n"
+        f"👥 **کاربران**\n"
+        f"عادی: {users.get('normal', 0):,} | VIP: {users.get('vip', 0):,} | نماینده: {users.get('reseller', 0):,}\n\n"
+        f"💵 **فروش**\n"
+        f"امروز: {money(r['today'])} تومان\n"
+        f"۷ روز اخیر: {money(r['week'])} تومان\n"
+        f"۳۰ روز اخیر: {money(r['month'])} تومان\n"
+        f"کل: {money(r['total'])} تومان ({r['sales_count']} فروش)\n\n"
+        f"🏷 **سهم هر سطح**\n"
+        f"عادی: {role_sales('normal')}\n"
+        f"VIP: {role_sales('vip')}\n"
+        f"نماینده: {role_sales('reseller')}\n\n"
+        f"🎁 **آفرها و تخفیف‌ها**\n"
+        f"استفاده از آفر خرید اول: {r['first_offers']:,}\n"
+        f"تعداد تمدیدها: {r['renewals']:,}\n"
+        f"مجموع تخفیف داده‌شده: {money(r['discount'])} تومان\n"
+        f"هدیه‌ی نمایندگی پرداختی: {money(r['bonus'])} تومان\n\n"
+        f"💳 **جریان مالی**\n"
+        f"کل شارژ حساب‌ها: {money(r['topup'])} تومان\n"
+        f"برگشت وجه: {money(r['refunds'])} تومان\n"
+        f"**درآمد خالص: {money(r['net'])} تومان**"
+    )
+    kb = [[InlineKeyboardButton("🔄 بروزرسانی", callback_data='admin_finance')]]
+    await _edit_or_send(query, msg, InlineKeyboardMarkup(kb))
+
+
+async def render_resellers_menu(query):
+    """وضعیت نمایندگان و تنظیمات پله‌های تخفیف و هدیه‌ی اولین شارژ."""
+    cfg = await pricing.load_config()
+    resellers = await db.list_vips(role=pricing.RESELLER)
+    lines = [
+        "🤝 **نمایندگان**", "",
+        f"🎁 هدیه‌ی اولین شارژ: {'🟢 روشن' if cfg.reseller_bonus_enabled else '🔴 خاموش'}",
+        f"   حداقل شارژ {money(cfg.reseller_bonus_min)} تومان → {cfg.reseller_bonus_percent}٪ اعتبار هدیه",
+        "",
+        "📊 **پله‌های تخفیف** (مجموع شارژ ۳۰ روز اخیر)",
+        "   سطح ۱: بدون تخفیف اضافه",
+        f"   سطح ۲: از {money(cfg.reseller_t2_min)} تومان → {cfg.reseller_t2_discount}٪",
+        f"   نماینده VIP: از {money(cfg.reseller_t3_min)} تومان → {cfg.reseller_t3_discount}٪",
+        "",
+        f"👥 **لیست نمایندگان ({len(resellers)})**",
+    ]
+    for r in resellers[:20]:
+        lines.append(f"`{r['user_id']}` - {r['nickname'] or 'بدون نام'} | موجودی: {money(r['balance'])}")
+    if not resellers:
+        lines.append("هنوز نماینده‌ای ثبت نشده است.")
+    kb = [
+        [InlineKeyboardButton("➕ افزودن نماینده", callback_data='admin_add_reseller'), InlineKeyboardButton("➖ حذف نماینده", callback_data='admin_rem_reseller')],
+        [InlineKeyboardButton(("🔴 خاموش‌کردن هدیه" if cfg.reseller_bonus_enabled else "🟢 روشن‌کردن هدیه"), callback_data='admin_toggle_resbonus')],
+        [InlineKeyboardButton("⚙️ تنظیم مقادیر (پنل وب)", callback_data='ignore')],
+    ]
+    await _edit_or_send(query, "\n".join(lines), InlineKeyboardMarkup(kb))
+
+
+async def _edit_or_send(query, text, markup=None):
+    """ویرایش پیام فعلی و در صورت ناموفق‌بودن، ارسال پیام جدید."""
+    try:
+        await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
+    except Exception:
+        try:
+            await query.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
+        except Exception as ex:
+            logging.warning("نمایش صفحه‌ی مدیریت ناموفق بود: %s", ex)
 
 
 # فیلدهای قابل‌ویرایش پنل: (کلید، برچسب، ستون دیتابیس)
@@ -249,11 +394,15 @@ async def plan_edit_text(plan):
         f"📋 نام: {plan['name']}\n"
         f"💾 حجم: {plan['gb']} GB\n"
         f"📅 مدت: {plan['duration_days']} روز\n"
-        f"💰 قیمت عادی: {money(plan['price'])}\n"
+        f"👤 قیمت عادی: {money(plan['price'])}\n"
         f"💎 قیمت VIP: {money(plan['vip_price'])}\n"
+        f"🤝 قیمت همکاری: {money(plan['reseller_price'])}\n"
+        f"♻️ قیمت تمدید: {money(plan['renew_price'])}\n"
+        f"🔥 آفر خرید اول: {money(plan['first_price'])}\n"
         f"📦 قیمت عمده: {money(plan['vip_bulk_price'])}\n"
         f"⚙️ اینباند: {plan['inbound_id']}\n"
-        f"🖥 پنل: {pname}\n\n"
+        f"🖥 پنل: {pname}\n"
+        f"وضعیت: {'🟢 فعال' if plan['is_active'] else '🔴 غیرفعال'}\n\n"
         f"برای تغییر هر مورد، دکمه‌اش را بزنید."
     )
 
@@ -302,9 +451,10 @@ async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_m
 
 async def _run_bulk_creation(context, query, user_id, plan, names, cfg_ip, xui, inbound,
                              order_panel_id, unit_price, total_price, prefix,
-                             nickname, role, admin_status):
+                             nickname, role, admin_status, quote=None):
     """ساخت کانفیگ‌های عمده در پس‌زمینه، با گزارش پیشرفت و برگشت وجهِ موارد ناموفق."""
     success_configs, last_err = [], "نامشخص"
+    base_unit = quote.base_price if quote else unit_price
     try:
         for i, name in enumerate(names, 1):
             link, err = await xui.add_client(
@@ -312,7 +462,17 @@ async def _run_bulk_creation(context, query, user_id, plan, names, cfg_ip, xui, 
             )
             if link:
                 success_configs.append(link)
-                await add_order(user_id, link, order_panel_id, email=name, inbound_id=plan['inbound_id'])
+                order_id = await add_order(
+                    user_id, link, order_panel_id, email=name, inbound_id=plan['inbound_id'],
+                    plan_id=plan['id'], price=unit_price, base_price=base_unit,
+                    discount=max(0, base_unit - unit_price), purchase_kind=KIND_BULK, user_role=role,
+                )
+                await db.record_sale(
+                    user_id=user_id, kind=KIND_BULK, user_role=role,
+                    base_price=base_unit, price=unit_price, discount=max(0, base_unit - unit_price),
+                    plan_id=plan['id'], order_id=order_id,
+                    offer_id=quote.offer_id if quote else None,
+                )
             else:
                 last_err = err
             if len(names) > 10 and i % 10 == 0:
@@ -659,27 +819,31 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             
         elif text == 'محصولات 🛍':
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
-            async with db.db_pool.acquire() as conn:
-                plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
+            plans = await db.list_plans(only_active=True)
             if not plans: return await update.message.reply_text("🛒 هنوز هیچ محصولی اضافه نشده است.")
-            kb = []
-            for p in plans:
-                price = await resolve_plan_price(user_id, p, role, bulk=False)
-                kb.append([InlineKeyboardButton(plan_button_text(p, price), callback_data=f"prebuy_{p['id']}")])
-            await update.message.reply_text("🛍 محصول مورد نظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
+            quoted = await pricing.quote_plans(user_id, plans, KIND_BUY, admin=admin_status)
+            kb = [
+                [InlineKeyboardButton(pricing.button_text(p, q), callback_data=f"prebuy_{p['id']}")]
+                for p, q in quoted
+            ]
+            await update.message.reply_text(
+                products_header(role, quoted), reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
+            )
 
         elif text == 'خرید عمده 📦':
             if not can_buy_bulk(role, admin_status):
-                return await update.message.reply_text("❌ خرید عمده فقط برای کاربران VIP فعال است.")
+                return await update.message.reply_text("❌ خرید عمده فقط برای کاربران VIP و نمایندگان فعال است.")
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
-            async with db.db_pool.acquire() as conn:
-                plans = await conn.fetch("SELECT * FROM plans ORDER BY COALESCE(sort_order, id) ASC, id ASC")
+            plans = await db.list_plans(only_active=True)
             if not plans: return await update.message.reply_text("🛒 هیچ محصولی برای عمده موجود نیست.")
+            quoted = await pricing.quote_plans(user_id, plans, KIND_BULK, admin=admin_status)
             kb = []
-            for p in plans:
-                price = await resolve_plan_price(user_id, p, role, bulk=True)
+            for p, q in quoted:
                 days = p['duration_days'] or 30
-                kb.append([InlineKeyboardButton(f"{_plan_icon(p)}عمده {p['name']} | {p['gb']}GB / {days}روز - دونه‌ای {price:,}T", callback_data=f"bulkbuy_{p['id']}")])
+                kb.append([InlineKeyboardButton(
+                    f"{_plan_icon(p)}عمده {p['name']} | {p['gb']}GB / {days}روز - دونه‌ای {q.price:,}T",
+                    callback_data=f"bulkbuy_{p['id']}",
+                )])
             await update.message.reply_text("📦 لطفاً پلن خرید گروهی را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
         elif text == 'سفارشات من 📦':
@@ -1188,6 +1352,60 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         else: await update.message.reply_text("❌ فرمت اشتباه! مثال: `123456789 علی`")
 
+    elif state == 'admin_waiting_toggle_plan' and admin_status:
+        if text.isdigit():
+            new_state = await db.toggle_plan_active(int(text))
+            context.user_data['state'] = 'none'
+            if new_state is None:
+                await update.message.reply_text("❌ پلنی با این آیدی یافت نشد.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text(
+                    f"{'🟢 پلن فعال شد.' if new_state else '🔴 پلن غیرفعال شد (از منوی فروش حذف می‌شود).'}",
+                    reply_markup=await get_main_keyboard(user_id),
+                )
+        else:
+            await update.message.reply_text("❌ فقط عدد بفرستید.")
+
+    elif state == 'admin_waiting_toggle_offer' and admin_status:
+        if text.isdigit():
+            new_state = await db.toggle_offer_active(int(text))
+            context.user_data['state'] = 'none'
+            if new_state is None:
+                await update.message.reply_text("❌ آفری با این آیدی یافت نشد.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text(
+                    f"{'🟢 آفر فعال شد.' if new_state else '🔴 آفر غیرفعال شد.'}",
+                    reply_markup=await get_main_keyboard(user_id),
+                )
+        else:
+            await update.message.reply_text("❌ فقط عدد بفرستید.")
+
+    elif state == 'admin_waiting_reseller_id' and admin_status:
+        parts = text.split(maxsplit=1)
+        if parts and parts[0].isdigit():
+            uid = int(parts[0])
+            name = parts[1] if len(parts) > 1 else 'بدون نام'
+            async with db.db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO users (user_id, nickname, role) VALUES ($1, $2, 'reseller') ON CONFLICT (user_id) DO UPDATE SET role = 'reseller', nickname = $2",
+                    uid, name,
+                )
+            context.user_data['state'] = 'none'
+            await update.message.reply_text(
+                f"🤝 کاربر {name} نماینده شد.\n📦 دسترسی خرید عمده و قیمت همکاری برایش فعال است.",
+                reply_markup=await get_main_keyboard(user_id),
+            )
+        else:
+            await update.message.reply_text("❌ فرمت اشتباه! مثال: `123456789 علی`")
+
+    elif state == 'admin_waiting_rem_reseller' and admin_status:
+        if text.isdigit():
+            await db.set_user_role(int(text), pricing.NORMAL)
+            context.user_data['state'] = 'none'
+            await update.message.reply_text(f"🔻 کاربر {text} به سطح عادی برگشت.", reply_markup=await get_main_keyboard(user_id))
+        else:
+            await update.message.reply_text("❌ فقط عدد بفرستید.")
+
     elif state == 'admin_waiting_rem_vip' and admin_status:
         if text.isdigit():
             async with db.db_pool.acquire() as conn: await conn.execute("UPDATE users SET role = 'normal' WHERE user_id = $1", int(text))
@@ -1259,16 +1477,20 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif state.startswith('waiting_for_nick_'):
         plan_id = int(state.split('_')[-1])
         if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) < 20:
-            async with db.db_pool.acquire() as conn:
-                plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
+            plan = await db.get_plan(plan_id)
             if not plan: return
+            if not plan['is_active']:
+                context.user_data['state'] = 'none'
+                return await update.message.reply_text("⛔️ این پلن در حال حاضر غیرفعال است.", reply_markup=await get_main_keyboard(user_id))
 
-            price = await resolve_plan_price(user_id, plan, role, bulk=False)
-            days = plan['duration_days'] or 30
+            quote = await pricing.quote_for_user(user_id, plan, KIND_BUY, admin=admin_status)
             final_name = f"{user_id}_{text}"
-            kb = [[InlineKeyboardButton("✅ تایید نهایی و پرداخت", callback_data=f"confirm_buy_{plan_id}_{final_name}")]]
+            # قیمت لحظه‌ی نمایش نگه داشته می‌شود تا مبلغ تاییدشده همان چیزی باشد که کسر می‌شود
+            remember_quote(context, plan_id, KIND_BUY, quote)
+            body, _spec = pricing.quote_lines(plan, quote)
+            kb = [[InlineKeyboardButton(f"✅ تایید و پرداخت {quote.price:,} تومان", callback_data=f"confirm_buy_{plan_id}_{final_name}")]]
             await update.message.reply_text(
-                f"اسم: `{final_name}`\nپلن: {plan['name']} ({plan['gb']}GB / {days}روز)\nقیمت: {price:,} تومان\nتایید خرید؟",
+                f"🏷 نام سرویس: `{final_name}`\n\n{body}\n\n💳 موجودی شما: {balance:,} تومان",
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
             )
             context.user_data['state'] = 'none'
@@ -1566,6 +1788,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🗑 آیدی (ID) پلنی که می‌خواهید حذف شود را بفرستید:", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
+    # ---------- مدیریت قیمت‌ها ----------
+    elif data == 'admin_pricing' and admin_status:
+        await render_pricing_menu(query)
+
+    elif data == 'admin_toggle_plan' and admin_status:
+        context.user_data['state'] = 'admin_waiting_toggle_plan'
+        await query.message.reply_text("🔁 آیدی پلنی که می‌خواهید فعال/غیرفعال شود را بفرستید:", reply_markup=CANCEL_MARKUP)
+
+    elif data == 'admin_seed_plans' and admin_status:
+        created = await db.seed_default_plans()
+        await safe_answer(query, f"✅ {created} پلن پیش‌فرض اضافه شد." if created else "همه‌ی پلن‌های پیش‌فرض از قبل وجود دارند.", alert=True)
+        await render_pricing_menu(query)
+
+    # ---------- مدیریت آفرها ----------
+    elif data == 'admin_offers' and admin_status:
+        await render_offers_menu(query)
+
+    elif data == 'admin_toggle_firstoffer' and admin_status:
+        cur = (await get_setting('first_offer_enabled')) == 'on'
+        await update_setting('first_offer_enabled', 'off' if cur else 'on')
+        await render_offers_menu(query)
+
+    elif data == 'admin_toggle_renewoffer' and admin_status:
+        cur = (await get_setting('renew_offer_enabled')) == 'on'
+        await update_setting('renew_offer_enabled', 'off' if cur else 'on')
+        await render_offers_menu(query)
+
+    elif data == 'admin_toggle_offer' and admin_status:
+        context.user_data['state'] = 'admin_waiting_toggle_offer'
+        await query.message.reply_text("🔁 آیدی آفری که می‌خواهید فعال/غیرفعال شود را بفرستید:", reply_markup=CANCEL_MARKUP)
+
+    # ---------- گزارش مالی و نمایندگان ----------
+    elif data == 'admin_finance' and admin_status:
+        await render_finance_report(query)
+
+    elif data == 'admin_resellers' and admin_status:
+        await render_resellers_menu(query)
+
+    elif data == 'admin_add_reseller' and admin_status:
+        context.user_data['state'] = 'admin_waiting_reseller_id'
+        await query.message.reply_text("🤝 آیدی عددی و نام نماینده را با فاصله بفرستید:\n\nمثال: `123456789 علی`", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_rem_reseller' and admin_status:
+        context.user_data['state'] = 'admin_waiting_rem_reseller'
+        await query.message.reply_text("آیدی نماینده‌ای که به کاربر عادی تبدیل می‌شود را بفرستید:", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_toggle_resbonus' and admin_status:
+        cur = (await get_setting('reseller_bonus_enabled')) == 'on'
+        await update_setting('reseller_bonus_enabled', 'off' if cur else 'on')
+        await render_resellers_menu(query)
+
     elif data == 'admin_add_vip' and admin_status:
         context.user_data['state'] = 'admin_waiting_vip_id'
         await query.message.reply_text("🔢 برای افزودن VIP، آیدی عددی و یک نام دلخواه را با فاصله بفرستید:\n\nمثال: `123456789 علی`", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
@@ -1646,16 +1921,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await ensure_order_access(query, order_id, admin_status): return
         # فقط پلن‌های همان پنلِ سفارش؛ وگرنه پول پلنِ یک سرور کسر و حجم روی سرور دیگری اعمال می‌شد
         order_panel_id = await db.get_order_panel_id(order_id)
-        plans = await db.list_plans(panel_id=order_panel_id)
+        plans = await db.list_plans(panel_id=order_panel_id, only_active=True)
         if not plans:
             return await safe_answer(query, "برای این سرور پلنی جهت تمدید تعریف نشده است!", alert=True)
-        kb = []
-        for p in plans:
-            price = await resolve_plan_price(user_id, p, role, bulk=False)
-            kb.append([InlineKeyboardButton(plan_button_text(p, price), callback_data=f"confirm_renew_{order_id}_{p['id']}")])
+        quoted = await pricing.quote_plans(user_id, plans, KIND_RENEW, admin=admin_status)
+        kb = [
+            [InlineKeyboardButton(pricing.button_text(p, q), callback_data=f"confirm_renew_{order_id}_{p['id']}")]
+            for p, q in quoted
+        ]
         kb.append([InlineKeyboardButton("🔙 انصراف", callback_data=f'show_order_{order_id}')])
+        special = any(q.has_discount for _p, q in quoted)
         await query.edit_message_text(
-            "🔄 **بخش تمدید سرویس**\nبا تمدید، حجم و زمان سرویس مطابق پلن انتخابی **ریست** می‌شود.\nلطفاً پلن را انتخاب کنید:",
+            "♻️ **تمدید سرویس**\n"
+            + ("💚 قیمت ویژه‌ی تمدید برای شما اعمال شده است.\n" if special else "")
+            + "با تمدید، حجم و زمان سرویس مطابق پلن انتخابی **ریست** می‌شود.\nلطفاً پلن را انتخاب کنید:",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
         )
 
@@ -1664,21 +1943,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = parts[2]
         if not await ensure_order_access(query, order_id, admin_status): return
         plan_id = int(parts[3])
-        async with db.db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
+        plan = await db.get_plan(plan_id)
         if not plan: return
-        price = await resolve_plan_price(user_id, plan, role, bulk=False)
+        quote = await pricing.quote_for_user(user_id, plan, KIND_RENEW, admin=admin_status)
+        remember_quote(context, plan_id, KIND_RENEW, quote)
         days = plan['duration_days'] or 30
 
-        if balance < price:
+        if balance < quote.price:
             kb = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f'renew_menu_{order_id}')]]
-            return await query.edit_message_text(f"❌ **موجودی حساب شما کافی نیست.**\nموجودی: {balance:,} | نیاز: {price:,}", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+            return await query.edit_message_text(
+                f"❌ **موجودی حساب شما کافی نیست.**\nموجودی: {balance:,} | نیاز: {quote.price:,}",
+                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
+            )
 
+        price_lines = (
+            f"💰 قیمت اصلی: {quote.base_price:,} تومان\n✅ قیمت تمدید: **{quote.price:,}** تومان\n"
+            f"🎁 سود شما: {quote.discount:,} تومان"
+            if quote.has_discount else f"💳 مبلغ کسر: **{quote.price:,} تومان**"
+        )
         kb = [[InlineKeyboardButton("✅ تایید و اعمال تمدید", callback_data=f'execute_renew_{order_id}_{plan_id}')], [InlineKeyboardButton("❌ انصراف", callback_data=f'renew_menu_{order_id}')]]
         await query.edit_message_text(
+            f"{quote.label + chr(10) if quote.label else ''}"
             f"آیا از اعمال پلن **{plan['name']}** روی این سرویس اطمینان دارید؟\n"
             f"💾 حجم جدید: **{plan['gb']} GB** (ریست کامل)\n"
             f"📅 مدت جدید: **{days} روز** از همین الان\n"
-            f"💳 مبلغ کسر: **{price:,} تومان**",
+            f"{price_lines}",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
         )
 
@@ -1687,9 +1976,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = parts[2]
         if not await ensure_order_access(query, order_id, admin_status): return
         plan_id = int(parts[3])
-        async with db.db_pool.acquire() as conn: plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
+        plan = await db.get_plan(plan_id)
         if not plan: return await safe_answer(query, "❌ پلن یافت نشد!", alert=True)
-        price = await resolve_plan_price(user_id, plan, role, bulk=False)
+        # قیمتِ همان صفحه‌ی تایید ملاک است تا تغییر قیمت در این فاصله به کاربر تحمیل نشود
+        quote = recall_quote(context, plan_id, KIND_RENEW) or await pricing.quote_for_user(user_id, plan, KIND_RENEW, admin=admin_status)
+        price = quote.price
 
         if context.user_data.get('processing'):
             return await safe_answer(query, "⏳ یک عملیات در حال انجام است، صبر کنید.", alert=True)
@@ -1730,6 +2021,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await xui.reset_client_traffic(inbound_id, email)
                 await db.reset_notify(order_id)
                 await db.update_order_service(order_id, inbound_id=inbound_id)
+                # ثبت فروش و مصرف آفر فقط بعد از موفقیت واقعی روی پنل
+                await pricing.commit_quote(user_id, quote, KIND_RENEW, plan_id, order_id=int(order_id), role=role)
+                context.user_data.pop('quote', None)
+                logging.info("RENEW user=%s plan=%s price=%s base=%s", user_id, plan_id, quote.price, quote.base_price)
                 await render_order_details(query, order_id, f"✅ تمدید شد: {plan['gb']}GB / {duration_days} روز")
             else:
                 await credit_balance(user_id, price, kind='برگشت وجه')
@@ -1770,16 +2065,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_id = int(parts[2])
         final_name = "_".join(parts[3:])
 
-        async with db.db_pool.acquire() as conn:
-            plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", plan_id)
+        plan = await db.get_plan(plan_id)
 
         if not plan: return await query.edit_message_text("❌ پلن یافت نشد.")
+        if not plan['is_active']:
+            return await query.edit_message_text("⛔️ این پلن در حال حاضر غیرفعال است.")
 
         # منویی که قبل از بستن فروش باز مانده نباید همچنان خرید انجام دهد
         if await get_setting('sales_status') == 'closed':
             return await query.edit_message_text("⛔️ فروش در حال حاضر بسته است.")
 
-        price = await resolve_plan_price(user_id, plan, role, bulk=False)
+        # همان قیمتی که در صفحه‌ی تایید نشان داده شد ملاک است
+        quote = recall_quote(context, plan_id, KIND_BUY) or await pricing.quote_for_user(user_id, plan, KIND_BUY, admin=admin_status)
+        price = quote.price
 
         if context.user_data.get('processing'):
             return await safe_answer(query, "⏳ یک عملیات در حال انجام است، صبر کنید.", alert=True)
@@ -1812,8 +2110,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             config_link, error_msg = await xui.add_client(plan['inbound_id'], final_name, plan['gb'], (plan['duration_days'] or 30), cfg_ip, inbound=inbound)
             if config_link:
-                await add_order(user_id, config_link, order_panel_id, email=final_name, inbound_id=plan['inbound_id'])
-                logging.info("PURCHASE user=%s plan=%s price=%s name=%s", user_id, plan_id, price, final_name)
+                # قیمت روی خود سفارش ثبت می‌شود تا تغییر قیمت‌های بعدی این سفارش را عوض نکند
+                order_id = await add_order(
+                    user_id, config_link, order_panel_id, email=final_name, inbound_id=plan['inbound_id'],
+                    plan_id=plan_id, price=quote.price, base_price=quote.base_price,
+                    discount=quote.discount, purchase_kind=KIND_BUY, user_role=role,
+                )
+                await pricing.commit_quote(user_id, quote, KIND_BUY, plan_id, order_id=order_id, role=role)
+                context.user_data.pop('quote', None)
+                logging.info("PURCHASE user=%s plan=%s price=%s base=%s offer=%s name=%s",
+                             user_id, plan_id, quote.price, quote.base_price, quote.label or '-', final_name)
 
                 # اگر پنل لینک ساب داشته باشد، آن را لینک اصلی قرار می‌دهیم
                 sub = sub_link_for(panel, final_name)
@@ -1821,6 +2127,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption = f"✅ خرید موفق!\n\n`{primary}`"
                 if sub:
                     caption += f"\n\nکانفیگ مستقیم:\n`{config_link}`"
+                if quote.has_discount:
+                    caption += f"\n\n🎁 تخفیف اعمال‌شده: {quote.discount:,} تومان"
                 caption += SECURITY_WARNING
                 encoded_url = urllib.parse.quote(primary)
                 qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
@@ -1856,14 +2164,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await query.edit_message_text("❌ اطلاعات خرید عمده ناقص است. دوباره از منو شروع کنید.")
         count = end_n - start_n + 1
 
-        async with db.db_pool.acquire() as conn:
-            plan = await conn.fetchrow("SELECT * FROM plans WHERE id = $1", int(plan_id))
+        plan = await db.get_plan(plan_id)
         if not plan:
             return await query.edit_message_text("❌ پلن یافت نشد.")
+        if not plan['is_active']:
+            return await query.edit_message_text("⛔️ این پلن در حال حاضر غیرفعال است.")
         if await get_setting('sales_status') == 'closed':
             return await query.edit_message_text("⛔️ فروش در حال حاضر بسته است.")
 
-        unit_price = await resolve_plan_price(user_id, plan, role, bulk=True)
+        quote = await pricing.quote_for_user(user_id, plan, KIND_BULK, admin=admin_status)
+        unit_price = quote.price
         total_price = unit_price * count
 
         if context.user_data.get('processing'):
@@ -1903,7 +2213,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context=context, query=query, user_id=user_id, plan=plan, names=names,
                 cfg_ip=cfg_ip, xui=xui, inbound=inbound, order_panel_id=order_panel_id,
                 unit_price=unit_price, total_price=total_price, prefix=prefix,
-                nickname=nickname, role=role, admin_status=admin_status,
+                nickname=nickname, role=role, admin_status=admin_status, quote=quote,
             ))
             keep_processing = True
         finally:
@@ -2004,8 +2314,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await conn.execute("UPDATE receipts SET status = 'approved' WHERE id = $1", receipt_id)
         await credit_balance(uid, amt)
         logging.info("CHARGE_APPROVED admin=%s user=%s amount=%s receipt=%s", user_id, uid, amt, receipt_id)
-        await query.edit_message_caption(caption="✅ تایید شد.")
-        try: await context.bot.send_message(chat_id=uid, text=f"🎉 حساب شما {amt:,} شارژ شد.")
+        # هدیه‌ی اولین شارژ نماینده (فقط یک‌بار، بالای حداقل مبلغِ تعیین‌شده)
+        bonus, percent = await pricing.reseller_bonus_on_topup(uid, amt)
+        if bonus > 0:
+            await credit_balance(uid, bonus, kind='هدیه نمایندگی', description=f'اولین شارژ نمایندگی ({percent}٪)')
+            logging.info("RESELLER_BONUS user=%s amount=%s bonus=%s", uid, amt, bonus)
+        await query.edit_message_caption(caption="✅ تایید شد." + (f" (+{bonus:,} هدیه)" if bonus else ""))
+        try:
+            msg = f"🎉 حساب شما {amt:,} شارژ شد."
+            if bonus > 0:
+                msg += f"\n🎁 هدیه‌ی اولین شارژ نمایندگی: {bonus:,} تومان ({percent}٪)\n💰 مجموع اعتبار افزوده‌شده: {amt + bonus:,} تومان"
+            await context.bot.send_message(chat_id=uid, text=msg)
         except Exception as ex:
             logging.warning("اطلاع شارژ به کاربر %s ناموفق بود: %s", uid, ex)
         # پاداش معرف بعد از اولین شارژِ تاییدشده
