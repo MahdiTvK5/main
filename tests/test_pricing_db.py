@@ -76,10 +76,15 @@ class TestMigrations:
                 assert {'plan_id', 'price', 'base_price', 'discount', 'purchase_kind', 'user_role'} <= cols
                 cols = {r['column_name'] for r in await conn.fetch(
                     "SELECT column_name FROM information_schema.columns WHERE table_name = 'users'")}
-                assert {'first_offer_used', 'reseller_bonus_used'} <= cols
+                assert {'first_offer_used', 'reseller_bonus_used', 'referred_by', 'ref_rewarded'} <= cols
+                cols = {r['column_name'] for r in await conn.fetch(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = 'gift_codes'")}
+                assert {'expires_at', 'is_active', 'note', 'audience', 'created_at'} <= cols
                 tables = {r['table_name'] for r in await conn.fetch(
                     "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")}
-                assert {'offers', 'offer_redemptions', 'sales'} <= tables
+                assert {'offers', 'offer_redemptions', 'sales', 'gift_codes', 'gift_redemptions'} <= tables
+                settings = {r['key'] for r in await conn.fetch("SELECT key FROM settings")}
+                assert {'ref_enabled', 'ref_bonus', 'ref_invitee_bonus', 'ref_min_topup'} <= settings
         run(scenario())
 
     def test_default_plans_match_the_approved_table(self):
@@ -258,6 +263,7 @@ class TestFinancialReport:
             assert r['by_role']['vip']['total'] == 165_000
             assert r['refunds'] == 50_000
             assert r['net'] == r['total'] - 50_000
+            assert r['gifts'] == 0 and r['referrals'] == 0
         run(scenario())
 
 
@@ -274,15 +280,73 @@ class TestExistingFeaturesStillWork:
             assert await db.deduct_balance(901, 10_000_000) is None      # موجودی ناکافی
 
             await db.add_gift_code('WELCOME', 25_000, 1)
-            ok, _msg = await db.redeem_gift_code(901, 'WELCOME')
+            ok, _msg = await db.redeem_gift_code(901, 'welcome')   # بدون حساسیت به حروف
             assert ok and await db.get_balance(901) == 175_000
             ok, _msg = await db.redeem_gift_code(901, 'WELCOME')
             assert not ok                                                 # فقط یک‌بار
 
             await db.set_referrer(902, 901)
             await db.update_setting('ref_bonus', 30_000)
-            assert await db.try_reward_referrer(902) == (901, 30_000)
-            assert await db.try_reward_referrer(902) is None              # فقط یک‌بار
+            await db.update_setting('ref_invitee_bonus', 10_000)
+            reward = await db.try_reward_referrer(902, 80_000)
+            assert reward is not None
+            assert (reward.referrer_id, reward.referrer_bonus, reward.invitee_bonus) == (901, 30_000, 10_000)
+            assert await db.get_balance(901) == 205_000
+            assert await db.get_balance(902) == 10_000
+            assert await db.try_reward_referrer(902, 80_000) is None       # فقط یک‌بار
+        run(scenario())
+
+    def test_gift_expiry_audience_and_toggle(self):
+        async def scenario():
+            import datetime as dt
+            await fresh_db()
+            past = dt.datetime.now() - dt.timedelta(days=1)
+            await db.add_gift_code('OLD', 5_000, 1, expires_at=past)
+            ok, msg = await db.redeem_gift_code(910, 'OLD')
+            assert not ok and 'مهلت' in msg
+
+            await db.add_gift_code('NEWONLY', 8_000, 2, audience='new')
+            # کاربر با سفارش، مخاطب «جدید» نیست
+            pid = await db.add_panel('p', 'https://p.example', 'u', 'p', '1.2.3.4', '')
+            await db.add_order(911, 'vless://x@1.2.3.4:443#911_x', pid, email='911_x')
+            ok, msg = await db.redeem_gift_code(911, 'NEWONLY')
+            assert not ok and 'جدید' in msg
+            ok, _msg = await db.redeem_gift_code(912, 'NEWONLY')
+            assert ok
+
+            await db.add_gift_code('PAUSED', 3_000, 1)
+            assert await db.toggle_gift_code_active('PAUSED') is False
+            ok, msg = await db.redeem_gift_code(913, 'PAUSED')
+            assert not ok and 'غیرفعال' in msg
+        run(scenario())
+
+    def test_referral_min_topup_and_disabled_do_not_consume(self):
+        async def scenario():
+            await fresh_db()
+            await db.get_user(920)
+            await db.get_user(921)
+            assert await db.set_referrer(921, 920) is True
+            assert await db.set_referrer(921, 920) is False          # تکراری
+            assert await db.set_referrer(920, 920) is False          # خودمعرف
+            assert await db.set_referrer(922, 999999) is False       # معرف ناموجود
+
+            await db.update_setting('ref_bonus', 15_000)
+            await db.update_setting('ref_min_topup', 50_000)
+            assert await db.try_reward_referrer(921, 10_000) is None  # کمتر از حداقل
+            reward = await db.try_reward_referrer(921, 50_000)
+            assert reward is not None and reward.referrer_bonus == 15_000
+            assert await db.get_balance(920) == 15_000
+
+            await db.get_user(930)
+            await db.get_user(931)
+            await db.set_referrer(931, 930)
+            await db.update_setting('ref_enabled', 'off')
+            await db.update_setting('ref_bonus', 20_000)
+            await db.update_setting('ref_min_topup', 0)
+            assert await db.try_reward_referrer(931, 80_000) is None  # خاموش؛ پرچم نمی‌خورد
+            await db.update_setting('ref_enabled', 'on')
+            reward = await db.try_reward_referrer(931, 80_000)
+            assert reward is not None and reward.referrer_id == 930
         run(scenario())
 
     def test_orders_and_panels_untouched(self):

@@ -25,6 +25,7 @@ from db import (
 from links import order_email, email_from_link, client_key, new_client_key
 import pricing
 from pricing import KIND_BUY, KIND_BULK, KIND_RENEW
+import rewards
 from panel import build_xui, sub_link_for, build_vless_link, build_share_link
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
@@ -172,7 +173,7 @@ async def admin_menu_markup(user_id):
         [InlineKeyboardButton("ایمپورت کانفیگ 🔗", callback_data='admin_import_config'), InlineKeyboardButton("پشتیبانی 📞", callback_data='admin_set_support')],
         [InlineKeyboardButton("مدیریت پنل‌ها 🖥", callback_data='admin_manage_panels'), InlineKeyboardButton("اکانت تست 🎁", callback_data='admin_test_menu')],
         [InlineKeyboardButton("📊 گزارش فروش", callback_data='admin_report'), InlineKeyboardButton("🔔 هشدار انقضا", callback_data='admin_set_notify')],
-        [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🎁 پاداش دعوت", callback_data='admin_set_refbonus')],
+        [InlineKeyboardButton("🎟 کدهای هدیه", callback_data='admin_gift_menu'), InlineKeyboardButton("🔗 سیستم دعوت", callback_data='admin_ref_menu')],
         [InlineKeyboardButton("💰 مدیریت قیمت‌ها", callback_data='admin_pricing'), InlineKeyboardButton("🎯 مدیریت آفرها", callback_data='admin_offers')],
         [InlineKeyboardButton("📈 گزارش مالی", callback_data='admin_finance'), InlineKeyboardButton("🤝 نمایندگان", callback_data='admin_resellers')],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
@@ -269,7 +270,9 @@ async def render_finance_report(query):
         f"استفاده از آفر خرید اول: {r['first_offers']:,}\n"
         f"تعداد تمدیدها: {r['renewals']:,}\n"
         f"مجموع تخفیف داده‌شده: {money(r['discount'])} تومان\n"
-        f"هدیه‌ی نمایندگی پرداختی: {money(r['bonus'])} تومان\n\n"
+        f"هدیه‌ی نمایندگی پرداختی: {money(r['bonus'])} تومان\n"
+        f"کدهای هدیه: {money(r.get('gifts', 0))} تومان\n"
+        f"پاداش دعوت: {money(r.get('referrals', 0))} تومان\n\n"
         f"💳 **جریان مالی**\n"
         f"کل شارژ حساب‌ها: {money(r['topup'])} تومان\n"
         f"برگشت وجه: {money(r['refunds'])} تومان\n"
@@ -303,6 +306,63 @@ async def render_resellers_menu(query):
         [InlineKeyboardButton("➕ افزودن نماینده", callback_data='admin_add_reseller'), InlineKeyboardButton("➖ حذف نماینده", callback_data='admin_rem_reseller')],
         [InlineKeyboardButton(("🔴 خاموش‌کردن هدیه" if cfg.reseller_bonus_enabled else "🟢 روشن‌کردن هدیه"), callback_data='admin_toggle_resbonus')],
         [InlineKeyboardButton("⚙️ تنظیم مقادیر (پنل وب)", callback_data='ignore')],
+    ]
+    await _edit_or_send(query, "\n".join(lines), InlineKeyboardMarkup(kb))
+
+
+async def render_referral_menu(query):
+    """وضعیت سیستم دعوت و دکمه‌های تنظیم پاداش معرف / دعوت‌شده / حداقل شارژ."""
+    cfg = await db.load_referral_config()
+    stats = await db.get_referral_stats()
+    lines = [
+        "🔗 **سیستم دعوت**", "",
+        f"وضعیت: {'🟢 روشن' if cfg.enabled else '🔴 خاموش'}",
+        f"🎁 پاداش معرف: {money(cfg.referrer_bonus)} تومان",
+        f"🎁 هدیه دعوت‌شده: {money(cfg.invitee_bonus)} تومان",
+        f"💳 حداقل شارژ برای آزاد شدن پاداش: {money(cfg.min_topup)} تومان" if cfg.min_topup else "💳 حداقل شارژ: بدون حداقل",
+        "",
+        f"👥 دعوت‌شده‌ها: {stats['invited']:,} | پاداش‌گرفته: {stats['rewarded']:,} | در انتظار: {stats['pending']:,}",
+        f"💸 مجموع پرداخت‌شده: {money(stats['paid'])} تومان",
+        "",
+        "پاداش فقط بعد از اولین شارژِ تاییدشده‌ی دعوت‌شده پرداخت می‌شود و روی هم سوار نمی‌شود.",
+    ]
+    kb = [
+        [InlineKeyboardButton(("🔴 خاموش کن" if cfg.enabled else "🟢 روشن کن"), callback_data='admin_ref_toggle')],
+        [InlineKeyboardButton("🎁 پاداش معرف", callback_data='admin_set_refbonus'), InlineKeyboardButton("🎁 هدیه دعوت‌شده", callback_data='admin_set_invitee_bonus')],
+        [InlineKeyboardButton("💳 حداقل شارژ", callback_data='admin_set_ref_min')],
+    ]
+    await _edit_or_send(query, "\n".join(lines), InlineKeyboardMarkup(kb))
+
+
+def _gift_line(c):
+    """یک خط خلاصه برای فهرست کدهای هدیه در ربات."""
+    used = f"{c['used_count']}/{c['max_uses']}"
+    flag = "🟢" if c['is_active'] is not False else "⏸"
+    extra = ""
+    expires = c['expires_at']
+    if expires:
+        extra = f" | تا {expires.strftime('%Y-%m-%d')}"
+        now = datetime.datetime.now()
+        if getattr(expires, 'tzinfo', None) and expires.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=expires.tzinfo)
+        if now > expires:
+            flag = "⏰"
+    note = f" — {c['note']}" if c['note'] else ""
+    return f"{flag} `{c['code']}` | {c['amount']:,} تومان | {used}{extra}{note}"
+
+
+async def render_gift_menu(query):
+    codes = await db.list_gift_codes()
+    lines = ["🎟 **کدهای هدیه**", ""]
+    if codes:
+        lines.extend(_gift_line(c) for c in codes[:25])
+        if len(codes) > 25:
+            lines.append(f"\n… و {len(codes) - 25} کد دیگر (در پنل وب ببینید)")
+    else:
+        lines.append("هیچ کدی ثبت نشده است.")
+    kb = [
+        [InlineKeyboardButton("➕ افزودن کد", callback_data='admin_gift_add'), InlineKeyboardButton("🎲 کد تصادفی", callback_data='admin_gift_random')],
+        [InlineKeyboardButton("⏸ فعال/غیرفعال", callback_data='admin_gift_toggle'), InlineKeyboardButton("🗑 حذف کد", callback_data='admin_gift_del')],
     ]
     await _edit_or_send(query, "\n".join(lines), InlineKeyboardMarkup(kb))
 
@@ -685,14 +745,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     is_new = await db.is_new_user(user_id)
     await get_user(user_id)
-    # پردازش لینک دعوت: /start ref_<referrer_id>
-    if is_new and context.args:
+    extra = []
+    if context.args:
         arg = context.args[0]
         if arg.startswith("ref_") and arg[4:].isdigit():
-            referrer_id = int(arg[4:])
-            await db.set_referrer(user_id, referrer_id)
+            if is_new:
+                await db.set_referrer(user_id, int(arg[4:]))
+        elif arg.lower().startswith("gift_"):
+            _ok, msg = await db.redeem_gift_code(user_id, arg[5:])
+            extra.append(msg)
     context.user_data['state'] = 'none'
     await update.message.reply_text("به ربات OverWallVpn خوش آمدید.", reply_markup=await get_main_keyboard(user_id))
+    for msg in extra:
+        await update.message.reply_text(msg, reply_markup=await get_main_keyboard(user_id))
 
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
@@ -1237,14 +1302,23 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if 'new_gift' not in context.user_data: context.user_data['new_gift'] = {}
         g = context.user_data['new_gift']
         if step == 'code':
-            g['code'] = text.strip()
+            raw = text.strip()
+            if not raw:
+                g['code'] = rewards.generate_gift_code()
+            else:
+                code = rewards.normalize_gift_code(raw)
+                if not rewards.is_valid_gift_code(code):
+                    return await update.message.reply_text("❌ کد باید ۳ تا ۳۲ حرف انگلیسی یا عدد باشد. خالی بگذارید تا تصادفی ساخته شود.")
+                g['code'] = code
             context.user_data['state'] = 'gift_add_amount'
-            await update.message.reply_text("💰 مبلغ هدیه (تومان) را بفرستید:", reply_markup=CANCEL_MARKUP)
+            await update.message.reply_text(f"💰 مبلغ هدیه (تومان) را بفرستید:\nکد: `{g['code']}`", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
         elif step == 'amount':
             try:
                 g['amount'] = clean_num(text)
             except ValueError:
                 return await update.message.reply_text("❌ فقط عدد بفرستید.")
+            if g['amount'] <= 0:
+                return await update.message.reply_text("❌ مبلغ باید بزرگ‌تر از صفر باشد.")
             context.user_data['state'] = 'gift_add_uses'
             await update.message.reply_text("🔢 حداکثر تعداد دفعات قابل‌استفاده را بفرستید:", reply_markup=CANCEL_MARKUP)
         elif step == 'uses':
@@ -1252,15 +1326,27 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 max_uses = max(1, clean_num(text))
             except ValueError:
                 return await update.message.reply_text("❌ فقط عدد بفرستید.")
-            await db.add_gift_code(g['code'], g['amount'], max_uses)
+            saved = await db.add_gift_code(g['code'], g['amount'], max_uses)
             context.user_data['state'] = 'none'
-            await update.message.reply_text(f"✅ کد هدیه `{g['code']}` ساخته شد.", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
+            if not saved:
+                await update.message.reply_text("❌ ساخت کد ناموفق بود.", reply_markup=await get_main_keyboard(user_id))
+            else:
+                await update.message.reply_text(f"✅ کد هدیه `{saved}` ساخته شد.", reply_markup=await get_main_keyboard(user_id), parse_mode='Markdown')
         return
 
     if state == 'admin_waiting_del_gift' and admin_status:
-        await db.delete_gift_code(text.strip())
+        deleted = await db.delete_gift_code(text.strip())
         context.user_data['state'] = 'none'
-        await update.message.reply_text("✅ کد حذف شد (در صورت وجود).", reply_markup=await get_main_keyboard(user_id))
+        await update.message.reply_text("✅ کد حذف شد." if deleted else "❌ کدی با این متن پیدا نشد.", reply_markup=await get_main_keyboard(user_id))
+        return
+
+    if state == 'admin_waiting_toggle_gift' and admin_status:
+        state_flag = await db.toggle_gift_code_active(text.strip())
+        context.user_data['state'] = 'none'
+        if state_flag is None:
+            await update.message.reply_text("❌ کدی با این متن پیدا نشد.", reply_markup=await get_main_keyboard(user_id))
+        else:
+            await update.message.reply_text("🟢 کد فعال شد." if state_flag else "⏸ کد غیرفعال شد.", reply_markup=await get_main_keyboard(user_id))
         return
 
     if state == 'admin_waiting_refbonus' and admin_status:
@@ -1269,7 +1355,25 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         except ValueError:
             return await update.message.reply_text("❌ فقط عدد بفرستید.")
         context.user_data['state'] = 'none'
-        await update.message.reply_text("✅ پاداش دعوت تنظیم شد.", reply_markup=await get_main_keyboard(user_id))
+        await update.message.reply_text("✅ پاداش معرف تنظیم شد.", reply_markup=await get_main_keyboard(user_id))
+        return
+
+    if state == 'admin_waiting_invitee_bonus' and admin_status:
+        try:
+            await update_setting('ref_invitee_bonus', clean_num(text))
+        except ValueError:
+            return await update.message.reply_text("❌ فقط عدد بفرستید.")
+        context.user_data['state'] = 'none'
+        await update.message.reply_text("✅ هدیه دعوت‌شده تنظیم شد.", reply_markup=await get_main_keyboard(user_id))
+        return
+
+    if state == 'admin_waiting_ref_min' and admin_status:
+        try:
+            await update_setting('ref_min_topup', clean_num(text))
+        except ValueError:
+            return await update.message.reply_text("❌ فقط عدد بفرستید.")
+        context.user_data['state'] = 'none'
+        await update.message.reply_text("✅ حداقل شارژ دعوت تنظیم شد.", reply_markup=await get_main_keyboard(user_id))
         return
 
     if state == 'admin_waiting_notify' and admin_status:
@@ -1654,14 +1758,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'wallet_referral':
         count = await db.referral_count(user_id)
-        bonus = await get_setting('ref_bonus')
+        rewarded = await db.referral_rewarded_count(user_id)
+        cfg = await db.load_referral_config()
         username = context.bot.username
         link = f"https://t.me/{username}?start=ref_{user_id}" if username else f"کد دعوت شما: ref_{user_id}"
+        if not cfg.enabled or not cfg.has_payout:
+            rules = "در حال حاضر پاداش دعوت توسط مدیریت غیرفعال است؛ لینک دعوت همچنان ثبت می‌شود."
+        else:
+            rules = f"بعد از اولین شارژِ تاییدشده‌ی دوستتان {money(cfg.referrer_bonus)} تومان به حساب شما اضافه می‌شود."
+            if cfg.invitee_bonus:
+                rules += f"\nدوستتان هم {money(cfg.invitee_bonus)} تومان هدیه ورود می‌گیرد."
+            if cfg.min_topup:
+                rules += f"\nحداقل مبلغ شارژ برای آزاد شدن پاداش: {money(cfg.min_topup)} تومان."
         msg = (
             f"🔗 **دعوت دوستان**\n\n"
-            f"با ارسال لینک زیر برای دوستانتان، بعد از اولین شارژِ آن‌ها {int(bonus or 0):,} تومان هدیه می‌گیرید:\n\n"
+            f"{rules}\n\n"
             f"`{link}`\n\n"
             f"👥 تعداد دعوت‌های شما: {count}"
+            + (f" (پاداش‌گرفته: {rewarded})" if count else "")
         )
         try:
             await query.edit_message_text(msg, parse_mode='Markdown')
@@ -1715,20 +1829,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_backup_to(context, user_id)
 
     elif data == 'admin_gift_menu' and admin_status:
-        codes = await db.list_gift_codes()
-        msg = "🎟 **کدهای هدیه:**\n\n"
-        if codes:
-            for c in codes:
-                msg += f"`{c['code']}` | {c['amount']:,} تومان | استفاده: {c['used_count']}/{c['max_uses']}\n"
-        else:
-            msg += "هیچ کدی ثبت نشده است.\n"
-        kb = [[InlineKeyboardButton("➕ افزودن کد", callback_data='admin_gift_add'), InlineKeyboardButton("🗑 حذف کد", callback_data='admin_gift_del')]]
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await render_gift_menu(query)
 
     elif data == 'admin_gift_add' and admin_status:
         context.user_data['new_gift'] = {}
         context.user_data['state'] = 'gift_add_code'
-        await query.message.reply_text("🎟 متن کد هدیه را وارد کنید (انگلیسی/عدد):", reply_markup=CANCEL_MARKUP)
+        await query.message.reply_text("🎟 متن کد هدیه را وارد کنید (انگلیسی/عدد).\nخالی بفرستید تا کد تصادفی ساخته شود:", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_gift_random' and admin_status:
+        context.user_data['new_gift'] = {'code': rewards.generate_gift_code()}
+        context.user_data['state'] = 'gift_add_amount'
+        await query.message.reply_text(
+            f"🎲 کد ساخته شد: `{context.user_data['new_gift']['code']}`\n💰 مبلغ هدیه (تومان) را بفرستید:",
+            reply_markup=CANCEL_MARKUP, parse_mode='Markdown',
+        )
         await query.delete_message()
 
     elif data == 'admin_gift_del' and admin_status:
@@ -1736,10 +1851,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("کدی که می‌خواهید حذف شود را بفرستید:", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
+    elif data == 'admin_gift_toggle' and admin_status:
+        context.user_data['state'] = 'admin_waiting_toggle_gift'
+        await query.message.reply_text("کدی که می‌خواهید فعال/غیرفعال شود را بفرستید:", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_ref_menu' and admin_status:
+        await render_referral_menu(query)
+
+    elif data == 'admin_ref_toggle' and admin_status:
+        cfg = await db.load_referral_config()
+        await update_setting('ref_enabled', 'off' if cfg.enabled else 'on')
+        await render_referral_menu(query)
+
     elif data == 'admin_set_refbonus' and admin_status:
         context.user_data['state'] = 'admin_waiting_refbonus'
         cur = await get_setting('ref_bonus')
-        await query.message.reply_text(f"🎁 مبلغ پاداش دعوت (تومان) را بفرستید:\nمقدار فعلی: {int(cur or 0):,}", reply_markup=CANCEL_MARKUP)
+        await query.message.reply_text(f"🎁 مبلغ پاداش معرف (تومان) را بفرستید:\nمقدار فعلی: {int(cur or 0):,}", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_set_invitee_bonus' and admin_status:
+        context.user_data['state'] = 'admin_waiting_invitee_bonus'
+        cur = await get_setting('ref_invitee_bonus')
+        await query.message.reply_text(f"🎁 مبلغ هدیه دعوت‌شده (تومان) را بفرستید:\nمقدار فعلی: {int(cur or 0):,}", reply_markup=CANCEL_MARKUP)
+        await query.delete_message()
+
+    elif data == 'admin_set_ref_min' and admin_status:
+        context.user_data['state'] = 'admin_waiting_ref_min'
+        cur = await get_setting('ref_min_topup')
+        await query.message.reply_text(f"💳 حداقل مبلغ شارژ برای آزاد شدن پاداش دعوت (تومان):\nمقدار فعلی: {int(cur or 0):,}\nصفر یعنی بدون حداقل.", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
     elif data == 'admin_set_notify' and admin_status:
@@ -2327,13 +2467,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=msg)
         except Exception as ex:
             logging.warning("اطلاع شارژ به کاربر %s ناموفق بود: %s", uid, ex)
-        # پاداش معرف بعد از اولین شارژِ تاییدشده
-        reward = await db.try_reward_referrer(uid)
-        if reward:
-            referrer_id, bonus = reward
-            try: await context.bot.send_message(chat_id=referrer_id, text=f"🎁 یکی از دعوت‌شدگان شما شارژ کرد! {bonus:,} تومان پاداش به حساب شما اضافه شد.")
+        # پاداش معرف بعد از اولین شارژِ تاییدشده‌ی واجد شرایط
+        reward = await db.try_reward_referrer(uid, amt)
+        if reward and reward.invitee_bonus:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"🎁 هدیه ورود با دعوت: {reward.invitee_bonus:,} تومان به حساب شما اضافه شد.",
+                )
             except Exception as ex:
-                logging.warning("اطلاع پاداش دعوت به %s ناموفق بود: %s", referrer_id, ex)
+                logging.warning("اطلاع هدیه دعوت به کاربر %s ناموفق بود: %s", uid, ex)
+        if reward and reward.referrer_bonus:
+            try:
+                await context.bot.send_message(
+                    chat_id=reward.referrer_id,
+                    text=f"🎁 یکی از دعوت‌شدگان شما شارژ کرد! {reward.referrer_bonus:,} تومان پاداش به حساب شما اضافه شد.",
+                )
+            except Exception as ex:
+                logging.warning("اطلاع پاداش دعوت به %s ناموفق بود: %s", reward.referrer_id, ex)
 
     elif data.startswith("reject_") and admin_status:
         parts = data.split("_")
