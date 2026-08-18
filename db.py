@@ -8,6 +8,7 @@ from config import (
     PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP,
 )
 from links import email_from_link
+import rewards
 
 # استخر اتصال دیتابیس؛ در init_db مقداردهی می‌شود و سایر ماژول‌ها با db.db_pool به آن دسترسی دارند.
 db_pool = None
@@ -104,6 +105,9 @@ async def init_db():
         # ===== سطح‌بندی قیمت، آفرها و فروش (فاز ۲۴) =====
         await _init_pricing(conn)
 
+        # ===== دعوت و کد هدیه (فاز ۲۵) =====
+        await _init_rewards(conn)
+
         # ===== ایندکس‌ها =====
         # این کوئری‌ها در هر «سفارشات من»، هر گزارش و هر هشدار انقضا اجرا می‌شوند.
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
@@ -139,6 +143,12 @@ PRICING_SETTINGS = {
     'reseller_t2_discount': '5',      # درصد تخفیف اضافه‌ی سطح ۲
     'reseller_t3_min': '3000000',     # آستانه‌ی سطح VIP نماینده
     'reseller_t3_discount': '8',      # درصد تخفیف اضافه‌ی سطح VIP نماینده
+}
+
+REFERRAL_SETTINGS = {
+    'ref_enabled': 'on',              # سیستم دعوت
+    'ref_invitee_bonus': '0',         # هدیه به دعوت‌شده هنگام اولین شارژ واجد شرایط
+    'ref_min_topup': '0',             # حداقل مبلغ شارژ برای آزاد شدن پاداش (۰ = بدون حداقل)
 }
 
 
@@ -221,6 +231,24 @@ async def _init_pricing(conn):
         panel_id = await conn.fetchval("SELECT id FROM panels ORDER BY id ASC LIMIT 1")
         await _insert_default_plans(conn, panel_id)
         logging.info("پلن‌های پیش‌فرض قیمت‌گذاری ساخته شدند (%s مورد).", len(DEFAULT_PLANS))
+
+
+async def _init_rewards(conn):
+    """مهاجرت‌های سیستم دعوت و کد هدیه؛ افزایشی و idempotent."""
+    await conn.execute("ALTER TABLE gift_codes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+    await conn.execute("ALTER TABLE gift_codes ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE")
+    await conn.execute("ALTER TABLE gift_codes ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''")
+    await conn.execute("ALTER TABLE gift_codes ADD COLUMN IF NOT EXISTS audience TEXT DEFAULT 'all'")
+    await conn.execute("ALTER TABLE gift_codes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+    await conn.execute("UPDATE gift_codes SET is_active = TRUE WHERE is_active IS NULL")
+    await conn.execute("UPDATE gift_codes SET audience = 'all' WHERE audience IS NULL OR audience = ''")
+    await conn.execute("UPDATE gift_codes SET created_at = NOW() WHERE created_at IS NULL")
+    await conn.execute("ALTER TABLE gift_redemptions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+    await conn.execute("ALTER TABLE gift_redemptions ADD COLUMN IF NOT EXISTS amount BIGINT")
+    await conn.execute("UPDATE gift_redemptions SET created_at = NOW() WHERE created_at IS NULL")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_gift_redemptions_user ON gift_redemptions(user_id)")
+    for key, value in REFERRAL_SETTINGS.items():
+        await conn.execute("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING", key, value)
 
 
 async def _insert_default_plans(conn, panel_id, inbound_id=1):
@@ -817,11 +845,19 @@ async def get_financial_report():
         refunds = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'برگشت وجه'")
         topup = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'شارژ حساب'")
         bonus = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'هدیه نمایندگی'")
+        gifts = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'کد هدیه'")
+        referrals = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind IN ('پاداش دعوت', 'هدیه دعوت')"
+        )
 
     users_by_role = {r['role']: int(r['n']) for r in roles}
     sales_by_role = {r['role']: {'total': int(r['total']), 'count': int(r['n'])} for r in by_role}
     total = int(periods['total'])
     discount = int(periods['discount'])
+    gifts = int(gifts or 0)
+    referrals = int(referrals or 0)
+    bonus = int(bonus or 0)
+    refunds = int(refunds or 0)
     return {
         'users': users_by_role,
         'today': int(periods['today']),
@@ -833,11 +869,13 @@ async def get_financial_report():
         'first_offers': int(periods['first_offers']),
         'sales_count': int(periods['sales_count']),
         'by_role': sales_by_role,
-        'refunds': int(refunds or 0),
+        'refunds': refunds,
         'topup': int(topup or 0),
-        'bonus': int(bonus or 0),
-        # درآمد خالص: فروش ثبت‌شده منهای برگشت وجه و هدایای اعتباری
-        'net': total - int(refunds or 0) - int(bonus or 0),
+        'bonus': bonus,
+        'gifts': gifts,
+        'referrals': referrals,
+        # درآمد خالص: فروش ثبت‌شده منهای برگشت وجه و اعتبارهای هدیه‌ای
+        'net': total - refunds - bonus - gifts - referrals,
     }
 
 
@@ -905,13 +943,36 @@ async def is_new_user(user_id):
         return await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user_id) is None
 
 
-async def set_referrer(user_id, referrer_id):
-    """معرف را فقط در صورتی ثبت می‌کند که قبلاً ثبت نشده باشد و خودِ کاربر نباشد."""
-    if referrer_id == user_id:
-        return
+async def load_referral_config():
+    keys = ('ref_enabled', 'ref_bonus', 'ref_invitee_bonus', 'ref_min_topup')
     async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM settings WHERE key = ANY($1::text[])", list(keys))
+    return rewards.parse_referral_config({r['key']: r['value'] for r in rows})
+
+
+async def set_referrer(user_id, referrer_id):
+    """معرف را فقط اگر وجود داشته باشد، خودش نباشد و قبلاً ثبت نشده باشد ذخیره می‌کند.
+    خروجی True یعنی ثبت شد."""
+    try:
+        referrer_id = int(referrer_id)
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    if referrer_id == user_id:
+        return False
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", referrer_id)
+        if not exists:
+            return False
         await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-        await conn.execute("UPDATE users SET referred_by = $1 WHERE user_id = $2 AND referred_by IS NULL", referrer_id, user_id)
+        status = await conn.execute(
+            "UPDATE users SET referred_by = $1 WHERE user_id = $2 AND referred_by IS NULL",
+            referrer_id, user_id,
+        )
+    try:
+        return int(status.split()[-1]) == 1
+    except (ValueError, IndexError, AttributeError):
+        return False
 
 
 async def referral_count(user_id):
@@ -919,64 +980,257 @@ async def referral_count(user_id):
         return int(await conn.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", user_id) or 0)
 
 
-async def try_reward_referrer(user_id):
-    """هنگام اولین شارژِ تاییدشده‌ی کاربر، یک‌بار به معرف پاداش می‌دهد.
-    خروجی: (referrer_id, bonus) یا None."""
+async def referral_rewarded_count(user_id):
     async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow("SELECT referred_by, ref_rewarded FROM users WHERE user_id = $1 FOR UPDATE", user_id)
-            if not row or not row['referred_by'] or row['ref_rewarded']:
-                return None
-            try:
-                bonus = int(await conn.fetchval("SELECT value FROM settings WHERE key = 'ref_bonus'") or 0)
-            except (TypeError, ValueError):
-                bonus = 0
-            referrer = row['referred_by']
-            await conn.execute("UPDATE users SET ref_rewarded = TRUE WHERE user_id = $1", user_id)
-            if bonus <= 0:
-                return None
-            await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", referrer)
-            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", bonus, referrer)
-            await conn.execute("INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)", referrer, bonus, 'پاداش دعوت', f'دعوت کاربر {user_id}')
-            return referrer, bonus
+        return int(await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referred_by = $1 AND COALESCE(ref_rewarded, FALSE)",
+            user_id,
+        ) or 0)
 
 
-# ================= کدهای هدیه =================
-async def add_gift_code(code, amount, max_uses):
+async def get_referral_stats():
+    """آمار کلی دعوت برای پنل وب و منوی ادمین."""
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO gift_codes (code, amount, max_uses) VALUES ($1, $2, $3) ON CONFLICT (code) DO UPDATE SET amount = $2, max_uses = $3",
-            code, amount, max_uses,
+        row = await conn.fetchrow(
+            """SELECT
+                 COUNT(*) FILTER (WHERE referred_by IS NOT NULL) AS invited,
+                 COUNT(*) FILTER (WHERE COALESCE(ref_rewarded, FALSE)) AS rewarded,
+                 COUNT(*) FILTER (WHERE referred_by IS NOT NULL AND NOT COALESCE(ref_rewarded, FALSE)) AS pending
+               FROM users"""
+        )
+        paid = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind IN ('پاداش دعوت', 'هدیه دعوت')"
+        )
+    return {
+        'invited': int(row['invited'] or 0),
+        'rewarded': int(row['rewarded'] or 0),
+        'pending': int(row['pending'] or 0),
+        'paid': int(paid or 0),
+    }
+
+
+async def list_referrals(search=None, limit=50, offset=0):
+    async with db_pool.acquire() as conn:
+        if search:
+            like = f"%{search}%"
+            return await conn.fetch(
+                """SELECT u.user_id, u.nickname, u.referred_by, u.ref_rewarded, u.balance,
+                          r.nickname AS referrer_nick
+                   FROM users u
+                   LEFT JOIN users r ON r.user_id = u.referred_by
+                   WHERE u.referred_by IS NOT NULL
+                     AND (CAST(u.user_id AS TEXT) LIKE $1
+                          OR CAST(u.referred_by AS TEXT) LIKE $1
+                          OR u.nickname ILIKE $1)
+                   ORDER BY u.user_id DESC LIMIT $2 OFFSET $3""",
+                like, limit, offset,
+            )
+        return await conn.fetch(
+            """SELECT u.user_id, u.nickname, u.referred_by, u.ref_rewarded, u.balance,
+                      r.nickname AS referrer_nick
+               FROM users u
+               LEFT JOIN users r ON r.user_id = u.referred_by
+               WHERE u.referred_by IS NOT NULL
+               ORDER BY u.user_id DESC LIMIT $1 OFFSET $2""",
+            limit, offset,
         )
 
 
-async def delete_gift_code(code):
+async def count_referrals(search=None):
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM gift_codes WHERE code = $1", code)
+        if search:
+            like = f"%{search}%"
+            return int(await conn.fetchval(
+                """SELECT COUNT(*) FROM users u
+                   WHERE u.referred_by IS NOT NULL
+                     AND (CAST(u.user_id AS TEXT) LIKE $1
+                          OR CAST(u.referred_by AS TEXT) LIKE $1
+                          OR u.nickname ILIKE $1)""",
+                like,
+            ) or 0)
+        return int(await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL"
+        ) or 0)
+
+
+async def try_reward_referrer(user_id, charge_amount=0):
+    """هنگام اولین شارژِ واجد شرایط، یک‌بار به معرف (و در صورت تنظیم به دعوت‌شده) پاداش می‌دهد.
+
+    اگر سیستم خاموش باشد یا مبلغ به حداقل نرسیده باشد پرچم بالا نمی‌رود.
+    خروجی: `rewards.ReferralReward` یا None.
+    """
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT referred_by, ref_rewarded FROM users WHERE user_id = $1 FOR UPDATE",
+                user_id,
+            )
+            if not row:
+                return None
+            setting_rows = await conn.fetch(
+                "SELECT key, value FROM settings WHERE key = ANY($1::text[])",
+                ['ref_enabled', 'ref_bonus', 'ref_invitee_bonus', 'ref_min_topup'],
+            )
+            cfg = rewards.parse_referral_config({r['key']: r['value'] for r in setting_rows})
+            if not rewards.referral_should_pay(
+                cfg,
+                referred_by=row['referred_by'],
+                already_rewarded=bool(row['ref_rewarded']),
+                charge_amount=charge_amount,
+            ):
+                return None
+            referrer = row['referred_by']
+            await conn.execute("UPDATE users SET ref_rewarded = TRUE WHERE user_id = $1", user_id)
+            if cfg.referrer_bonus > 0:
+                await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", referrer)
+                await conn.execute(
+                    "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+                    cfg.referrer_bonus, referrer,
+                )
+                await conn.execute(
+                    "INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)",
+                    referrer, cfg.referrer_bonus, 'پاداش دعوت', f'دعوت کاربر {user_id}',
+                )
+            if cfg.invitee_bonus > 0:
+                await conn.execute(
+                    "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+                    cfg.invitee_bonus, user_id,
+                )
+                await conn.execute(
+                    "INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)",
+                    user_id, cfg.invitee_bonus, 'هدیه دعوت', f'ورود با دعوت {referrer}',
+                )
+            return rewards.ReferralReward(referrer, cfg.referrer_bonus, cfg.invitee_bonus)
+
+
+# ================= کدهای هدیه =================
+def _gift_select_cols():
+    return ("code, amount, max_uses, used_count, expires_at, is_active, note, audience, created_at")
+
+
+async def _find_gift_code(conn, code):
+    """ردیف کد را با تطبیق بدون حساسیت به حروف پیدا می‌کند."""
+    normalized = rewards.normalize_gift_code(code)
+    if not normalized:
+        return None
+    return await conn.fetchrow(
+        f"SELECT {_gift_select_cols()} FROM gift_codes WHERE UPPER(code) = $1",
+        normalized,
+    )
+
+
+async def add_gift_code(code, amount, max_uses, expires_at=None, is_active=True, note='', audience='all'):
+    """ساخت یا به‌روزرسانی کد هدیه. خروجی کد نرمال‌شده، یا None اگر نامعتبر باشد."""
+    normalized = rewards.normalize_gift_code(code) or rewards.generate_gift_code()
+    if not rewards.is_valid_gift_code(normalized):
+        return None
+    amount = int(amount)
+    max_uses = max(1, int(max_uses or 1))
+    audience = audience if audience in rewards.GIFT_AUDIENCES else 'all'
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchval("SELECT code FROM gift_codes WHERE UPPER(code) = $1", normalized)
+        key = existing or normalized
+        await conn.execute(
+            """INSERT INTO gift_codes (code, amount, max_uses, expires_at, is_active, note, audience)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (code) DO UPDATE SET
+                 amount = $2, max_uses = $3, expires_at = $4, is_active = $5, note = $6, audience = $7""",
+            key, amount, max_uses, expires_at, bool(is_active), note or '', audience,
+        )
+    return key
+
+
+async def delete_gift_code(code):
+    normalized = rewards.normalize_gift_code(code)
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("SELECT code FROM gift_codes WHERE UPPER(code) = $1", normalized)
+            if not row:
+                return False
+            await conn.execute("DELETE FROM gift_redemptions WHERE code = $1", row['code'])
+            await conn.execute("DELETE FROM gift_codes WHERE code = $1", row['code'])
+            return True
 
 
 async def list_gift_codes():
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT code, amount, max_uses, used_count FROM gift_codes ORDER BY code")
+        return await conn.fetch(
+            f"SELECT {_gift_select_cols()} FROM gift_codes ORDER BY created_at DESC NULLS LAST, code"
+        )
+
+
+async def get_gift_code(code):
+    async with db_pool.acquire() as conn:
+        return await _find_gift_code(conn, code)
+
+
+async def toggle_gift_code_active(code):
+    normalized = rewards.normalize_gift_code(code)
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            """UPDATE gift_codes SET is_active = NOT COALESCE(is_active, FALSE)
+               WHERE UPPER(code) = $1 RETURNING is_active""",
+            normalized,
+        )
+
+
+async def list_gift_redemptions(code):
+    normalized = rewards.normalize_gift_code(code)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT code FROM gift_codes WHERE UPPER(code) = $1", normalized)
+        if not row:
+            return []
+        return await conn.fetch(
+            """SELECT r.user_id, r.amount, r.created_at, u.nickname
+               FROM gift_redemptions r
+               LEFT JOIN users u ON u.user_id = r.user_id
+               WHERE r.code = $1
+               ORDER BY r.created_at DESC NULLS LAST""",
+            row['code'],
+        )
 
 
 async def redeem_gift_code(user_id, code):
     """اعمال اتمیک کد هدیه. خروجی: (ok, message)."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            gc = await conn.fetchrow("SELECT amount, max_uses, used_count FROM gift_codes WHERE code = $1 FOR UPDATE", code)
+            gc = await _find_gift_code(conn, code)
             if not gc:
                 return False, "❌ کد نامعتبر است."
-            if gc['used_count'] >= gc['max_uses']:
-                return False, "❌ ظرفیت این کد تکمیل شده است."
-            already = await conn.fetchval("SELECT 1 FROM gift_redemptions WHERE code = $1 AND user_id = $2", code, user_id)
-            if already:
-                return False, "❌ شما قبلاً این کد را استفاده کرده‌اید."
-            await conn.execute("INSERT INTO gift_redemptions (code, user_id) VALUES ($1, $2)", code, user_id)
-            await conn.execute("UPDATE gift_codes SET used_count = used_count + 1 WHERE code = $1", code)
+            # قفل ردیف برای جلوگیری از استفاده هم‌زمان بیش از سقف
+            gc = await conn.fetchrow(
+                f"SELECT {_gift_select_cols()} FROM gift_codes WHERE code = $1 FOR UPDATE",
+                gc['code'],
+            )
+            order_count = int(await conn.fetchval(
+                "SELECT COUNT(*) FROM orders WHERE user_id = $1", user_id,
+            ) or 0)
+            already = await conn.fetchval(
+                "SELECT 1 FROM gift_redemptions WHERE code = $1 AND user_id = $2",
+                gc['code'], user_id,
+            )
+            reason = rewards.gift_reject_reason(
+                dict(gc), order_count=order_count, already_used=bool(already),
+            )
+            if reason:
+                return False, reason
+            await conn.execute(
+                "INSERT INTO gift_redemptions (code, user_id, amount) VALUES ($1, $2, $3)",
+                gc['code'], user_id, gc['amount'],
+            )
+            await conn.execute(
+                "UPDATE gift_codes SET used_count = used_count + 1 WHERE code = $1",
+                gc['code'],
+            )
             await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", gc['amount'], user_id)
-            await conn.execute("INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)", user_id, gc['amount'], 'کد هدیه', code)
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+                gc['amount'], user_id,
+            )
+            await conn.execute(
+                "INSERT INTO transactions (user_id, amount, kind, description) VALUES ($1, $2, $3, $4)",
+                user_id, gc['amount'], 'کد هدیه', gc['code'],
+            )
             return True, f"✅ کد اعمال شد. {gc['amount']:,} تومان به حساب شما اضافه شد."
 
 

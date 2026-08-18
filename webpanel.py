@@ -17,6 +17,7 @@ from aiohttp import web
 
 import db
 import pricing
+import rewards
 from links import order_email
 from config import (
     WEB_ADMIN_PASSWORD, WEB_PORT, WEB_HOST, WEB_SESSION_TTL,
@@ -180,6 +181,7 @@ NAV = [
     ("/offers", "🎯 آفرها"),
     ("/panels", "🖥 پنل‌ها"),
     ("/giftcodes", "🎟 کدهای هدیه"),
+    ("/referrals", "🔗 دعوت‌ها"),
     ("/broadcast", "📢 پیام همگانی"),
     ("/specials", "💎 VIP و نمایندگان"),
     ("/settings", "⚙️ تنظیمات"),
@@ -308,6 +310,8 @@ async def dashboard(request):
       <a href='/finance'><button class='btn-ghost'>📈 گزارش مالی</button></a>
       <a href='/plans'><button class='btn-ghost'>💰 مدیریت قیمت‌ها</button></a>
       <a href='/offers'><button class='btn-ghost'>🎯 آفرها</button></a>
+      <a href='/giftcodes'><button class='btn-ghost'>🎟 کدهای هدیه</button></a>
+      <a href='/referrals'><button class='btn-ghost'>🔗 دعوت‌ها</button></a>
       <a href='/users'><button class='btn-ghost'>👥 کاربران</button></a>
       <a href='/broadcast'><button class='btn-ghost'>📢 پیام همگانی</button></a>
       <a href='/backup'><button class='btn-ghost'>💾 دانلود بکاپ</button></a>
@@ -414,7 +418,9 @@ async def user_view(request):
         <p>اکانت تست گرفته: {'بله' if u['got_test'] else 'خیر'}</p>
         <p>آفر خرید اول: <b>{e(first_offer)}</b> | تعداد سفارش‌ها: {len(orders)}</p>
         {reseller_box}
-        <p>دعوت‌کننده: {e(u['referred_by'] or '—')} | تعداد دعوت‌های او: {ref_count}</p>
+        <p>دعوت‌کننده: {('<a href="/users/view?id=' + e(u['referred_by']) + '">' + e(u['referred_by']) + '</a>') if u['referred_by'] else '—'}
+           {(' | پاداش دعوت: ' + ('پرداخت شده' if u['ref_rewarded'] else 'در انتظار')) if u['referred_by'] else ''}
+           | تعداد دعوت‌های او: {ref_count}</p>
         <div class='row' style='margin-top:10px'>
           <form class='inline' method='post' action='/users/adjust'>
             <input type='hidden' name='user_id' value='{e(uid)}'>
@@ -911,6 +917,8 @@ async def finance_page(request):
         card("💰", "فروش کل", money(r['total'])),
         card("🎁", "مجموع تخفیف داده‌شده", money(r['discount'])),
         card("🤝", "هدیه‌ی نمایندگی", money(r['bonus'])),
+        card("🎟", "کدهای هدیه", money(r.get('gifts', 0))),
+        card("🔗", "پاداش دعوت", money(r.get('referrals', 0))),
         card("↩️", "برگشت وجه", money(r['refunds'])),
         card("🏦", "درآمد خالص", money(r['net'])),
     ])
@@ -927,8 +935,10 @@ async def finance_page(request):
         <tr><td>تعداد تمدیدها</td><td>{r['renewals']:,}</td></tr>
         <tr><td>تعداد کل فروش‌ها</td><td>{r['sales_count']:,}</td></tr>
         <tr><td>کل شارژ حساب‌ها</td><td>{money(r['topup'])} تومان</td></tr>
+        <tr><td>کدهای هدیه پرداخت‌شده</td><td>{money(r.get('gifts', 0))} تومان</td></tr>
+        <tr><td>پاداش دعوت پرداخت‌شده</td><td>{money(r.get('referrals', 0))} تومان</td></tr>
       </table>
-      <p class='muted'>درآمد خالص = مجموع فروش‌های ثبت‌شده منهای برگشت وجه و اعتبار هدیه‌ی نمایندگی.
+      <p class='muted'>درآمد خالص = مجموع فروش‌های ثبت‌شده منهای برگشت وجه، اعتبار هدیه‌ی نمایندگی، کدهای هدیه و پاداش دعوت.
       فروش‌ها از لحظه‌ی نصب این نسخه ثبت می‌شوند؛ سفارش‌های قدیمی‌تر مبلغ ثبت‌شده ندارند.</p>
     </div>"""
     return layout("گزارش مالی", body, "/finance", request)
@@ -1013,24 +1023,66 @@ async def panel_delete(request):
 
 
 # ================= کدهای هدیه =================
+def _gift_status_badge(c, now=None):
+    now = now or datetime.datetime.now()
+    if c['is_active'] is False:
+        return "<span class='badge off'>غیرفعال</span>"
+    expires = c['expires_at']
+    if expires:
+        cmp_now = now
+        if getattr(expires, 'tzinfo', None) and expires.tzinfo is not None and cmp_now.tzinfo is None:
+            cmp_now = cmp_now.replace(tzinfo=expires.tzinfo)
+        if cmp_now > expires:
+            return "<span class='badge off'>منقضی</span>"
+    if c['max_uses'] and c['used_count'] >= c['max_uses']:
+        return "<span class='badge off'>تکمیل</span>"
+    return "<span class='badge on'>فعال</span>"
+
+
 @require_auth
 async def giftcodes_page(request):
     codes = await db.list_gift_codes()
+    now = datetime.datetime.now()
+    aud_opts = "".join(
+        f"<option value='{k}'>{e(label)}</option>" for k, label in rewards.GIFT_AUDIENCES.items()
+    )
     rows = ""
     for c in codes:
+        expires = c['expires_at'].strftime('%Y-%m-%d %H:%M') if c['expires_at'] else '—'
+        audience = rewards.GIFT_AUDIENCES.get(c['audience'] or 'all', c['audience'] or 'همه')
         rows += (
-            f"<tr><td>{e(c['code'])}</td><td>{c['amount']:,}</td><td>{e(c['used_count'])}/{e(c['max_uses'])}</td>"
-            f"<td><form class='inline' method='post' action='/giftcodes/delete' onsubmit=\"return confirm('حذف کد؟')\">"
-            f"<input type='hidden' name='code' value='{e(c['code'])}'><button class='btn-danger'>🗑</button></form></td></tr>"
+            f"<tr><td><a href='/giftcodes/view?code={quote(c['code'])}'><b>{e(c['code'])}</b></a></td>"
+            f"<td>{money(c['amount'])}</td><td>{e(c['used_count'])}/{e(c['max_uses'])}</td>"
+            f"<td>{e(audience)}</td><td>{e(expires)}</td><td>{_gift_status_badge(c, now)}</td>"
+            f"<td>{e(c['note'] or '—')}</td>"
+            f"<td class='actions'>"
+            f"<form class='inline' method='post' action='/giftcodes/toggle'>"
+            f"<input type='hidden' name='code' value='{e(c['code'])}'>"
+            f"<button class='btn-ghost'>{'⏸' if c['is_active'] else '▶️'}</button></form>"
+            f"<form class='inline' method='post' action='/giftcodes/delete' onsubmit=\"return confirm('حذف کد؟')\">"
+            f"<input type='hidden' name='code' value='{e(c['code'])}'><button class='btn-danger'>🗑</button></form>"
+            f"</td></tr>"
         )
     body = f"""<h2>کدهای هدیه</h2>
-    <div class='box'><form class='row' method='post' action='/giftcodes/add'>
-      <input name='code' placeholder='کد'>
-      <input name='amount' placeholder='مبلغ (تومان)'>
-      <input name='max_uses' placeholder='حداکثر دفعات' value='1'>
-      <button>➕ افزودن</button>
-    </form></div>
-    <table><tr><th>کد</th><th>مبلغ</th><th>استفاده</th><th></th></tr>{rows}</table>"""
+    <p class='muted'>کد را می‌توان از کیف پول ربات یا با لینک <code>/start gift_CODE</code> وارد کرد.
+    هر کاربر هر کد را فقط یک‌بار می‌تواند استفاده کند. تخفیف‌ها روی هم سوار نمی‌شوند.</p>
+    <div class='box'><h3>افزودن یا به‌روزرسانی کد</h3>
+      <form method='post' action='/giftcodes/add'>
+        <div class='grid2'>
+          <div><label>کد (خالی = تصادفی)</label><input name='code' placeholder='مثلاً NOWROZ1405'></div>
+          <div><label>مبلغ (تومان)</label><input name='amount' placeholder='50000'></div>
+          <div><label>حداکثر دفعات</label><input name='max_uses' value='1'></div>
+          <div><label>مخاطب</label><select name='audience'>{aud_opts}</select></div>
+          <div><label>تاریخ انقضا (اختیاری)</label><input type='datetime-local' name='expires_at'></div>
+          <div><label>یادداشت</label><input name='note' placeholder='مثلاً کمپین اینستاگرام'></div>
+          <div><label>وضعیت</label><select name='is_active'>
+            <option value='1'>فعال</option><option value='0'>غیرفعال</option>
+          </select></div>
+        </div>
+        <div class='row' style='margin-top:12px'><button>➕ ذخیره کد</button></div>
+      </form>
+    </div>
+    <table><tr><th>کد</th><th>مبلغ</th><th>استفاده</th><th>مخاطب</th><th>انقضا</th><th>وضعیت</th><th>یادداشت</th><th></th></tr>{rows}</table>"""
     return layout("کدهای هدیه", body, "/giftcodes", request)
 
 
@@ -1041,12 +1093,24 @@ async def giftcodes_add(request):
         code = (data.get("code") or "").strip()
         amount = int(data.get("amount"))
         max_uses = max(1, int(data.get("max_uses") or 1))
-        if code:
-            await db.add_gift_code(code, amount, max_uses)
-            logging.info("WEB_GIFTCODE_ADD code=%s amount=%s", code, amount)
+        if amount <= 0:
+            raise ValueError("amount")
     except (TypeError, ValueError):
         raise _redirect("/giftcodes", err="ورودی نامعتبر")
-    raise _redirect("/giftcodes", ok="کد هدیه اضافه شد")
+    if code and not rewards.is_valid_gift_code(rewards.normalize_gift_code(code)):
+        raise _redirect("/giftcodes", err="کد باید ۳ تا ۳۲ حرف انگلیسی یا عدد باشد")
+    audience = data.get("audience") if data.get("audience") in rewards.GIFT_AUDIENCES else "all"
+    saved = await db.add_gift_code(
+        code, amount, max_uses,
+        expires_at=_dt(data.get("expires_at")),
+        is_active=data.get("is_active") != "0",
+        note=(data.get("note") or "").strip(),
+        audience=audience,
+    )
+    if not saved:
+        raise _redirect("/giftcodes", err="ساخت کد ناموفق بود")
+    logging.info("WEB_GIFTCODE_ADD code=%s amount=%s", saved, amount)
+    raise _redirect("/giftcodes", ok=f"کد {saved} ذخیره شد")
 
 
 @require_auth
@@ -1057,6 +1121,111 @@ async def giftcodes_delete(request):
         await db.delete_gift_code(code)
         logging.info("WEB_GIFTCODE_DELETE code=%s", code)
     raise _redirect("/giftcodes", ok="کد حذف شد")
+
+
+@require_auth
+async def giftcodes_toggle(request):
+    data = await request.post()
+    code = (data.get("code") or "").strip()
+    state = await db.toggle_gift_code_active(code) if code else None
+    if state is None:
+        raise _redirect("/giftcodes", err="کد پیدا نشد")
+    logging.info("WEB_GIFTCODE_TOGGLE code=%s active=%s", code, state)
+    raise _redirect("/giftcodes", ok="کد فعال شد" if state else "کد غیرفعال شد")
+
+
+@require_auth
+async def giftcodes_view(request):
+    code = (request.query.get("code") or "").strip()
+    gc = await db.get_gift_code(code)
+    if not gc:
+        raise _redirect("/giftcodes", err="کد پیدا نشد")
+    redemptions = await db.list_gift_redemptions(gc['code'])
+    rows = ""
+    for r in redemptions:
+        d = r['created_at'].strftime('%Y-%m-%d %H:%M') if r['created_at'] else '—'
+        rows += (
+            f"<tr><td><a href='/users/view?id={e(r['user_id'])}'>{e(r['user_id'])}</a></td>"
+            f"<td>{e(r['nickname'] or '—')}</td><td>{money(r['amount'] or gc['amount'])}</td>"
+            f"<td>{e(d)}</td></tr>"
+        )
+    table = f"<table><tr><th>کاربر</th><th>نام</th><th>مبلغ</th><th>تاریخ</th></tr>{rows}</table>" if rows else "<p class='muted'>هنوز کسی این کد را استفاده نکرده است.</p>"
+    expires = gc['expires_at'].strftime('%Y-%m-%d %H:%M') if gc['expires_at'] else 'بدون انقضا'
+    audience = rewards.GIFT_AUDIENCES.get(gc['audience'] or 'all', gc['audience'])
+    body = f"""<h2>کد {e(gc['code'])}</h2>
+    <div class='box'>
+      <p>مبلغ: <b>{money(gc['amount'])}</b> تومان | استفاده: {e(gc['used_count'])}/{e(gc['max_uses'])} | مخاطب: {e(audience)}</p>
+      <p>انقضا: {e(expires)} | وضعیت: {_gift_status_badge(gc)} | یادداشت: {e(gc['note'] or '—')}</p>
+      <p class='muted'>لینک ورود مستقیم: <code>/start gift_{e(gc['code'])}</code></p>
+      <div class='row'><a href='/giftcodes'><button class='btn-ghost'>بازگشت</button></a></div>
+    </div>
+    <div class='box'><h3>استفاده‌کننده‌ها</h3>{table}</div>"""
+    return layout(f"کد {gc['code']}", body, "/giftcodes", request)
+
+
+# ================= دعوت‌ها =================
+@require_auth
+async def referrals_page(request):
+    search = request.query.get("q", "").strip() or None
+    page = _page_arg(request)
+    stats = await db.get_referral_stats()
+    cfg = await db.load_referral_config()
+    total = await db.count_referrals(search)
+    rows_data = await db.list_referrals(search=search, limit=PER_PAGE, offset=(page - 1) * PER_PAGE)
+    extra = f"&q={quote(search)}" if search else ""
+    cards = "".join([
+        f"<div class='card'><div class='i'>👥</div><div class='n'>{stats['invited']:,}</div><div class='l'>دعوت‌شده</div></div>",
+        f"<div class='card'><div class='i'>🎁</div><div class='n'>{stats['rewarded']:,}</div><div class='l'>پاداش‌گرفته</div></div>",
+        f"<div class='card'><div class='i'>⏳</div><div class='n'>{stats['pending']:,}</div><div class='l'>در انتظار شارژ</div></div>",
+        f"<div class='card'><div class='i'>💸</div><div class='n'>{money(stats['paid'])}</div><div class='l'>مجموع پرداخت‌شده</div></div>",
+    ])
+    rows = ""
+    for r in rows_data:
+        status = "<span class='badge on'>پرداخت شده</span>" if r['ref_rewarded'] else "<span class='badge off'>در انتظار</span>"
+        rows += (
+            f"<tr><td><a href='/users/view?id={e(r['user_id'])}'>{e(r['user_id'])}</a></td>"
+            f"<td>{e(r['nickname'] or '—')}</td>"
+            f"<td><a href='/users/view?id={e(r['referred_by'])}'>{e(r['referred_by'])}</a></td>"
+            f"<td>{e(r['referrer_nick'] or '—')}</td>"
+            f"<td>{status}</td><td>{money(r['balance'])}</td></tr>"
+        )
+    body = f"""<h2>سیستم دعوت</h2>
+    <div class='cards'>{cards}</div>
+    <div class='box'><h3>تنظیمات دعوت</h3>
+      <form method='post' action='/referrals/save'>
+        <div class='grid2'>
+          <div><label>وضعیت</label><select name='ref_enabled'>
+            <option value='on' {_sel('on' if cfg.enabled else 'off','on')}>روشن</option>
+            <option value='off' {_sel('on' if cfg.enabled else 'off','off')}>خاموش</option>
+          </select></div>
+          <div><label>پاداش معرف (تومان)</label><input name='ref_bonus' value='{e(cfg.referrer_bonus)}'></div>
+          <div><label>هدیه دعوت‌شده (تومان)</label><input name='ref_invitee_bonus' value='{e(cfg.invitee_bonus)}'></div>
+          <div><label>حداقل شارژ برای آزاد شدن پاداش</label><input name='ref_min_topup' value='{e(cfg.min_topup)}'></div>
+        </div>
+        <p class='muted'>پاداش فقط یک‌بار و بعد از اولین شارژِ تاییدشده‌ی دعوت‌شده پرداخت می‌شود.
+        اگر مبلغ شارژ به حداقل نرسد یا سیستم خاموش باشد، شانس برای شارژ بعدی باقی می‌ماند.</p>
+        <div class='row'><button>💾 ذخیره تنظیمات دعوت</button></div>
+      </form>
+    </div>
+    <div class='box'><form class='row' method='get' action='/referrals'>
+      <input name='q' placeholder='جستجو (آیدی دعوت‌شده یا معرف)' value='{e(search or "")}'>
+      <button class='btn-ghost'>🔎 جستجو</button>
+    </form></div>
+    <table><tr><th>دعوت‌شده</th><th>نام</th><th>معرف</th><th>نام معرف</th><th>وضعیت</th><th>موجودی</th></tr>{rows}</table>
+    {_pager_html('/referrals', page, total, extra)}"""
+    return layout("دعوت‌ها", body, "/referrals", request)
+
+
+@require_auth
+async def referrals_save(request):
+    data = await request.post()
+    await db.update_setting("ref_enabled", "on" if data.get("ref_enabled") == "on" else "off")
+    for key in ("ref_bonus", "ref_invitee_bonus", "ref_min_topup"):
+        raw = (data.get(key) or "").strip()
+        if raw.isdigit():
+            await db.update_setting(key, raw)
+    logging.info("WEB_REFERRAL_SETTINGS_SAVE")
+    raise _redirect("/referrals", ok="تنظیمات دعوت ذخیره شد")
 
 
 # ================= پیام همگانی =================
@@ -1186,6 +1355,9 @@ async def settings_page(request):
     support = await db.get_setting("support_id")
     notify_days = await db.get_setting("notify_days")
     ref_bonus = await db.get_setting("ref_bonus")
+    ref_enabled = await db.get_setting("ref_enabled")
+    ref_invitee = await db.get_setting("ref_invitee_bonus")
+    ref_min = await db.get_setting("ref_min_topup")
     backup_enabled = await db.get_setting("backup_enabled")
     test_enabled = await db.get_setting("test_enabled")
     test_gb = await db.get_setting("test_gb")
@@ -1214,12 +1386,22 @@ async def settings_page(request):
         <div><label>شماره کارت</label><input name='card_number' value='{e(card)}'></div>
         <div><label>آیدی پشتیبانی</label><input name='support_id' value='{e(support)}'></div>
         <div><label>هشدار انقضا (روز مانده)</label><input name='notify_days' value='{e(notify_days)}'></div>
-        <div><label>پاداش دعوت (تومان)</label><input name='ref_bonus' value='{e(ref_bonus)}'></div>
         <div><label>بکاپ خودکار روزانه</label><select name='backup_enabled'>
           <option value='on' {_sel(backup_enabled,'on')}>روشن</option>
           <option value='off' {_sel(backup_enabled,'off')}>خاموش</option>
         </select></div>
       </div>
+      <h3 style='margin-top:16px'>سیستم دعوت</h3>
+      <div class='grid2'>
+        <div><label>وضعیت دعوت</label><select name='ref_enabled'>
+          <option value='on' {_sel(ref_enabled or 'on','on')}>روشن</option>
+          <option value='off' {_sel(ref_enabled or 'on','off')}>خاموش</option>
+        </select></div>
+        <div><label>پاداش معرف (تومان)</label><input name='ref_bonus' value='{e(ref_bonus)}'></div>
+        <div><label>هدیه دعوت‌شده (تومان)</label><input name='ref_invitee_bonus' value='{e(ref_invitee)}'></div>
+        <div><label>حداقل شارژ برای پاداش دعوت</label><input name='ref_min_topup' value='{e(ref_min)}'></div>
+      </div>
+      <p class='muted'>پاداش دعوت فقط بعد از اولین شارژِ تاییدشده پرداخت می‌شود. جزئیات دعوت‌ها در صفحه «دعوت‌ها» است.</p>
       <h3 style='margin-top:16px'>نمایندگان و آفرها</h3>
       <div class='grid2'>
         <div><label>هدیه‌ی اولین شارژ نماینده</label><select name='reseller_bonus_enabled'>
@@ -1262,7 +1444,7 @@ async def settings_save(request):
     await db.update_setting("card_number", (data.get("card_number") or "").strip())
     await db.update_setting("support_id", (data.get("support_id") or "").strip())
     numeric_keys = (
-        "notify_days", "ref_bonus", "test_gb", "test_days",
+        "notify_days", "ref_bonus", "ref_invitee_bonus", "ref_min_topup", "test_gb", "test_days",
         "reseller_bonus_min", "reseller_bonus_percent",
         "reseller_t2_min", "reseller_t2_discount",
         "reseller_t3_min", "reseller_t3_discount",
@@ -1272,6 +1454,7 @@ async def settings_save(request):
         if raw.isdigit():
             await db.update_setting(key, raw)
     await db.update_setting("reseller_bonus_enabled", "on" if data.get("reseller_bonus_enabled") == "on" else "off")
+    await db.update_setting("ref_enabled", "on" if data.get("ref_enabled") == "on" else "off")
     await db.update_setting("backup_enabled", "on" if data.get("backup_enabled") == "on" else "off")
     await db.update_setting("test_enabled", "on" if data.get("test_enabled") == "on" else "off")
     tp = (data.get("test_panel_id") or "").strip()
@@ -1350,8 +1533,12 @@ def build_app():
         web.post("/panels/save", panel_save),
         web.post("/panels/delete", panel_delete),
         web.get("/giftcodes", giftcodes_page),
+        web.get("/giftcodes/view", giftcodes_view),
         web.post("/giftcodes/add", giftcodes_add),
         web.post("/giftcodes/delete", giftcodes_delete),
+        web.post("/giftcodes/toggle", giftcodes_toggle),
+        web.get("/referrals", referrals_page),
+        web.post("/referrals/save", referrals_save),
         web.get("/broadcast", broadcast_page),
         web.post("/broadcast/send", broadcast_send),
         web.get("/specials", specials_page),
