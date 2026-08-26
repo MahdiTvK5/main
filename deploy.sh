@@ -262,7 +262,7 @@ deploy_branch() {
 
   if [ ! -d "$target/.git" ]; then
     log "Cloning origin/${branch} into ${target} ..."
-    git clone --branch "$branch" origin "$target"
+    git clone --branch "$branch" --single-branch "$(git -C "$src_dir" remote get-url origin)" "$target"
   else
     log "Existing branch install found; updating it..."
     git -C "$target" fetch origin
