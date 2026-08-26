@@ -2666,6 +2666,7 @@ def main():
         app.job_queue.run_repeating(notify_job, interval=21600, first=120)
         # بکاپ خودکار دیتابیس (هر ۲۴ ساعت)
         app.job_queue.run_repeating(backup_job, interval=86400, first=300)
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
