@@ -546,9 +546,9 @@ button:active,.btn:active{transform:scale(.98)}
 .b-teal{background:var(--teal-soft);color:var(--teal)}
 .b-gray{background:var(--bg-soft);color:var(--text-2)}
 
-/* تب‌های فرم پلن (بدون JS) */
+/* تب‌های فرم پلن (بدون JS): رادیوها بیرون از .tabs و برادرِ مستقیم بدنه‌ها هستند */
+.tab-radio{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
 .tabs{display:flex;gap:4px;flex-wrap:wrap;padding:16px 18px 0;border-bottom:1px solid var(--line)}
-.tabs input{display:none}
 .tabs label{
   display:inline-flex;align-items:center;gap:7px;padding:10px 15px;margin:0 0 -1px;cursor:pointer;
   color:var(--text-2);font-weight:700;font-size:12.5px;border:1px solid transparent;border-bottom:0;
@@ -562,8 +562,8 @@ button:active,.btn:active{transform:scale(.98)}
 #tab-adv:checked ~ .tabs [for=tab-adv]{
   background:var(--primary-soft);color:var(--primary);border-color:var(--line);border-bottom:1px solid var(--panel);
 }
-#tab-basic:checked ~ * .tb-basic,#tab-buy:checked ~ * .tb-buy,
-#tab-renew:checked ~ * .tb-renew,#tab-adv:checked ~ * .tb-adv{display:block}
+#tab-basic:checked ~ .tb-basic,#tab-buy:checked ~ .tb-buy,
+#tab-renew:checked ~ .tb-renew,#tab-adv:checked ~ .tb-adv{display:block}
 .fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:16px}
 .renew-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
 .renew-cell{border:1px solid var(--line);border-radius:14px;padding:15px;background:var(--panel-2);position:relative;overflow:hidden;transition:border-color .16s,box-shadow .16s}
@@ -1486,12 +1486,15 @@ async def plan_edit_form(request):
         return (f"<div class='field'><label>{lbl}</label>"
                 f"<input name='{name}' value='{v}' class='ltr' inputmode='numeric' placeholder='0'>{h}</div>")
 
+    # رادیوهای تب باید «برادرِ» مستقیم نوار .tabs و بدنه‌های tab-body باشند؛
+    # اگر داخل div تودرتو شوند، سلکتورهای ~ در CSS مچ نمی‌شوند و همه‌ی
+    # بدنه‌ها مخفی می‌مانند (فرم پلن خالی رندر می‌شد).
     tabs = (
+        "<input type='radio' name='plan-tab' id='tab-basic' class='tab-radio' checked>"
+        "<input type='radio' name='plan-tab' id='tab-buy' class='tab-radio'>"
+        "<input type='radio' name='plan-tab' id='tab-renew' class='tab-radio'>"
+        "<input type='radio' name='plan-tab' id='tab-adv' class='tab-radio'>"
         "<div class='tabs'>"
-        "<input type='radio' name='plan-tab' id='tab-basic' checked>"
-        "<input type='radio' name='plan-tab' id='tab-buy'>"
-        "<input type='radio' name='plan-tab' id='tab-renew'>"
-        "<input type='radio' name='plan-tab' id='tab-adv'>"
         "<label for='tab-basic'>" + icon('box') + " اطلاعات پایه</label>"
         "<label for='tab-buy'>" + icon('card') + " قیمت خرید</label>"
         "<label for='tab-renew'>" + icon('refresh') + " قیمت تمدید</label>"
