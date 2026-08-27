@@ -283,7 +283,7 @@ async def _insert_default_plans(conn, panel_id, inbound_id=1):
                                   bulk_price, vip_bulk_price, renew_price, first_price,
                                   renew_normal_price, renew_vip_price, renew_reseller_price,
                                   inbound_id, panel_id, icon, sort_order, is_active)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$14,$15,$16,$10,$11,$12,$13,TRUE)""",
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,TRUE)""",
             name, gb, days, normal, vip, reseller, reseller, renew, first,
             rn, rv, rr,
             inbound_id, panel_id, icon, gb,
