@@ -162,6 +162,22 @@ async def _init_pricing(conn):
     await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS reseller_price BIGINT")
     await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS renew_price BIGINT")
     await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS first_price BIGINT")
+
+    # --- قیمت تمدید جدا برای هر سطح (عادی/VIP/همکاری) ---
+    await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS renew_normal_price BIGINT")
+    await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS renew_vip_price BIGINT")
+    await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS renew_reseller_price BIGINT")
+    # انتقالِ یک‌باره‌ی «تمدید» مشترک قبلی: برای هر سطح دقیقاً همان مبلغ مؤثری که
+    # تا امروز محاسبه می‌شد (کمترینِ قیمت همان سطح و تمدید) ذخیره می‌شود؛ هیچ عدد
+    # جدیدی ساخته نمی‌شود و ردیف‌های دست‌کاری‌شده دوباره بازنویسی نمی‌شوند.
+    await conn.execute("""
+        UPDATE plans
+        SET renew_normal_price = LEAST(COALESCE(price, 0), renew_price),
+            renew_vip_price = LEAST(COALESCE(vip_price, price, 0), renew_price),
+            renew_reseller_price = LEAST(COALESCE(reseller_price, vip_price, price, 0), renew_price)
+        WHERE COALESCE(renew_price, 0) > 0
+          AND renew_normal_price IS NULL AND renew_vip_price IS NULL AND renew_reseller_price IS NULL
+    """)
     await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE")
     await conn.execute("UPDATE plans SET is_active = TRUE WHERE is_active IS NULL")
 
@@ -258,12 +274,18 @@ async def _insert_default_plans(conn, panel_id, inbound_id=1):
         name = f"{gb}GB - {days} روزه"
         if await conn.fetchval("SELECT 1 FROM plans WHERE name = $1", name):
             continue
+        # همان نگاشت مهاجرت: تمدید هر سطح = کمترینِ قیمت همان سطح و قیمت تمدید
+        rn = min(normal, renew) if renew else None
+        rv = min(vip, renew) if renew else None
+        rr = min(reseller, renew) if renew else None
         await conn.execute(
             """INSERT INTO plans (name, gb, duration_days, price, vip_price, reseller_price,
                                   bulk_price, vip_bulk_price, renew_price, first_price,
+                                  renew_normal_price, renew_vip_price, renew_reseller_price,
                                   inbound_id, panel_id, icon, sort_order, is_active)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,TRUE)""",
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,TRUE)""",
             name, gb, days, normal, vip, reseller, reseller, renew, first,
+            rn, rv, rr,
             inbound_id, panel_id, icon, gb,
         )
         created += 1
@@ -505,6 +527,7 @@ async def list_plans(panel_id=None, only_active=False):
 PLAN_PRICE_COLUMNS = {
     'gb', 'duration_days', 'price', 'vip_price', 'reseller_price',
     'vip_bulk_price', 'bulk_price', 'renew_price', 'first_price',
+    'renew_normal_price', 'renew_vip_price', 'renew_reseller_price',
     'name', 'icon', 'inbound_id', 'panel_id', 'sort_order', 'is_active',
 }
 
@@ -533,27 +556,33 @@ async def get_plan(plan_id):
 
 
 async def create_plan(name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
-                      icon='', reseller_price=None, renew_price=None, first_price=None, is_active=True):
+                      icon='', reseller_price=None, renew_price=None, first_price=None, is_active=True,
+                      renew_normal_price=None, renew_vip_price=None, renew_reseller_price=None):
     async with db_pool.acquire() as conn:
         return await conn.fetchval(
             """INSERT INTO plans (name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price,
-                                  inbound_id, panel_id, icon, reseller_price, renew_price, first_price, is_active)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id""",
+                                  inbound_id, panel_id, icon, reseller_price, renew_price, first_price,
+                                  renew_normal_price, renew_vip_price, renew_reseller_price, is_active)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id""",
             name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
-            icon or '', reseller_price, renew_price, first_price, bool(is_active),
+            icon or '', reseller_price, renew_price, first_price,
+            renew_normal_price, renew_vip_price, renew_reseller_price, bool(is_active),
         )
 
 
 async def update_plan(plan_id, name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
-                      icon='', reseller_price=None, renew_price=None, first_price=None, is_active=True):
+                      icon='', reseller_price=None, renew_price=None, first_price=None, is_active=True,
+                      renew_normal_price=None, renew_vip_price=None, renew_reseller_price=None):
     async with db_pool.acquire() as conn:
         await conn.execute(
             """UPDATE plans SET name=$2, gb=$3, duration_days=$4, price=$5, vip_price=$6, bulk_price=$7,
                    vip_bulk_price=$8, inbound_id=$9, panel_id=$10, icon=$11,
-                   reseller_price=$12, renew_price=$13, first_price=$14, is_active=$15
+                   reseller_price=$12, renew_price=$13, first_price=$14,
+                   renew_normal_price=$15, renew_vip_price=$16, renew_reseller_price=$17, is_active=$18
                WHERE id=$1""",
             int(plan_id), name, gb, duration_days, price, vip_price, bulk_price, vip_bulk_price, inbound_id, panel_id,
-            icon or '', reseller_price, renew_price, first_price, bool(is_active),
+            icon or '', reseller_price, renew_price, first_price,
+            renew_normal_price, renew_vip_price, renew_reseller_price, bool(is_active),
         )
 
 

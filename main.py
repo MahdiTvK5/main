@@ -152,7 +152,9 @@ PLAN_FIELDS = [
     ("price", "قیمت عادی", "price", True),
     ("vipprice", "قیمت VIP", "vip_price", True),
     ("resprice", "قیمت همکاری", "reseller_price", True),
-    ("renewprice", "قیمت تمدید", "renew_price", True),
+    ("renewnormal", "قیمت تمدید عادی", "renew_normal_price", True),
+    ("renewvip", "قیمت تمدید VIP", "renew_vip_price", True),
+    ("renewres", "قیمت تمدید همکاری", "renew_reseller_price", True),
     ("firstprice", "قیمت آفر خرید اول", "first_price", True),
     ("vipbulk", "قیمت عمده", "vip_bulk_price", True),
     ("inbound", "اینباند", "inbound_id", True),
@@ -194,13 +196,14 @@ def plan_edit_markup(plan_id):
 async def render_pricing_menu(query):
     """جدول قیمت همه‌ی پلن‌ها در سه سطح، به‌همراه قیمت تمدید و آفر خرید اول."""
     plans = await db.list_plans()
-    lines = ["💰 **مدیریت قیمت‌ها**", "", "`ID | حجم/روز | همکاری | VIP | عادی | تمدید | خرید‌اول`"]
+    lines = ["💰 **مدیریت قیمت‌ها**", "", "`ID | حجم/روز | همکاری | VIP | عادی | تمدید عادی/VIP/همکاری | خرید‌اول`"]
     for p in plans:
         state = "" if p['is_active'] else " ⛔️"
         lines.append(
             f"`{p['id']}` {_plan_icon(p)}{p['gb']}GB/{p['duration_days']}روز{state}\n"
             f"   🤝 {money(p['reseller_price'])} | 💎 {money(p['vip_price'])} | 👤 {money(p['price'])}"
-            f" | ♻️ {money(p['renew_price'])} | 🔥 {money(p['first_price'])}"
+            f" | ♻️ {money(p['renew_normal_price'])}/{money(p['renew_vip_price'])}/{money(p['renew_reseller_price'])}"
+            f" | 🔥 {money(p['first_price'])}"
         )
     if not plans:
         lines.append("\nهنوز پلنی تعریف نشده است.")
@@ -457,7 +460,9 @@ async def plan_edit_text(plan):
         f"👤 قیمت عادی: {money(plan['price'])}\n"
         f"💎 قیمت VIP: {money(plan['vip_price'])}\n"
         f"🤝 قیمت همکاری: {money(plan['reseller_price'])}\n"
-        f"♻️ قیمت تمدید: {money(plan['renew_price'])}\n"
+        f"♻️ تمدید عادی: {money(plan['renew_normal_price'])}\n"
+        f"♻️ تمدید VIP: {money(plan['renew_vip_price'])}\n"
+        f"♻️ تمدید همکاری: {money(plan['renew_reseller_price'])}\n"
         f"🔥 آفر خرید اول: {money(plan['first_price'])}\n"
         f"📦 قیمت عمده: {money(plan['vip_bulk_price'])}\n"
         f"⚙️ اینباند: {plan['inbound_id']}\n"
@@ -2661,6 +2666,7 @@ def main():
         app.job_queue.run_repeating(notify_job, interval=21600, first=120)
         # بکاپ خودکار دیتابیس (هر ۲۴ ساعت)
         app.job_queue.run_repeating(backup_job, interval=86400, first=300)
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':

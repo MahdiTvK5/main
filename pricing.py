@@ -41,6 +41,13 @@ AUDIENCES = {
     'reseller': 'نمایندگان',
 }
 
+# ستون «قیمت تمدید» مخصوص هر سطح روی پلن؛ مقدار این ستون مرجعِ تمدید همان سطح است.
+RENEW_PRICE_COLUMNS = {
+    NORMAL: 'renew_normal_price',
+    VIP: 'renew_vip_price',
+    RESELLER: 'renew_reseller_price',
+}
+
 
 def normalize_role(role):
     """هر مقدار ناشناخته‌ای در ستون role به «عادی» تفسیر می‌شود."""
@@ -228,15 +235,40 @@ def apply_offer(base, offer):
 def resolve_quote(plan, buyer, kind=KIND_BUY, config=None, custom_price=None, offers=(), now=None):
     """قیمت نهایی یک پلن برای یک کاربر.
 
-    قاعده: تخفیف‌ها روی هم سوار نمی‌شوند؛ همه‌ی قیمت‌های ممکن (سطح کاربر، آفر خرید
-    اول، قیمت تمدید، پله‌ی نمایندگی و آفرهای فعال) کنار هم گذاشته می‌شوند و
+    خرید/خرید عمده: تخفیف‌ها روی هم سوار نمی‌شوند؛ همه‌ی قیمت‌های ممکن (سطح کاربر،
+    آفر خرید اول، پله‌ی نمایندگی و آفرهای فعال) کنار هم گذاشته می‌شوند و
     **ارزان‌ترین** برنده است. این هم برای کاربر قابل فهم است و هم جلوی تخفیفِ
     تصادفیِ روی‌هم‌رفته (مثلاً پله‌ی نمایندگی روی قیمت آفر خرید اول) را می‌گیرد.
+
+    تمدید: قیمتِ ستونِ مخصوصِ سطحِ کاربر (renew_normal_price / renew_vip_price /
+    renew_reseller_price) **مرجع** است و عیناً همان مبلغ کسر می‌شود؛ با قیمت پایه،
+    سطح دیگر، پله‌ی نمایندگی یا آفر کمپینی مقایسه/جایگزین نمی‌شود. فقط وقتی برای آن
+    سطح قیمتی تنظیم نشده باشد (ستون خالی/صفر) قیمت پایه‌ی همان سطح گرفته می‌شود.
     """
     config = config or PricingConfig()
     role = normalize_role(buyer.role)
     plan_id = _int(_plan_get(plan, 'id'))
+    # قیمت اختصاصیِ صفر/منفی مثل بقیه‌ی ستون‌های قیمت یعنی «تنظیم نشده»
+    custom_price = _positive(custom_price)
     base = base_price_for(plan, role, kind, config, custom_price)
+
+    # تمدید: قیمتِ اختصاصیِ همین سطح مرجع است؛ هیچ کاندیدای دیگری وارد نمی‌شود.
+    if kind == KIND_RENEW:
+        if custom_price is not None:
+            price, label = max(0, _int(custom_price)), ''
+        elif config.renew_offer_enabled:
+            renew = _positive(_plan_get(plan, RENEW_PRICE_COLUMNS[role]))
+            if renew:
+                price, label = renew, '♻️ قیمت ویژه‌ی تمدید'
+            else:
+                price, label = base, ''
+        else:
+            price, label = base, ''
+        return Quote(
+            plan_id=plan_id, kind=kind, base_price=base, price=max(0, price),
+            label=label if price < base else '', offer_id=None,
+            first_offer=False, tier_discount=0,
+        )
 
     # هر گزینه: (قیمت، برچسب، آفر خرید اول؟، آیدی آفر، درصد پله)
     candidates = [(base, '', False, None, 0)]
@@ -246,11 +278,6 @@ def resolve_quote(plan, buyer, kind=KIND_BUY, config=None, custom_price=None, of
         first = _positive(_plan_get(plan, 'first_price'))
         if first:
             candidates.append((first, '🔥 آفر خرید اول', True, None, 0))
-
-    if kind == KIND_RENEW and config.renew_offer_enabled and custom_price is None:
-        renew = _positive(_plan_get(plan, 'renew_price'))
-        if renew:
-            candidates.append((renew, '♻️ قیمت ویژه‌ی تمدید', False, None, 0))
 
     if role == RESELLER:
         _tier, percent, tier_title = reseller_tier(buyer.monthly_topup, config)
@@ -384,7 +411,8 @@ async def custom_price_for(user_id, plan_id, bulk=False):
     if not row:
         return None
     value = row['bulk_price'] if bulk else row['price']
-    return None if value is None else _int(value)
+    # صفر/خالی مثل بقیه‌ی ستون‌های قیمت یعنی «تنظیم نشده»، نه قیمت رایگان
+    return _positive(value)
 
 
 async def quote_for_user(user_id, plan, kind=KIND_BUY, buyer=None, config=None, offers=None, admin=False):

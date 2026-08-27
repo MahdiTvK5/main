@@ -7,7 +7,7 @@ from urllib.parse import urlparse, quote
 
 import httpx
 
-from config import PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP
+from config import PANEL_URL, PANEL_USER, PANEL_PASS, CONFIG_IP, PANEL_TIMEOUT
 
 
 def _host_from_url(url):
@@ -204,10 +204,14 @@ class AsyncXuiAPI:
         return [f"https://{u}", f"http://{u}"]
 
     async def login(self):
+        """ورود به پنل. برای مقاومت در برابر شبکه‌های ناپایدار، هر آدرسِ کاندید
+        یک‌بار دیگر (مجموعاً دو تلاش) امتحان می‌شود و خطای اتصال با راهنمای
+        عیب‌یابی فارسی برگردانده می‌شود."""
         last_err = "آدرس پنل نامعتبر است"
-        for base in self._candidate_urls():
+        candidates = [(base, attempt) for base in self._candidate_urls() for attempt in (1, 2)]
+        for base, attempt in candidates:
             # follow_redirects تا ریدایرکتِ http→https پنل خودکار دنبال شود
-            async with httpx.AsyncClient(verify=False, timeout=10.0, trust_env=False, follow_redirects=True) as client:
+            async with httpx.AsyncClient(verify=False, timeout=PANEL_TIMEOUT, trust_env=False, follow_redirects=True) as client:
                 try:
                     res = await client.post(f"{base}/login", data={"username": self.username, "password": self.password})
                     if res.status_code == 200 and res.json().get('success'):
@@ -220,6 +224,11 @@ class AsyncXuiAPI:
                         return True, "OK"
                     # پاسخ گرفتیم ولی ناموفق (مثلاً یوزر/پس اشتباه یا مسیر نادرست)
                     last_err = f"{base}/login → HTTP {res.status_code}: {str(res.text)[:200]}"
+                except httpx.ConnectTimeout as e:
+                    hint = ("سرور پنل اصلاً پاسخ نداد؛ پورت پنل روی فایروال باز است؟ آدرس/پورت پنل در «مدیریت پنل‌ها» درست است؟ "
+                            "اگر ربات و پنل روی یک سرورند، PANEL_URL را با 127.0.0.1 امتحان کنید")
+                    last_err = f"{base}/login → ConnectTimeout ({PANEL_TIMEOUT}s): {hint}"
+                    logging.warning("panel login connect timeout (%s/%s) %s", base, attempt, e)
                 except Exception as e:
                     last_err = f"{base}/login → {type(e).__name__}: {e}"
         return False, last_err
