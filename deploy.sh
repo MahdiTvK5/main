@@ -202,14 +202,28 @@ try_create_branch_db() {
     warn "psql not found; create DB '${dbname}' manually (README step 3)."
     return 0
   }
+  # Identifiers may contain '-' (e.g. overwall_test-overwallbot), so they MUST
+  # be double-quoted in SQL, otherwise CREATE DATABASE fails with a syntax
+  # error and the bot later dies with InvalidCatalogNameError. Single quotes
+  # inside the password literal are escaped by doubling them.
+  local q_name="\"${dbname}\"" q_user="\"${dbuser}\""
+  local q_pass="${dbpass//\'/\'\'}"
   log "Ensuring database '${dbname}' exists (best effort)..."
   if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${dbuser}'" 2>/dev/null | grep -q 1; then
-    sudo -u postgres psql -c "CREATE USER ${dbuser} WITH PASSWORD '${dbpass}';" >/dev/null 2>&1 \
-      || sudo -u postgres psql -c "ALTER USER ${dbuser} WITH PASSWORD '${dbpass}';" >/dev/null 2>&1 \
+    sudo -u postgres psql -c "CREATE USER ${q_user} WITH PASSWORD '${q_pass}';" >/dev/null 2>&1 \
+      || sudo -u postgres psql -c "ALTER USER ${q_user} WITH PASSWORD '${q_pass}';" >/dev/null 2>&1 \
       || warn "Could not create DB role '${dbuser}' (needs root/postgres access)."
   fi
-  sudo -u postgres psql -c "CREATE DATABASE ${dbname} OWNER ${dbuser};" >/dev/null 2>&1 \
-    || warn "Could not create DB '${dbname}' (maybe it already exists / no rights). Create it manually."
+  if [ "$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${dbname}'" 2>/dev/null)" = "1" ]; then
+    log "Database '${dbname}' already exists."
+    return 0
+  fi
+  if sudo -u postgres psql -c "CREATE DATABASE ${q_name} OWNER ${q_user};" >/dev/null 2>&1; then
+    log "Database '${dbname}' created."
+  else
+    warn "Could not create DB '${dbname}'. Create it manually, then restart:"
+    echo "    sudo -u postgres psql -c 'CREATE DATABASE \"${dbname}\" OWNER \"${dbuser}\";'"
+  fi
 }
 
 seed_branch_env() {
