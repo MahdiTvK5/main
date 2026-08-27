@@ -8,10 +8,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pricing  # noqa: E402
 from pricing import (  # noqa: E402
     KIND_BULK, KIND_RENEW, NORMAL, RESELLER, VIP,
     Buyer, PricingConfig, apply_offer, base_price_for, button_text, can_buy_bulk,
-    normalize_role, offer_matches, reseller_bonus_for, reseller_tier, resolve_quote,
+    normalize_role, offer_matches, quote_lines, reseller_bonus_for, reseller_tier, resolve_quote,
 )
 
 # جدول مصوب: (حجم، روز، همکاری، VIP، عادی، تمدید، خرید اول)
@@ -27,10 +28,15 @@ PRICE_TABLE = [
 
 
 def plan_of(gb, days, reseller, vip, normal, renew, first, **extra):
+    # همان نگاشت مهاجرت دیتابیس: تمدید هر سطح = کمترینِ قیمت همان سطح و تمدید مشترک
+    rn = min(normal, renew) if renew else None
+    rv = min(vip, renew) if renew else None
+    rr = min(reseller, renew) if renew else None
     plan = {
         'id': gb, 'name': f'{gb}GB - {days} روزه', 'gb': gb, 'duration_days': days,
         'price': normal, 'vip_price': vip, 'reseller_price': reseller,
         'renew_price': renew, 'first_price': first, 'vip_bulk_price': reseller,
+        'renew_normal_price': rn, 'renew_vip_price': rv, 'renew_reseller_price': rr,
         'icon': '🟦', 'is_active': True,
     }
     plan.update(extra)
@@ -89,6 +95,39 @@ class TestRenewal:
             assert q.base_price == normal
             assert q.label == '♻️ قیمت ویژه‌ی تمدید'
 
+    def test_each_level_pays_exactly_its_own_renewal_price(self):
+        # سه قیمت تمدیدِ متمایز (اعداد آزمایشی، فقط برای تست مکانیزم):
+        # هر سطح باید «دقیقاً» قیمت تمدید خودش را بگیرد؛ نه قیمت پایه‌ی خودش،
+        # نه سطح دیگر و نه ارزان‌ترین کاندیدا.
+        plan = plan_of(30, 30, reseller=300_000, vip=400_000, normal=500_000,
+                       renew=0, first=0,
+                       renew_normal_price=100_000,      # X
+                       renew_vip_price=90_000,          # Y
+                       renew_reseller_price=80_000)     # Z
+        assert resolve_quote(plan, returning_buyer(NORMAL), kind=KIND_RENEW).price == 100_000
+        assert resolve_quote(plan, returning_buyer(VIP), kind=KIND_RENEW).price == 90_000
+        assert resolve_quote(plan, returning_buyer(RESELLER), kind=KIND_RENEW).price == 80_000
+
+    def test_missing_level_renewal_falls_back_to_own_tier(self):
+        # ستون تمدیدِ سطح خالی/صفر یعنی «تنظیم نشده» → قیمت پایه‌ی همان سطح
+        plan = plan_of(30, 30, 140_000, 165_000, 190_000, 169_000, 129_000,
+                       renew_normal_price=None, renew_vip_price=0)
+        assert resolve_quote(plan, returning_buyer(NORMAL), kind=KIND_RENEW).price == 190_000
+        assert resolve_quote(plan, returning_buyer(VIP), kind=KIND_RENEW).price == 165_000
+        assert resolve_quote(plan, returning_buyer(RESELLER), kind=KIND_RENEW).price == 140_000
+        # پلنِ قدیمی بدون هیچ ستون جدید هم نباید خطا بدهد
+        legacy = {'id': 99, 'gb': 5, 'duration_days': 30, 'price': 60_000}
+        assert resolve_quote(legacy, returning_buyer(VIP), kind=KIND_RENEW).price == 60_000
+
+    def test_displayed_renewal_price_equals_charged_amount(self):
+        plan = PLANS[2]
+        for role in (NORMAL, VIP, RESELLER):
+            q = resolve_quote(plan, returning_buyer(role), kind=KIND_RENEW)
+            # متن دکمه‌ی منوی تمدید همان عددی را نشان می‌دهد که کسر می‌شود
+            assert pricing.money(q.price) in button_text(plan, q)
+            body, _spec = quote_lines(plan, q)
+            assert pricing.money(q.price) in body
+
     def test_renewal_never_costs_more_than_the_user_tier(self):
         # نماینده‌ی ۱۰ گیگ: قیمت همکاری ۸۰٬۰۰۰ از قیمت تمدید ۹۵٬۰۰۰ کمتر است
         q = resolve_quote(PLANS[0], returning_buyer(RESELLER), kind=KIND_RENEW)
@@ -132,6 +171,20 @@ class TestFirstPurchaseOffer:
 
     def test_offer_does_not_apply_to_renewal(self):
         assert resolve_quote(PLANS[2], new_buyer(), kind=KIND_RENEW).price == 169_000
+        # حتی آفر فعالِ ارزان‌تر هم نباید قیمت تمدید را از مقدار تنظیم‌شده پایین‌تر ببرد
+        offer = {'id': 9, 'name': 'کمپین', 'kind': 'percent', 'value': 50, 'audience': 'all',
+                 'plan_id': None, 'starts_at': None, 'ends_at': None, 'max_uses': 0,
+                 'per_user_limit': 0, 'used_count': 0, 'is_active': True}
+        q = resolve_quote(PLANS[2], new_buyer(), kind=KIND_RENEW, offers=[offer])
+        assert q.price == 169_000 and q.offer_id is None
+
+    def test_renewal_respects_each_role(self):
+        # هر سطح فقط در زنجیره‌ی خودش تمدید می‌شود؛ قیمت تمدید فقط وقتی اعمال می‌شود
+        # که از قیمت سطحِ همان کاربر کمتر باشد (هیچ سطحی گران‌تر از پله‌ی خودش نمی‌شود)
+        p = PLANS[2]   # عادی ۱۹۰٬۰۰۰ / VIP ۱۶۵٬۰۰۰ / همکاری ۱۴۰٬۰۰۰ / تمدید ۱۶۹٬۰۰۰
+        assert resolve_quote(p, returning_buyer(NORMAL), kind=KIND_RENEW).price == 169_000
+        assert resolve_quote(p, returning_buyer(VIP), kind=KIND_RENEW).price == 165_000
+        assert resolve_quote(p, returning_buyer(RESELLER), kind=KIND_RENEW).price == 140_000
 
     def test_offer_never_raises_the_price(self):
         # نماینده‌ی تازه: قیمت همکاری ۱۴۰٬۰۰۰ از آفر ۱۲۹٬۰۰۰ بیشتر است، پس آفر برنده است

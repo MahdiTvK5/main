@@ -41,6 +41,12 @@ PANEL_URL = os.getenv("PANEL_URL")
 PANEL_USER = os.getenv("PANEL_USER")
 PANEL_PASS = os.getenv("PANEL_PASS")
 CONFIG_IP = os.getenv("CONFIG_IP")
+# تایم‌اوت اتصال به پنل X-UI (ثانیه). اگر شبکه/مسیرِ بین سرور ربات و پنل کند باشد،
+# با متغیر محیطی PANEL_TIMEOUT بیشترش کنید.
+try:
+    PANEL_TIMEOUT = float(os.getenv("PANEL_TIMEOUT", "20"))
+except ValueError:
+    PANEL_TIMEOUT = 20.0
 
 # ===== پنل وب مدیریت =====
 # اگر رمز تنظیم نشده باشد، پنل وب اجرا نمی‌شود.
