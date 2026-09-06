@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+bot.log*
+# بکاپ‌ها و دامپ‌های دیتابیس هرگز نباید به ریپو بروند
+*.sql
+*.dump
+backups/
+# کش‌های محلی
+.pytest_cache/
+.freebuff/
+
+.env.txt
+*.env.txt
