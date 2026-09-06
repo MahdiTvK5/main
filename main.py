@@ -857,7 +857,6 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     admin_status = await is_admin(user_id)
 
     text = update.message.text
-    if not text: return
 
     # لغو سراسری: قبل از هر ماشین وضعیت، تا «لغو» هرگز به‌عنوان ورودیِ ویزارد
     # (پیام همگانی، رسید، ایمپورت و…) پردازش نشود.
@@ -868,7 +867,32 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("عملیات لغو شد.", reply_markup=await get_main_keyboard(user_id))
         return
 
+    # 📸 Receipts — قبل از گیتِ متن تا عکس‌ها (که text ندارند) هم برسند
+    if state.startswith('waiting_receipt_'):
+        if not update.message.photo:
+            return await update.message.reply_text("❌ لطفاً فقط **عکس رسید** واریزی را ارسال کنید.")
+        amount = state.split('_')[2]
+        receipt_id = str(uuid.uuid4())[:8]
+        async with db.db_pool.acquire() as conn: await conn.execute("INSERT INTO receipts (id, status) VALUES ($1, 'pending')", receipt_id)
+
+        keyboard = [[InlineKeyboardButton(f"✅ تایید {int(amount):,}", callback_data=f"approve_{user_id}_{amount}_{receipt_id}")], [InlineKeyboardButton("❌ رد", callback_data=f"reject_{user_id}_{receipt_id}")]]
+        admins = await get_all_admins()
+        sent = False
+        for adm in admins:
+            if adm == 0: continue
+            try:
+                await context.bot.send_photo(chat_id=adm, photo=update.message.photo[-1].file_id, caption=f"رسید کاربر: `{user_id}`\nمبلغ: {int(amount):,}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+                sent = True
+            except Exception as ex:
+                logging.warning("ارسال رسید به ادمین %s ناموفق بود: %s", adm, ex)
+
+        context.user_data['state'] = 'none'
+        msg = "✅ رسید در صف بررسی قرار گرفت." if sent else "⚠️ سیستم نتوانست رسید را بفرستد."
+        await update.message.reply_text(msg, reply_markup=await get_main_keyboard(user_id))
+        return
+
     # 📢 Broadcast — مرحله‌ی ۱: هیچ‌چیز مستقیم ارسال نمی‌شود؛ اول پیش‌نمایش و تأیید
+    # (قبل از گیتِ متن تا عکس/ویس/ویدیو هم قابل همگانی‌شدن باشند)
     if state == 'admin_waiting_broadcast' and admin_status:
         context.user_data['broadcast_draft_msg'] = update.message.message_id
         context.user_data['state'] = 'broadcast_confirm'
@@ -886,29 +910,8 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # 📸 Receipts
-    if state.startswith('waiting_receipt_'):
-        if not update.message.photo:
-            return await update.message.reply_text("❌ لطفاً فقط **عکس رسید** واریزی را ارسال کنید.")
-        amount = state.split('_')[2]
-        receipt_id = str(uuid.uuid4())[:8]
-        async with db.db_pool.acquire() as conn: await conn.execute("INSERT INTO receipts (id, status) VALUES ($1, 'pending')", receipt_id)
-            
-        keyboard = [[InlineKeyboardButton(f"✅ تایید {int(amount):,}", callback_data=f"approve_{user_id}_{amount}_{receipt_id}")], [InlineKeyboardButton("❌ رد", callback_data=f"reject_{user_id}_{receipt_id}")]]
-        admins = await get_all_admins()
-        sent = False
-        for adm in admins:
-            if adm == 0: continue
-            try: 
-                await context.bot.send_photo(chat_id=adm, photo=update.message.photo[-1].file_id, caption=f"رسید کاربر: `{user_id}`\nمبلغ: {int(amount):,}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-                sent = True
-            except Exception as ex:
-                logging.warning("ارسال رسید به ادمین %s ناموفق بود: %s", adm, ex)
-                
-        context.user_data['state'] = 'none'
-        msg = "✅ رسید در صف بررسی قرار گرفت." if sent else "⚠️ سیستم نتوانست رسید را بفرستد."
-        await update.message.reply_text(msg, reply_markup=await get_main_keyboard(user_id))
-        return
+    # گیتِ متن: از اینجا به بعد فقط پیام‌های متنی پردازش می‌شوند
+    if not text: return
 
     # ================= اکانت تست رایگان =================
     if text == '🎁 اکانت تست رایگان':
