@@ -159,7 +159,7 @@ async def _send_join_prompt(update_or_query, channel):
         pass
 
 
-async def unique_service_name(xui, base, max_tries=8, max_len=20):
+async def unique_service_name(xui, base, max_tries=8, max_len=24):
     """نام سرویس یکتا روی پنل.
 
     اسم دلخواه کاربر عیناً استفاده می‌شود (حس مالکیت)؛ فقط اگر روی پنل تکراری
@@ -1620,7 +1620,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not admin_status and not await order_belongs_to(order_id, user_id):
             context.user_data['state'] = 'none'
             return await update.message.reply_text("⛔️ این سفارش متعلق به شما نیست.", reply_markup=await get_main_keyboard(user_id))
-        if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) < 20:
+        if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) <= 24:
             row, old_email = await load_order_service(order_id)
             if not row:
                 context.user_data['state'] = 'none'
@@ -1648,11 +1648,11 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                     else: await update.message.reply_text("❌ سرور درخواست تغییر نام را رد کرد.")
                 else: await update.message.reply_text("❌ کانفیگ در سرور یافت نشد.")
             else: await update.message.reply_text("❌ خطا در اتصال به پنل X-UI.")
-        else: await update.message.reply_text("❌ نامعتبر! فقط حروف انگلیسی و اعداد.")
+        else: await update.message.reply_text("❌ نامعتبر! فقط حروف انگلیسی، اعداد، - و _ (حداکثر ۲۴ کاراکتر).")
 
     elif state.startswith('waiting_for_nick_'):
         plan_id = int(state.split('_')[-1])
-        if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) < 20:
+        if re.match(r"^[A-Za-z0-9_-]+$", text) and len(text) <= 24:
             plan = await db.get_plan(plan_id)
             if not plan: return
             if not plan['is_active']:
@@ -1673,7 +1673,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
             )
             context.user_data['state'] = 'none'
-        else: await update.message.reply_text("❌ نامعتبر! فقط از حروف انگلیسی و اعداد استفاده کنید:")
+        else: await update.message.reply_text("❌ نامعتبر! فقط حروف انگلیسی، اعداد، - و _ (حداکثر ۲۴ کاراکتر):")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """پوشش‌دهنده‌ی هندلر دکمه‌ها.
