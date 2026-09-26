@@ -13,11 +13,19 @@ def email_from_link(link):
 
     در vless/trojan نام سرویس در فرگمنتِ بعد از # است، اما در vmess کل تنظیمات
     (از جمله نام، در فیلد ps) داخل Base64 قرار دارد و هیچ فرگمنتی وجود ندارد.
+    نشانگرهای فایل (ovpn:// ، wg://) هم پشتیبانی می‌شوند.
     اگر نام قابل استخراج نباشد رشته‌ی خالی برمی‌گردد تا صدازننده تصمیم بگیرد.
     """
     if not link:
         return ""
     link = str(link).strip()
+    # نشانگرهای فایل (OpenVPN/WireGuard در vpn-ui): نام بعد از اسکیم/ترنسپورت است
+    if link.startswith("ovpn://"):
+        rest = link[len("ovpn://"):]
+        transport, _, name = rest.partition('/')
+        return (name or transport).strip()
+    if link.startswith("wg://"):
+        return link[len("wg://"):].strip()
     if link.startswith("vmess://"):
         payload = link[len("vmess://"):].split("#")[0].strip()
         try:

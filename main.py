@@ -22,12 +22,14 @@ import db
 from db import (
     init_db, is_admin, get_all_admins, get_setting, update_setting, get_user,
     deduct_balance, credit_balance, add_order, order_belongs_to,
+    get_user_allowed_panels,
 )
 from links import order_email, email_from_link, client_key, new_client_key
 import pricing
 from pricing import KIND_BUY, KIND_RENEW
 import rewards
-from panel import build_xui, sub_link_for, build_vless_link, build_share_link
+from panel import (build_xui, sub_link_for, build_vless_link, build_share_link,
+                   is_vpnui_panel, file_link_kind, parse_file_link)
 import subportal
 from keyboards import get_main_keyboard, generate_orders_keyboard, CANCEL_MARKUP
 
@@ -320,6 +322,7 @@ async def admin_menu_markup(user_id):
         [InlineKeyboardButton("💰 مدیریت قیمت‌ها", callback_data='admin_pricing'), InlineKeyboardButton("🎯 مدیریت آفرها", callback_data='admin_offers')],
         [InlineKeyboardButton("📈 گزارش مالی", callback_data='admin_finance'), InlineKeyboardButton("🤝 نمایندگان", callback_data='admin_resellers')],
         [InlineKeyboardButton("🚫 بن کاربر", callback_data='admin_ban_menu'), InlineKeyboardButton("🔀 مهاجرت اینباند", callback_data='admin_migrate_menu')],
+        [InlineKeyboardButton("🖥 پنل‌های مجاز کاربر", callback_data='admin_user_panels')],
         [InlineKeyboardButton("⭐️ اجبار عضویت کانال", callback_data='admin_force_channel')],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data='admin_backup_menu')],
         [InlineKeyboardButton(f"وضعیت فروش: {status_text}", callback_data='admin_toggle_sales')],
@@ -532,12 +535,45 @@ PANEL_FIELDS = [
     ("pass", "رمز عبور", "password"),
     ("ip", "IP کانفیگ", "config_ip"),
     ("sub", "لینک ساب (Sub URL)", "sub_url"),
+    ("type", "نوع پنل (xui یا vpn-ui)", "panel_type"),
 ]
 PANEL_FIELD_MAP = {f[0]: f for f in PANEL_FIELDS}
 
 
+async def _user_panels_view(target_uid):
+    """(متن، کیبورد) منوی چک‌باکس پنل‌های مجاز کاربر. هیچ انتخابی = همه‌ی پنل‌ها (دیفالت)."""
+    panels = await db.get_panels()
+    allowed = await db.get_user_allowed_panels(target_uid)
+    shown_all = allowed is None
+    if shown_all:
+        allowed = {p['id'] for p in panels}  # نمایش «همه فعال»
+    row = await db.get_user(target_uid)
+    nickname = row[1] if row else None
+    lines = [
+        f"🖥 **پنل‌های مجاز کاربر** {('— ' + str(nickname)) if nickname else ''}",
+        f"🆔 `{target_uid}`", "",
+        "روی هر پنل بزنید تا فعال/غیرفعال شود:",
+        "⛔️ اگر هیچ پنلی فعال نباشد، کاربر چیزی برای خرید نمی‌بیند.",
+        "🔁 «همه‌ی پنل‌ها» یعنی بدون محدودیت (پنل‌های جدید هم خودکار اضافه می‌شوند).",
+    ]
+    kb = []
+    for p in panels:
+        mark = "✅" if p['id'] in allowed else "❌"
+        kb.append([InlineKeyboardButton(f"{mark} {p['name']}", callback_data=f"userpn_{target_uid}_{p['id']}")])
+    if len(panels) > 1:
+        kb.append([InlineKeyboardButton(("✅ همه‌ی پنل‌ها (فعلاً فعال است)" if shown_all else "🔄 همه‌ی پنل‌ها (حذف محدودیت)"), callback_data=f"userpn_all_{target_uid}")])
+    kb.append([InlineKeyboardButton("✅ پایان", callback_data="pe_done")])
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_user_panels(query, target_uid):
+    text, kb = await _user_panels_view(target_uid)
+    await _edit_or_send(query, text, kb)
+
+
 def panel_edit_markup(panel_id):
     rows = [[InlineKeyboardButton(f"✏️ {label}", callback_data=f"panef_{key}_{panel_id}")] for key, label, _col in PANEL_FIELDS]
+    rows.append([InlineKeyboardButton("📡 نمایش اینباندها", callback_data=f"paninb_{panel_id}")])
     rows.append([InlineKeyboardButton("✅ پایان", callback_data="pe_done")])
     return InlineKeyboardMarkup(rows)
 
@@ -549,7 +585,8 @@ def panel_edit_text(panel):
         f"🔗 URL: {panel['url']}\n"
         f"👤 یوزر: {panel['username']}\n"
         f"🌐 IP کانفیگ: {panel['config_ip']}\n"
-        f"🔗 لینک ساب: {panel['sub_url'] or '—'}\n\n"
+        f"🔗 لینک ساب: {panel['sub_url'] or '—'}\n"
+        f"🧩 نوع: {(panel['panel_type'] or 'xui') if 'panel_type' in panel.keys() else 'xui'}\n\n"
         f"برای تغییر هر مورد، دکمه‌اش را بزنید."
     )
 
@@ -628,6 +665,51 @@ async def load_order_service(order_id):
     if not row:
         return None, ""
     return row, order_email(row)
+
+
+async def _send_file_config(context, user_id, row, email, config_link):
+    """ارسال فایل کانفیگ OpenVPN/WireGuard (vpn-ui) برای یک سفارش.
+
+    فایل مستقیم از پنل دانلود و به‌صورت document به کاربر ارسال می‌شود.
+    خروجی: True اگر فایلی ارسال شد."""
+    kind, _transport, _name = parse_file_link(config_link)
+    try:
+        panel = await db.get_panel(row['panel_id'])
+        xui, _ip = build_xui(panel)
+        is_logged, _ = await xui.login()
+        if not is_logged:
+            return False
+        inbound_id = int(row['inbound_id'] or 0) or None
+        if not inbound_id:
+            inbound_id, _p, _c = await xui.get_client_exact_info(email)
+            if not inbound_id:
+                return False
+        creds = ''
+        if kind == 'openvpn':
+            # اکانت OpenVPN با یوزر (email) و پسورد RADIUS وارد می‌شود؛ پسورد از پنل خوانده می‌شود
+            _iid, _port, client = await xui.get_client_exact_info(email)
+            pwd = (client or {}).get('password') or ''
+            if pwd:
+                creds = f"\n🔐 یوزرنیم: `{email}`\n🔑 پسورد: `{pwd}`\n"
+        text, _filename, err = await xui.download_config(inbound_id, email, kind)
+        if not text:
+            logging.warning("download_config failed order=%s kind=%s: %s", row['id'], kind, err)
+            return False
+        label = 'OpenVPN' if kind == 'openvpn' else 'WireGuard'
+        ext = 'ovpn' if kind == 'openvpn' else 'conf'
+        caption = (
+            f"📁 کانفیگ {label} — سرویس: `{email}`\n"
+            + creds
+            + f"فایل را دانلود و در اپ ({'OpenVPN Connect' if kind == 'openvpn' else 'WireGuard'}) ایمپورت کنید.{SECURITY_WARNING}"
+        )
+        import io
+        doc = io.BytesIO(text.encode())
+        doc.name = f"{email}.{ext}"
+        await context.bot.send_document(chat_id=user_id, document=doc, caption=caption, parse_mode='Markdown')
+        return True
+    except Exception as ex:
+        logging.warning("_send_file_config failed order=%s: %s", row.get('id') if row else '?', ex)
+        return False
 
 
 async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_msg=None, forward=False):
@@ -810,6 +892,10 @@ async def render_order_details(query, order_id, alert_msg=None):
         [InlineKeyboardButton(auto_btn_text, callback_data=f'auto_renew_{order_id}')],
         [InlineKeyboardButton("🗑 حذف از لیست", callback_data=f'delorder_{order_id}'), InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_orders')],
     ]
+    if file_link_kind(row['config_link']):
+        # سرویس OpenVPN/WireGuard: UUID ندارد؛ متن دکمه‌ی دریافت هم فایلی می‌شود
+        kb[0] = [InlineKeyboardButton("تغییر وضعیت 🔄", callback_data=f'toggle_status_{order_id}')]
+        kb[2] = [InlineKeyboardButton("📥 دریافت فایل کانفیگ", callback_data=f'get_conf_{order_id}')]
     if portal_link:
         kb.insert(0, [InlineKeyboardButton("🌐 پورتال اشتراک", url=portal_link)])
     try:
@@ -947,12 +1033,22 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             config_link, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, cfg_ip, inbound=inbound)
             if not config_link:
                 return await update.message.reply_text(f"❌ ساخت اکانت تست ناموفق بود.\n{err}", reply_markup=await get_main_keyboard(user_id))
-            await add_order(user_id, config_link, opid, email=test_name, inbound_id=int(inbound_setting))
+            test_order_id = await add_order(user_id, config_link, opid, email=test_name, inbound_id=int(inbound_setting))
             if not admin_status:
                 await db.mark_test_used(user_id)
+            caption = f"🎁 اکانت تست شما ({test_gb}GB / {test_days} روز):\n\n`{config_link}`{SECURITY_WARNING}"
+            # سرویس فایلی (OpenVPN/WireGuard روی vpn-ui): به‌جای QR، فایل کانفیگ ارسال می‌شود
+            if file_link_kind(config_link):
+                sent = False
+                row0 = await db.get_order(test_order_id) if test_order_id else None
+                if row0:
+                    sent = await _send_file_config(context, user_id, row0, test_name, config_link)
+                if not sent:
+                    msg2 = f"🎁 اکانت تست شما ساخته شد ({test_gb}GB / {test_days} روز).\n\n📥 فایل کانفیگ را از «سفارشات من 📦» دریافت کنید."
+                    await update.message.reply_text(msg2, reply_markup=await get_main_keyboard(user_id))
+                return
             encoded_url = urllib.parse.quote(config_link)
             qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
-            caption = f"🎁 اکانت تست شما ({test_gb}GB / {test_days} روز):\n\n`{config_link}`{SECURITY_WARNING}"
             try:
                 await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown', reply_markup=await get_main_keyboard(user_id))
             except Exception:
@@ -988,8 +1084,14 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             if await get_setting('sales_status') == 'closed': return await update.message.reply_text("⛔️ فروش بسته است.")
             if not await _join_ok(context, user_id):
                 return await _send_join_prompt(update, (await get_setting('force_channel') or '').strip())
-            plans = await db.list_plans(only_active=True)
-            if not plans: return await update.message.reply_text("🛒 هنوز هیچ محصولی اضافه نشده است.")
+            # پنل‌های مجاز کاربر (ادمین همیشه همه را می‌بیند)
+            allowed = await get_user_allowed_panels(user_id)
+            if allowed is not None and not is_super_admin(user_id) and not await is_admin(user_id):
+                allowed = allowed or set()  # ثبت‌شده ولی خالی = هیچ پنلی مجاز نیست
+            else:
+                allowed = None
+            plans = await db.list_plans(only_active=True, allowed_panels=allowed)
+            if not plans: return await update.message.reply_text("🛒 هنوز هیچ محصولی برای شما موجود نیست.")
             quoted = await pricing.quote_plans(user_id, plans, KIND_BUY, admin=is_super_admin(user_id))
             # پلنِ بدونِ قیمت برای سطح کاربر (قیمت صفر/خالی) اصلاً نشان داده نمی‌شود
             kb = [
@@ -1247,11 +1349,28 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("🌐 آی‌پی یا دامنه‌ای که در لینک کانفیگ (sni/host) استفاده شود را وارد کنید:", reply_markup=CANCEL_MARKUP)
         elif step == 'ip':
             np['config_ip'] = text.strip()
+            context.user_data['state'] = 'panel_add_type'
+            await update.message.reply_text(
+                "🧩 نوع پنل را بفرستید:\n\n"
+                "• `1` یا `xui` → پنل 3X-UI\n"
+                "• `2` یا `vpn-ui` → پنل VPN-UI\n\n"
+                "(اگر مطمئن نیستید، `1` بفرستید)",
+                reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+        elif step == 'type':
+            from panel import PANEL_TYPE_XUI, PANEL_TYPE_VPNUI
+            raw = text.strip().lower()
+            if raw in ('1', 'xui', '3x-ui', '3xui', 'x-ui', '3x'):
+                ptype = PANEL_TYPE_XUI
+            elif raw in ('2', 'vpn-ui', 'vpnui', 'vpn_ui'):
+                ptype = PANEL_TYPE_VPNUI
+            else:
+                return await update.message.reply_text("❌ مقدار نامعتبر است. `1` برای 3x-UI یا `2` برای VPN-UI بفرستید:", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
+            np['panel_type'] = ptype
             context.user_data['state'] = 'panel_add_sub'
             await update.message.reply_text("🔗 لینک ساب (Subscription URL) را وارد کنید.\nاگر ندارید، `-` بفرستید.\nمثال: `https://domain.com:2096/sub`", reply_markup=CANCEL_MARKUP, parse_mode='Markdown')
         elif step == 'sub':
             sub_url = '' if text.strip() in ('-', '0', 'خیر', 'ندارد') else text.strip()
-            await db.add_panel(np['name'], np['url'], np['username'], np['password'], np['config_ip'], sub_url)
+            await db.add_panel(np['name'], np['url'], np['username'], np['password'], np['config_ip'], sub_url, np.get('panel_type', 'xui'))
             context.user_data['state'] = 'none'
             await update.message.reply_text(f"✅ پنل «{np['name']}» با موفقیت اضافه شد.", reply_markup=await get_main_keyboard(user_id))
         return
@@ -1413,6 +1532,18 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ================= ویرایش/انتقال پنل =================
+    if state == 'admin_waiting_user_panels_id' and admin_status:
+        if text.isdigit():
+            uid = int(text)
+            row = await db.get_user(uid)
+            await get_user(uid)  # ساخت ردیف در صورت نبود
+            context.user_data['state'] = 'none'
+            text, kb = await _user_panels_view(uid)
+            await update.message.reply_text(text, reply_markup=kb, parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ فقط عدد بفرستید.")
+        return
+
     if state == 'admin_waiting_edit_panel_id' and admin_status:
         if text.isdigit():
             p = await db.get_panel(int(text))
@@ -1796,6 +1927,46 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"مقدار جدید «{meta[1]}» را بفرستید:", reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
+    elif data.startswith('paninb_') and admin_status:
+        panel_id = data.split('_')[1]
+        p = await db.get_panel(int(panel_id))
+        if not p:
+            return await safe_answer(query, "❌ پنل یافت نشد.", alert=True)
+        await safe_answer(query)
+        wait = await query.message.reply_text("📡 در حال دریافت اینباندها از پنل... ⏳")
+        xui, _cfg = build_xui(p)
+        ok, _err = await xui.login()
+        inbounds = await xui.get_inbounds() if ok else None
+        if not ok:
+            text = "❌ اتصال به پنل برقرار نشد؛ URL/یوزر/پس پنل را در ویرایش چک کنید."
+        elif not inbounds:
+            text = "❌ لیست اینباندها دریافت نشد (پنل پاسخ نداد یا خطا داد)."
+        else:
+            lines = []
+            for ib in inbounds:
+                try:
+                    lines.append(f"🆔 ID: `{ib.get('id')}` | پورت {ib.get('port')} | {ib.get('protocol')} | {ib.get('remark')}")
+                except Exception:
+                    continue
+            body = "\n".join(lines) or "—"
+            text = f"📡 **اینباندهای پنل «{p['name']}»**\n\n{body}\n\nاین ID را در فیلد اینباندِ پلن (یا اکانت تست) وارد کنید."
+            if len(text) > 4000:  # محدودیت 4096 کاراکتر تلگرام
+                text = f"📡 **اینباندهای پنل «{p['name']}»** ({len(lines)} عدد)\n\n" + "\n".join(lines[:400]) + f"\n\n… و {len(lines) - 400} مورد دیگر"
+        try:
+            await wait.edit_text(text, parse_mode='Markdown')
+        except Exception:
+            # اگر Markdown مشکل داشت یا پیام عوض شده بود، متن ساده فرستاده می‌شود
+            plain = text.replace('**', '').replace('`', '')
+            try:
+                await wait.edit_text(plain)
+            except Exception:
+                await query.message.reply_text(plain)
+
+    elif data == 'userpn_all' and admin_status:
+        target_uid = int(data.split('_')[2])
+        await db.set_user_allowed_panels(target_uid, None)  # خالی = همه‌ی پنل‌ها
+        await _render_user_panels(query, target_uid)
+
     elif data == 'admin_add_panel' and admin_status:
         context.user_data['new_panel'] = {}
         context.user_data['state'] = 'panel_add_name'
@@ -2157,6 +2328,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🔢 برای افزودن VIP، آیدی عددی و یک نام دلخواه را با فاصله بفرستید:\n\nمثال: `123456789 علی`", parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
+    elif data == 'admin_user_panels' and admin_status:
+        context.user_data['state'] = 'admin_waiting_user_panels_id'
+        await query.message.reply_text(
+            "🖥 **پنل‌های مجاز کاربر**\n\nآیدی عددی کاربر (VIP/نماینده/عادی) را بفرستید تا تنظیم کنید که از کدام پنل(ها) خرید کند.\n\nمثال: `123456789`",
+            parse_mode='Markdown', reply_markup=CANCEL_MARKUP,
+        )
+        await query.delete_message()
+
+    elif data.startswith('userpn_') and admin_status:
+        # تاگل مجوز یک پنل برای کاربر هدف (چک‌باکس)
+        _prefix, target_uid, panel_id = data.split('_')[1], data.split('_')[2], data.split('_')[3]
+        target_uid, panel_id = int(target_uid), int(panel_id)
+        current = await db.get_user_allowed_panels(target_uid)
+        panels = await db.get_panels()
+        if current is None:
+            current = {p['id'] for p in panels}  # «همه» → تبدیل به مجموعه‌ی صریح برای تاگل
+        current = (current or set())
+        if panel_id in current:
+            current.discard(panel_id)
+        else:
+            current.add(panel_id)
+        await db.set_user_allowed_panels(target_uid, current)
+        await _render_user_panels(query, target_uid)
+
     elif data == 'admin_rem_vip' and admin_status:
         context.user_data['state'] = 'admin_waiting_rem_vip'
         await query.message.reply_text("آیدی حذف VIP:", reply_markup=CANCEL_MARKUP)
@@ -2206,6 +2401,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("change_uuid_"):
         order_id = data.split("_")[2]
         if not await ensure_order_access(query, order_id, admin_status): return
+        row, _email = await load_order_service(order_id)
+        panel = await db.get_panel(row['panel_id']) if row else None
+        if is_vpnui_panel(panel) and file_link_kind(row['config_link'] if row else ''):
+            return await safe_answer(query, "⛔️ این سرویس OpenVPN/WireGuard است و UUID ندارد.", alert=True)
         found = await fetch_client_for_order(query, order_id)
         if not found: return
         xui, cfg_ip, inbound_id, client_dict = found
@@ -2444,6 +2643,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row:
             config_link = row['config_link']
             panel = await db.get_panel(row['panel_id'])
+            # سرویس‌های OpenVPN/WireGuard (vpn-ui): فایل کانفیگ مستقیم از پنل دانلود می‌شود
+            if file_link_kind(config_link):
+                if not await _send_file_config(context, user_id, row, email, config_link):
+                    await context.bot.send_message(
+                        user_id,
+                        "❌ دریافت فایل کانفیگ از پنل ناموفق بود. لطفاً به پشتیبانی اطلاع دهید.")
+                return
             sub = sub_link_for(panel, email)
             # اگر پنل لینک ساب داشته باشد، آن را به‌عنوان لینک اصلی (که با تغییر UUID خراب نمی‌شود) می‌دهیم
             primary = sub or config_link
@@ -2480,6 +2686,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # منویی که قبل از بستن فروش باز مانده نباید همچنان خرید انجام دهد
         if await get_setting('sales_status') == 'closed':
             return await query.edit_message_text("⛔️ فروش در حال حاضر بسته است.")
+
+        # گارد مجوز پنل: پیام قدیمی نباید دورِ فیلتر منو را بزند
+        allowed = await get_user_allowed_panels(user_id)
+        if allowed is not None and not is_super_admin(user_id) and not await is_admin(user_id):
+            if plan['panel_id'] is None or int(plan['panel_id']) not in (allowed or set()):
+                return await query.edit_message_text("⛔️ این محصول برای شما در دسترس نیست.")
 
         # همان قیمتی که در صفحه‌ی تایید نشان داده شد ملاک است
         quote = recall_quote(context, plan_id, KIND_BUY) or await pricing.quote_for_user(user_id, plan, KIND_BUY, admin=is_super_admin(user_id))
@@ -2541,15 +2753,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if quote.has_discount:
                     caption += f"\n\n🎁 تخفیف اعمال‌شده: {quote.discount:,} تومان"
                 caption += SECURITY_WARNING
-                encoded_url = urllib.parse.quote(primary)
-                qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
-                try:
-                    await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown')
-                    await query.delete_message()
-                except Exception:
-                    await query.edit_message_text(caption, parse_mode='Markdown')
+                # سرویس‌های فایلی (OpenVPN/WireGuard روی vpn-ui): QR بی‌معناست؛ فایل ارسال می‌شود
+                if file_link_kind(config_link):
+                    row0 = await db.get_order(order_id)
+                    email0 = final_name
+                    sent = False
+                    if row0:
+                        sent = await _send_file_config(context, user_id, row0, email0, config_link)
+                    if not sent:
+                        cap2 = "✅ خرید موفق! سرویس شما ساخته شد.\n\n📥 فایل کانفیگ را از «سفارشات من 📦 → دریافت کانفیگ» دریافت کنید."
+                        await query.edit_message_text(cap2)
+                else:
+                    encoded_url = urllib.parse.quote(primary)
+                    qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
+                    try:
+                        await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown')
+                        await query.delete_message()
+                    except Exception:
+                        await query.edit_message_text(caption, parse_mode='Markdown')
 
-                # پورتال اشتراک: پیام جداگانه با لینک پورتال و اشتراک خام (additive)
+                # پورتال اشتراک: پیام جداگانه با لینک پورتال (برای سرویس فایلی فقط پورتال)
                 try:
                     sub_token = await db.ensure_sub_token(order_id)
                     sub_link = subportal.raw_url(sub_token) if sub_token else None
@@ -2558,15 +2781,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         kb = []
                         if portal_link:
                             kb.append([InlineKeyboardButton("🌐 پورتال اشتراک", url=portal_link)])
-                        portal_text = (
-                            "✅ سرویس شما با موفقیت ساخته شد.\n\n"
-                            f"👤 نام سرویس: `{final_name}`\n"
-                            f"🛍 پلن: {plan['name']} ({plan['gb']}GB / {plan['duration_days'] or 30} روز)\n\n"
-                            "🌐 پورتال اشتراک (وضعیت زنده، مصرف، انقضا):\n"
-                            f"`{portal_link}`\n\n"
-                            "🔗 لینک اشتراک (در کلاینت اضافه کنید):\n"
-                            f"`{sub_link}`"
-                        )
+                        if file_link_kind(config_link):
+                            # OpenVPN/WireGuard: لینک اشتراک خام معنا ندارد؛ فقط پورتال
+                            portal_text = (
+                                "✅ سرویس شما با موفقیت ساخته شد.\n\n"
+                                f"👤 نام سرویس: `{final_name}`\n"
+                                f"🛍 پلن: {plan['name']} ({plan['gb']}GB / {plan['duration_days'] or 30} روز)\n\n"
+                                "🌐 پورتال سرویس (وضعیت زنده، مصرف، انقضا):\n"
+                                f"`{portal_link}`\n\n"
+                                "📥 فایل کانفیگ از «سفارشات من 📦 → دریافت کانفیگ» ارسال می‌شود."
+                            )
+                        else:
+                            portal_text = (
+                                "✅ سرویس شما با موفقیت ساخته شد.\n\n"
+                                f"👤 نام سرویس: `{final_name}`\n"
+                                f"🛍 پلن: {plan['name']} ({plan['gb']}GB / {plan['duration_days'] or 30} روز)\n\n"
+                                "🌐 پورتال اشتراک (وضعیت زنده، مصرف، انقضا):\n"
+                                f"`{portal_link}`\n\n"
+                                "🔗 لینک اشتراک (در کلاینت اضافه کنید):\n"
+                                f"`{sub_link}`"
+                            )
                         await context.bot.send_message(
                             user_id, portal_text,
                             reply_markup=InlineKeyboardMarkup(kb) if kb else None,

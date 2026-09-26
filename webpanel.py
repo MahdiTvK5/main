@@ -1341,6 +1341,14 @@ async def user_view(request):
             "<dt>شارژ ۳۰ روز اخیر</dt><dd>" + num(money(profile.get('monthly_topup'))) + " تومان</dd>"
             "<dt>هدیه‌ی اولین شارژ</dt><dd>" + ('مصرف شده' if profile.get('reseller_bonus_used') else 'استفاده نشده') + "</dd>"
         )
+    # پنل‌های مجاز کاربر (خالی = همه‌ی پنل‌ها)
+    allowed_ids = await db.get_user_allowed_panels(int(uid))
+    panels_list = await db.get_panels()
+    if allowed_ids is None:
+        panels_txt = "همه‌ی پنل‌ها (بدون محدودیت)"
+    else:
+        names = [p['name'] for p in panels_list if p['id'] in allowed_ids]
+        panels_txt = ("، ".join(names) if names else "⛔️ هیچ پنلی (خرید نمی‌تواند)")
     first_offer = 'مصرف شده' if profile.get('first_offer_used') else 'در دسترس'
     referrer = (f"<a href=\"/users/view?id={e(u['referred_by'])}\">{num(u['referred_by'])}</a>") if u['referred_by'] else '—'
     ref_extra = (f" | پاداش دعوت: {'پرداخت شده' if u['ref_rewarded'] else 'در انتظار'}") if u['referred_by'] else ''
@@ -1352,6 +1360,7 @@ async def user_view(request):
         "<dt>وضعیت دسترسی</dt><dd>" + ("<span class='badge b-red'>بن‌شده 🚫</span>" if u.get('is_banned') else "<span class='badge b-green'>عادی</span>") + "</dd>"
         "<dt>موجودی</dt><dd>" + num(money(u['balance'])) + " تومان</dd>"
         "<dt>اکانت تست گرفته</dt><dd>" + ('بله' if u['got_test'] else 'خیر') + "</dd>"
+        "<dt>پنل‌های مجاز خرید</dt><dd>" + e(panels_txt) + "</dd>"
         "<dt>آفر خرید اول</dt><dd>" + e(first_offer) + "</dd>"
         "<dt>تعداد سفارش‌ها</dt><dd>" + str(len(orders)) + "</dd>"
         + reseller_box +
@@ -1404,6 +1413,20 @@ async def user_edit_form(request):
     nick_v = e(u['nickname']) if u else ""
     bal_v = e(u['balance']) if u else "0"
     role_v = u['role'] if u else "normal"
+    # چک‌باکس پنل‌های مجاز کاربر (وقتی هیچ‌کدام تیک نخورد یعنی همه‌ی پنل‌ها)
+    panels_list = await db.get_panels()
+    allowed_ids = (await db.get_user_allowed_panels(int(uid))) if not is_new else None
+    if allowed_ids is None:
+        allowed_ids = {p['id'] for p in panels_list}
+    panel_checks = ""
+    if panels_list:
+        checks = ""
+        for p in panels_list:
+            checked = " checked" if p['id'] in allowed_ids else ""
+            checks += (f"<label style='display:inline-flex;align-items:center;gap:6px;margin-inline-end:14px'>"
+                       f"<input type='checkbox' name='panel_ids' value='{e(p['id'])}'{checked}> {e(p['name'])}</label>")
+        panel_checks = ("<div class='field'><label>پنل‌های مجاز خرید</label><div>" + checks + "</div>"
+                        "<div class='hint'>هیچ‌کدام تیک نخورد = همه‌ی پنل‌ها (بدون محدودیت؛ پنل‌های جدید هم خودکار شامل می‌شوند).</div></div>")
     uid_field = ((f"<input value='{uid_v}' disabled><input type='hidden' name='user_id' value='{uid_v}'>")
                  if not is_new else "<input name='user_id' placeholder='آیدی عددی تلگرام' class='ltr' required>")
     body = (
@@ -1420,6 +1443,7 @@ async def user_edit_form(request):
         "<div class='field'><label>نقش</label>"
         f"<select name='role'>{_role_options(role_v)}</select>"
         "<div class='hint'>هر نقش قیمت ستون خودش را می‌بیند؛ نماینده علاوه بر آن پله‌ی تخفیف می‌گیرد.</div></div>",
+        panel_checks,
         "</div>",
         "<div class='form-foot'><button type='submit'>" + _use('check') + " ذخیره</button>"
         "<a href='/users' class='btn btn-ghost'>انصراف</a></div>",
@@ -1439,7 +1463,14 @@ async def user_save(request):
     nickname = (data.get("nickname") or "").strip() or None
     role = _valid_role(data.get("role"))
     await db.save_user(uid, nickname, role, balance)
-    logging.info("WEB_USER_SAVE user=%s role=%s balance=%s", uid, role, balance)
+    # پنل‌های مجاز: چک‌باکس تیک‌خورده → همان‌ها؛ هیچ‌کدام → همه‌ی پنل‌ها (بدون محدودیت)
+    raw_ids = data.getall("panel_ids", []) if hasattr(data, "getall") else []
+    try:
+        chosen = {int(x) for x in raw_ids if str(x).strip().isdigit()}
+    except (TypeError, ValueError):
+        chosen = set()
+    await db.set_user_allowed_panels(uid, chosen or None)
+    logging.info("WEB_USER_SAVE user=%s role=%s balance=%s allowed_panels=%s", uid, role, balance, sorted(chosen) if chosen else 'ALL')
     raise _redirect("/users", ok="کاربر ذخیره شد")
 
 
@@ -1658,6 +1689,9 @@ async def plan_edit_form(request):
     for pr in panels:
         sel = "selected" if pr['id'] == cur_panel else ""
         options += f"<option value='{e(pr['id'])}' {sel}>{e(pr['id'])} - {e(pr['name'])}</option>"
+
+    from panel import normalize_panel_type
+    cur_type = normalize_panel_type((p['panel_type'] if p and 'panel_type' in p.keys() else '') or '')
 
     hidden_id = "" if is_new else f"<input type='hidden' name='id' value='{e(pid)}'>"
 
@@ -2050,9 +2084,11 @@ async def panels_page(request):
     panels = await db.get_panels()
     rows = ""
     for p in panels:
+        ptype = (p['panel_type'] or 'xui') if 'panel_type' in p.keys() else 'xui'
         rows += (
             f"<tr><td>{num(p['id'])}</td><td class='wrap'><b>{e(p['name'])}</b></td>"
             f"<td class='wrap'>{num(p['url'])} {_copy_btn(p['url'] or '')}</td>"
+            f"<td class='muted'>{'VPN-UI' if ptype == 'vpn-ui' else '3X-UI'}</td>"
             f"<td>{num(p['config_ip'])}</td><td class='muted'>{e(p['sub_url'] or '—')}</td>"
             f"<td class='col-actions'><div class='actions'>"
             f"<a href='/panels/edit?id={e(p['id'])}'><button class='btn-ghost btn-sm' title='ویرایش'>{_use('edit')}</button></a>"
@@ -2060,7 +2096,7 @@ async def panels_page(request):
             f"<input type='hidden' name='id' value='{e(p['id'])}'><button class='btn-danger btn-sm'>{_use('trash')}</button></form>"
             f"</div></td></tr>"
         )
-    table = (f"<table data-enhance><thead><tr><th>#</th><th>نام</th><th>URL</th><th>IP کانفیگ</th><th>Sub</th>"
+    table = (f"<table data-enhance><thead><tr><th>#</th><th>نام</th><th>URL</th><th>نوع</th><th>IP کانفیگ</th><th>Sub</th>"
              f"<th class='col-actions'>عملیات</th></tr></thead><tbody>{rows}</tbody></table>"
              if rows else _empty('هنوز سروری اضافه نشده', 'برای فروش، ابتدا یک پنل (سرور) ثبت کنید.', 'server'))
     body = (
@@ -2079,6 +2115,9 @@ async def panel_edit_form(request):
     is_new = p is None
     title = "افزودن پنل" if is_new else f"ویرایش پنل {pid}"
 
+    from panel import normalize_panel_type
+    cur_type = normalize_panel_type((p['panel_type'] if p and 'panel_type' in p.keys() else '') or '')
+
     def val(key):
         return e(p[key]) if p else ""
 
@@ -2095,6 +2134,10 @@ async def panel_edit_form(request):
         "<input type='password' name='password' class='ltr'" + ('' if is_new else " placeholder='••••••••'") + "></div>"
         "<div class='field'><label>IP کانفیگ (sni/host)</label><input name='config_ip' value='" + val('config_ip') + "' class='ltr'></div>"
         "<div class='field'><label>لینک ساب (اختیاری)</label><input name='sub_url' value='" + val('sub_url') + "' class='ltr'></div>"
+        "<div class='field'><label>نوع پنل</label><select name='panel_type'>"
+        f"<option value='xui' {'selected' if cur_type == 'xui' else ''}>3X-UI</option>"
+        f"<option value='vpn-ui' {'selected' if cur_type == 'vpn-ui' else ''}>VPN-UI</option>"
+        "</select><div class='hint'>پنل vpn-ui همان 3x-ui است با API کمی متفاوت؛ اگر مطمئن نیستید 3X-UI بگذارید.</div></div>"
         "</div>"
         "<div class='form-foot'><button type='submit'>" + _use('check') + " ذخیره</button>"
         "<a href='/panels' class='btn btn-ghost'>انصراف</a></div>"
@@ -2112,6 +2155,8 @@ async def panel_save(request):
     password = (data.get("password") or "").strip()
     config_ip = (data.get("config_ip") or "").strip()
     sub_url = (data.get("sub_url") or "").strip()
+    from panel import normalize_panel_type
+    panel_type = normalize_panel_type(data.get("panel_type") or "")
     if not (name and url):
         raise _redirect("/panels", err="نام و URL الزامی است")
     pid = data.get("id")
@@ -2120,9 +2165,9 @@ async def panel_save(request):
         if not password:
             current = await db.get_panel(int(pid))
             password = current['password'] if current else ""
-        await db.update_panel(int(pid), name, url, username, password, config_ip, sub_url)
+        await db.update_panel(int(pid), name, url, username, password, config_ip, sub_url, panel_type)
     else:
-        await db.add_panel(name, url, username, password, config_ip, sub_url)
+        await db.add_panel(name, url, username, password, config_ip, sub_url, panel_type)
     logging.info("WEB_PANEL_SAVE name=%s", name)
     raise _redirect("/panels", ok="پنل ذخیره شد")
 

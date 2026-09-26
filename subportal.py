@@ -24,7 +24,7 @@ from urllib.parse import quote
 import db
 from config import PORTAL_PUBLIC_URL, format_size
 from links import order_email
-from panel import _stream_params, build_share_link, build_xui
+from panel import _stream_params, build_share_link, build_xui, file_link_kind
 
 log = logging.getLogger("subportal")
 
@@ -582,12 +582,21 @@ def render_portal(sub):
     remain_pill = 'warn' if st_key == 'expired' else ''
     pill = f"<span class='pill {remain_pill}'>{esc(ex['remain_text'])}</span>"
 
-    spec = (
-        _spec_cell('پروتکل', det['protocol'])
-        + _spec_cell('ترنسپورت', det['transport'])
-        + _spec_cell('امنیت', det['security'])
-        + _spec_cell('پورت', str(sub['port']) if sub.get('port') else '—')
-    )
+    fkind = sub.get('file_kind')
+    if fkind:
+        # سرویس فایلی (OpenVPN/WireGuard): مشخصات پروتکلی معمولی ندارد
+        spec = (
+            _spec_cell('پروتکل', 'OpenVPN' if fkind == 'openvpn' else 'WireGuard')
+            + _spec_cell('نوع کانفیگ', 'فایل')
+            + _spec_cell('دریافت', 'از داخل ربات')
+        )
+    else:
+        spec = (
+            _spec_cell('پروتکل', det['protocol'])
+            + _spec_cell('ترنسپورت', det['transport'])
+            + _spec_cell('امنیت', det['security'])
+            + _spec_cell('پورت', str(sub['port']) if sub.get('port') else '—')
+        )
 
     # ---------- اتصال سریع ----------
     tabs, panes = [], []
@@ -629,7 +638,7 @@ def render_portal(sub):
     )
 
     direct = ''
-    if sub.get('config_link'):
+    if sub.get('config_link') and not sub.get('file_kind'):
         direct = (
             "<details class='card glass direct'><summary>⚙️ کانفیگ مستقیم (VLESS / VMess / Trojan)</summary>"
             "<div class='subbox mono-full'><code>" + esc(sub['config_link']) + "</code>"
@@ -637,6 +646,33 @@ def render_portal(sub):
             "</div></details>"
         )
 
+    # سرویس فایلی (OpenVPN/WireGuard): بدون اتصال سریع/QR/اشتراک؛
+    # کارت راهنمای دریافت فایل از ربات جای آن‌ها می‌نشیند.
+    file_guide = ''
+    if fkind:
+        app_name = 'OpenVPN Connect' if fkind == 'openvpn' else 'WireGuard'
+        file_guide = (
+            "<section class='card glass'><h2>📥 دریافت کانفیگ</h2>"
+            f"<p style='font-size:13.5px;color:var(--mut);line-height:2'>این سرویس از نوع "
+            f"<b style='color:var(--txt)'>{'OpenVPN' if fkind == 'openvpn' else 'WireGuard'}</b> است؛ "
+            "فایل کانفیگ را از ربات (سفارشات من → دریافت کانفیگ) دانلود کنید و در اپ "
+            f"<b style='color:var(--txt)'>{app_name}</b> ایمپورت کنید.</p></section>"
+        )
+        qc = ''
+        sub_section = ''
+    else:
+        qc = (
+            "<section class='card glass qc'><h2>⚡️ اتصال سریع</h2>"
+            f"{tab_bar}{''.join(panes)}</section>"
+        )
+        sub_section = (
+            "<section class='card glass'><h2>🔗 اشتراک</h2>"
+            "<div class='subbox'><code id=\"sub-url\">" + esc(raw) + "</code>"
+            f"<button class='btn' data-copy='{esc(raw)}' onclick='owCopy(this)'>کپی</button></div>"
+            f"<div class='qrbox'><img src='{esc(qr)}' alt='QR اشتراک' loading='lazy'>"
+            "<span>اسکن کنید تا متصل شوید</span></div>"
+            "</section>"
+        )
     doc = f"""<!doctype html><html lang="fa" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
@@ -663,12 +699,8 @@ def render_portal(sub):
 <div class="sub">تاریخ پایان سرویس</div>
 </div>{pill}</div></section>
 <section class="card glass"><h2>🧩 مشخصات سرویس</h2><div class="spec">{spec}</div></section>
-{qc}
-<section class="card glass"><h2>🔗 اشتراک</h2>
-<div class="subbox"><code id="sub-url">{esc(raw)}</code>
-<button class="btn" data-copy="{esc(raw)}" onclick="owCopy(this)">کپی</button></div>
-<div class="qrbox"><img src="{esc(qr)}" alt="QR اشتراک" loading="lazy"><span>اسکن کنید تا متصل شوید</span></div>
-</section>
+{file_guide}{qc}
+{sub_section}
 {direct}
 <footer>سرویس‌دهی توسط <b>{BRAND}</b> • پورتال اشتراک</footer>
 </div>
@@ -758,7 +790,13 @@ async def load_subscription(token):
         log.exception("خطا در بارگذاری اشتراک token=%s", token[:8])
         return {'error': 'panel', 'token': token}
 
-    links = [build_share_link(inbound, client, cfg_ip)]
+    # OpenVPN/WireGuard (vpn-ui): فایل کانفیگ مستقیم از پنل دانلود می‌شود؛
+    # لینک اشتراک/Clash برای این پروتکل‌ها معنا ندارد و یک لیست خالی برمی‌گردد.
+    fkind = file_link_kind(order['config_link'])
+    if fkind:
+        links = []
+    else:
+        links = [build_share_link(inbound, client, cfg_ip)]
     plan_name = None
     if order['plan_id']:
         try:
@@ -781,6 +819,7 @@ async def load_subscription(token):
         'plan': plan_name,
         'panel_name': panel['name'] if panel else None,
         'config_link': order['config_link'],
+        'file_kind': fkind,
         'links': links,
         'server': cfg_ip,
         'port': port,
@@ -835,6 +874,8 @@ async def raw_subscription(request):
         return web.Response(status=404, text='not found')
     if sub.get('error'):
         return web.Response(status=503, text='temporarily unavailable')
+    if sub.get('file_kind'):
+        return web.Response(status=404, text='file-based service: get config from the bot')
     headers = {'Cache-Control': 'no-store'}
     headers.update(subscription_headers(sub['name'], sub['traffic'], sub['expiry']['ms']))
     purl = portal_url(sub['token'])
@@ -854,6 +895,8 @@ async def clash_subscription(request):
         return web.Response(status=404, text='not found')
     if sub.get('error'):
         return web.Response(status=503, text='temporarily unavailable')
+    if sub.get('file_kind'):
+        return web.Response(status=404, text='file-based service: get config from the bot')
     full = await _load_full(sub['token'])
     if not full:
         return web.Response(status=503, text='temporarily unavailable')

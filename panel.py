@@ -23,6 +23,68 @@ def _host_from_url(url):
         return ""
 
 
+# انواع پنل پشتیبانی‌شده. مقادیر ورودی آزاد (مثل «3x-ui» یا «VPN-UI») نرمال می‌شوند.
+PANEL_TYPE_XUI = "xui"
+PANEL_TYPE_VPNUI = "vpn-ui"
+
+_PANEL_TYPE_ALIASES = {
+    "xui": PANEL_TYPE_XUI,
+    "3x": PANEL_TYPE_XUI,
+    "3x-ui": PANEL_TYPE_XUI,
+    "3xui": PANEL_TYPE_XUI,
+    "x-ui": PANEL_TYPE_XUI,
+    "سنایی": PANEL_TYPE_XUI,
+    "vpn-ui": PANEL_TYPE_VPNUI,
+    "vpnui": PANEL_TYPE_VPNUI,
+    "vpn_ui": PANEL_TYPE_VPNUI,
+}
+
+
+def normalize_panel_type(value):
+    """نوع پنل ورودی (از دیتابیس/فرم) را به کلید ثابت تبدیل می‌کند.
+    خالی/نامعتبر → xui (رفتار قدیمی به‌عنوان پیش‌فرض)."""
+    return _PANEL_TYPE_ALIASES.get((value or "").strip().lower(), PANEL_TYPE_XUI)
+
+
+def is_vpnui_panel(panel):
+    """آیا این ردیف پنل از نوع vpn-ui است؟ (None → نه)"""
+    if panel is None:
+        return False
+    try:
+        return normalize_panel_type(panel.get('panel_type')) == PANEL_TYPE_VPNUI
+    except Exception:
+        return False
+
+
+def file_link_kind(link):
+    """نوع «لینک نشانگرِ فایل» را برمی‌گرداند: openvpn / wireguard / '' (لینک معمولی).
+
+    اینباندهای OpenVPN/WireGuard در vpn-ui فایل کانفیگ می‌دهند نه URI؛ پس ربات در
+    config_link سفارش یک نشانگر ذخیره می‌کند (ovpn://udp/name یا wg://name) و فایل
+    واقعی هنگام «دریافت کانفیگ» از پنل دانلود می‌شود."""
+    if not link:
+        return ""
+    s = str(link).strip()
+    if s.startswith("ovpn://"):
+        return "openvpn"
+    if s.startswith("wg://"):
+        return "wireguard"
+    return ""
+
+
+def parse_file_link(link):
+    """ovpn://udp/name یا wg://name را باز می‌کند: (نوع، ترنسپورت، نام سرویس)."""
+    kind = file_link_kind(link)
+    if not kind:
+        return "", "", ""
+    s = str(link).strip()
+    if kind == "openvpn":
+        rest = s[len("ovpn://"):]
+        transport, _, name = rest.partition('/')
+        return kind, (transport or 'udp'), name
+    return kind, "udp", s[len("wg://"):]
+
+
 def build_xui(panel):
     """از روی ردیف پنل، کلاینت X-UI و config_ip مربوطه را می‌سازد.
     اگر panel برابر None باشد، به مقادیر پیش‌فرضِ .env برمی‌گردد (سازگاری با نسخه‌ی تک‌پنل).
@@ -31,9 +93,16 @@ def build_xui(panel):
     if panel:
         panel_url = panel['url']
         cfg_ip = (panel['config_ip'] or CONFIG_IP or _host_from_url(panel_url))
-        return AsyncXuiAPI(panel_url, panel['username'], panel['password']), cfg_ip
+        if normalize_panel_type(panel.get('panel_type')) == PANEL_TYPE_VPNUI:
+            api = AsyncVpnUiAPI(panel_url, panel['username'], panel['password'])
+        else:
+            api = AsyncXuiAPI(panel_url, panel['username'], panel['password'])
+        api._config_host = cfg_ip or ''
+        return api, cfg_ip
     cfg_ip = CONFIG_IP or _host_from_url(PANEL_URL)
-    return AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS), cfg_ip
+    api = AsyncXuiAPI(PANEL_URL, PANEL_USER, PANEL_PASS)
+    api._config_host = cfg_ip or ''
+    return api, cfg_ip
 
 
 def build_vless_link(client_uuid, host, port, remark, path="/", sni=None):
@@ -192,6 +261,8 @@ class AsyncXuiAPI:
         self.username = username
         self.password = password
         self.cookies = None
+        # IP کانفیگ (دامنه/آی‌پی داخل لینک‌ها و فایل‌ها)؛ در build_xui ست می‌شود
+        self._config_host = ''
         # لیست اینباندها در طول یک عملیات ثابت است؛ کش می‌کنیم تا هر متد
         # درخواست تکراری به پنل نفرستد (هر نمونه فقط برای یک عملیات ساخته می‌شود).
         self._inbounds_cache = None
@@ -250,6 +321,11 @@ class AsyncXuiAPI:
 
     def _invalidate_cache(self):
         self._inbounds_cache = None
+
+    async def get_inbounds(self):
+        """لیست کامل اینباندها (شامل id, port, protocol, remark) یا None در صورت خطا.
+        برای ادمین تا آیدی اینباندها را بدون devtools ببیند."""
+        return await self._fetch_inbounds()
 
     async def get_inbound_port(self, inbound_id):
         inbound = await self.get_inbound(inbound_id)
@@ -431,3 +507,261 @@ class AsyncXuiAPI:
             except Exception as e:
                 logging.warning("reset_client_traffic failed: %s", e)
         return False
+
+
+# ================= پنل vpn-ui (نسخه‌ی ارتقایافته‌ی 3x-ui) =================
+class AsyncVpnUiAPI(AsyncXuiAPI):
+    """کلاینت پنل vpn-ui (Sir-MmD/vpn-ui) — فورک ارتقایافته‌ی 3x-ui 2.9.3.
+
+    تفاوت‌های اصلی با 3x-ui که این کلاس مدیریت می‌کند:
+    • همه‌ی هندلرها با c.PostForm بایند می‌شوند → بدنه باید application/x-www-form-urlencoded
+      باشد نه JSON (وگرنه پنل HTTP 200 با success:false می‌دهد!).
+    • updateClient/:clientId کلاینتِ کامل را می‌خواهد؛ فرستادنِ فقط فیلدهای تغییر
+      یافته، بقیه‌ی فیلدها (UUID، حجم، انقضا) را صفر می‌کند. کلاینتِ فعلی خوانده و
+      تغییرات روی آن اعمال (overlay) می‌شود.
+    • clientId برای vless/vmess/tuic همان UUID و برای اکثر پروتکل‌های تونلی
+      (trojan/ssh/mtproto/wg-c/awg/gre/...) همان email است.
+    • پاسخ‌ها همان پاکت {success, msg, obj} و مسیرها همان /panel/api/... هستند؛
+    • بقیه‌ی متدها (login، getClientTraffics، resetClientTraffic، addClient،
+      delClient و list) با 3x-ui یکسان‌اند و از کلاس پایه به ارث می‌رسند.
+    """
+
+    _IDENTITY_PASSWORD = ("trojan", "l2tp", "pptp", "openvpn", "openconnect", "sstp",
+                          "ikev2", "anytls", "naive")
+
+    @staticmethod
+    def _client_identity(protocol, client):
+        """فیلدی که کلاینت با آن آدرس‌دهی می‌شود (قرینه‌ی clientIdentityKey پنل)."""
+        if protocol in AsyncVpnUiAPI._IDENTITY_PASSWORD:
+            return client.get("password", "") or ""
+        if protocol == "shadowsocks":
+            return client.get("email", "") or ""
+        if protocol in ("hysteria", "hysteria2"):
+            return client.get("auth", "") or ""
+        # vmess/vless/tuic (uuid) و پروتکل‌های email-محور (wg-c، awg، gre، mtproto، ssh)
+        # که در settings شناسه‌شان id=email است.
+        return client.get("id", "") or client.get("email", "") or ""
+
+    async def update_client(self, inbound_id, old_key, client_dict):
+        """به‌روزرسانی کلاینت به سبک vpn-ui — امضای سازگار با 3x-ui (خروجی bool).
+
+        جزئیات و خطا در _update_client_full است؛ call-site های ربات مثل کلاس پایه
+        فقط True/False انتظار دارند."""
+        ok, err = await self._update_client_full(inbound_id, old_key, client_dict)
+        if not ok:
+            logging.warning("vpn-ui update_client failed: %s", err)
+        return ok
+
+    async def _update_client_full(self, inbound_id, old_key, client_dict):
+        """به‌روزرسانی کلاینت — به سبک vpn-ui.
+
+        old_key در api این ربات همان email/identifier است؛ کلاینتِ کامل از اینباند
+        خوانده و تغییراتِ client_dict روی آن اعمال (overlay) می‌شود تا هیچ فیلدی صفر نشود.
+        بدنه form-encoded است و clientId از خودِ کلاینتِ کامل استخراج می‌شود.
+        خروجی: (موفقیت، خطا)."""
+        inbound = await self.get_inbound(inbound_id)
+        if not inbound:
+            return False, f"اینباند با آیدی {inbound_id} یافت نشد"
+        stored = None
+        try:
+            settings = json.loads(inbound.get('settings') or '{}')
+            stored = next((c for c in (settings.get('clients') or [])
+                           if str(c.get('email', '')).strip().lower() == str(old_key).strip().lower()), None)
+        except Exception:
+            stored = None
+        if not stored:
+            # اگر کلاینت روی پنل نبود، همان دیکشنری داده‌شده را کامل می‌پذیریم
+            stored = client_dict
+        else:
+            merged = dict(stored)
+            merged.update(client_dict)
+            stored = merged
+        proto = (inbound.get('protocol') or 'vless').lower()
+        payload = {
+            "id": str(inbound_id),
+            "remark": inbound.get('remark', ''),
+            "enable": "true",
+            "listen": inbound.get('listen', '') or '',
+            "protocol": proto,
+            "port": str(inbound.get('port', 0)),
+            "settings": json.dumps({"clients": [stored]}),
+            "streamSettings": "{}",
+            "sniffing": "{}",
+        }
+        client_id = self._client_identity(proto, stored)
+        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as c:
+            try:
+                res = await c.post(
+                    f"{self.url}/panel/api/inbounds/updateClient/{quote(str(client_id), safe='')}",
+                    data=payload, headers={'Accept': 'application/json'},
+                )
+                data = res.json()
+                if res.status_code == 200 and data.get('success', False):
+                    self._invalidate_cache()
+                    return True, None
+                return False, data.get('msg', res.text)
+            except Exception as e:
+                return False, str(e)
+
+    # ---- اینباندهای فایلی (OpenVPN / WireGuard) -------------------------
+
+    async def add_client(self, inbound_id, client_email, total_gb, expire_days, host, limit_ip=1, inbound=None):
+        """ساخت اکانت روی اینباند فایلی (openvpn/wg-c/awg/…).
+
+        در vpn-ui اکانت این پروتکل‌ها از جفت «email + password» تشکیل می‌شود
+        (email = نام سرویس، password = رمز RADIUS) و totalGB/expiryTime هم روی
+        خود اکانت می‌نشیند. خروجی «لینک نشانگر» مثل `ovpn://udp/<email>` است که
+        نقطه‌ی اتصال ربات و فایلِ واقعی کانفیگ است؛ فایل هنگام «دریافت کانفیگ»
+        با download_config از پنل گرفته می‌شود. خروجی: (نشانگر، خطا)."""
+        if inbound is None:
+            inbound = await self.get_inbound(inbound_id)
+        if not inbound:
+            return None, f"اینباند با آیدی {inbound_id} یافت نشد"
+        protocol = (inbound.get('protocol') or '').lower()
+        if protocol not in ('openvpn', 'wg-c', 'awg'):
+            return None, f"پروتکل {protocol} به‌صورت فایلی پشتیبانی نمی‌شود"
+        try:
+            settings = json.loads(inbound.get('settings') or '{}')
+        except Exception:
+            settings = {}
+        existing = settings.get('clients') or []
+        # اگر قبلاً ساخته شده (مثلاً خرید دوم از همین اکانت)، همان را آپدیت می‌کنیم
+        stored = next((c for c in existing
+                       if str(c.get('email', '')).strip().lower() == str(client_email).strip().lower()), None)
+        if not stored:
+            stored = {}
+        merged = dict(stored)
+        merged.update({
+            "id": client_email,          # در پروتکل‌های فایلی id همان email است
+            "email": client_email,
+            "enable": True,
+            "totalGB": int(total_gb * 1024 * 1024 * 1024),
+            "expiryTime": int((time.time() + (expire_days * 86400)) * 1000),
+        })
+        if not stored.get('password'):
+            merged["password"] = uuid.uuid4().hex[:12]  # رمز RADIUS (openvpn/l2tp/...)
+        existing = [c for c in existing
+                    if str(c.get('email', '')).strip().lower() != str(client_email).strip().lower()]
+        existing.append(merged)
+        settings['clients'] = existing
+        payload = {
+            "id": str(inbound_id),
+            "remark": inbound.get('remark', ''),
+            "enable": "true",
+            "listen": inbound.get('listen', '') or '',
+            "protocol": protocol,
+            "port": str(inbound.get('port', 0)),
+            "settings": json.dumps(settings),
+            "streamSettings": "{}",
+            "sniffing": "{}",
+        }
+        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=10.0, trust_env=False) as c:
+            try:
+                res = await c.post(f"{self.url}/panel/api/inbounds/update/{int(inbound_id)}",
+                                   data=payload, headers={'Accept': 'application/json'})
+                data = res.json()
+                if res.status_code == 200 and data.get('success', False):
+                    self._invalidate_cache()
+                    scheme = 'wg' if protocol in ('wg-c', 'awg') else 'ovpn'
+                    if protocol == 'openvpn':
+                        # در vpn-ui هر ترنسپورت (udp/tcp) اینباندِ خودش را دارد؛
+                        # ترنسپورت از روی نام اینباند تشخیص داده می‌شود (پورت‌های رایج + udp/tcp در remark)
+                        r = (inbound.get('remark') or '').lower()
+                        transport = 'tcp' if ('tcp' in r or '1443' in r or ' 443' in r) else 'udp'
+                        return f"ovpn://{transport}/{client_email}", None
+                    return f"wg://{client_email}", None
+                return None, data.get('msg', res.text)
+            except Exception as e:
+                return None, str(e)
+
+    async def download_config(self, inbound_id, email, protocol_hint=''):
+        """فایل کانفیگ واقعی اکانت را از پنل می‌گیرد.
+
+        openvpn → .ovpn (از /ovpn/udp و در نبودش /ovpn/tcp)
+        wg-c/awg → متن کانفیگ از /wgc-configs یا /awg-configs (برای هر دستگاه یک بلاک [Interface])
+        protocol_hint می‌تواند 'openvpn' یا 'wireguard' باشد (از نشانگر فایل سفارش)؛
+        اگر خالی باشد نوع از روی اینباند تشخیص داده می‌شود. inbound_id هم اختیاری است
+        چون endpoint های این دو پروتکل به شناسه‌ی اینباند تکیه‌ی منطقی ندارند ولی
+        برای تشخیص نوع در نبود hint لازم می‌شود.
+        خروجی: (متن فایل، نام فایل، خطا)."""
+        host = self._config_host
+        protocol = ''
+        if str(protocol_hint).lower() == 'openvpn':
+            protocol = 'openvpn'
+        elif str(protocol_hint).lower() == 'wireguard':
+            protocol = 'wg-c'
+        if not protocol and inbound_id:
+            inbound = await self.get_inbound(inbound_id)
+            protocol = ((inbound or {}).get('protocol') or '').lower() if inbound else ''
+        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=15.0, trust_env=False) as c:
+            try:
+                if protocol == 'openvpn':
+                    # ترنسپورت ترجیحی tcp است (ترتیب tcp سپس udp برای سازگاری با پنل‌هایی
+                    # که اینباندشان یکی از این دو را سرو می‌کند)
+                    transports = ('tcp', 'udp')
+                    body_text = None
+                    for transport in transports:
+                        res = await c.get(f"{self.url}/panel/api/inbounds/{int(inbound_id)}/ovpn/{transport}")
+                        # فایل ovpn واقعی یا حاوی کلمه‌ی openvpn است یا با «client» شروع می‌شود
+                        body = (res.text or '')[:200].lower()
+                        if res.status_code == 200 and ('openvpn' in body or body.lstrip().startswith('client')):
+                            body_text = res.text
+                            break
+                    if body_text is None:
+                        return None, None, "فایل ovpn از پنل دریافت نشد"
+                    return self._fix_ovpn_host(body_text, host), f"{email}.ovpn", None
+                if protocol in ('wg-c', 'awg'):
+                    ep = 'wgc-configs' if protocol == 'wg-c' else 'awg-configs'
+                    res = await c.get(f"{self.url}/panel/api/inbounds/{int(inbound_id)}/{ep}?email={quote(str(email), safe='')}")
+                    if res.status_code == 200 and res.json().get('success', False):
+                        items = res.json().get('obj') or []
+                        cfgs = [i.get('config', '') for i in items if i.get('config')]
+                        # فایل .conf باید دقیقاً یک [Interface] داشته باشد؛ چسباندن کانفیگِ
+                        # همه‌ی دستگاه‌ها فایل نامعتبر می‌سازد که اپ WireGuard رد می‌کند.
+                        # پس فقط اولین دستگاهِ سالم فرستاده می‌شود.
+                        cfg = next((c0 for c0 in cfgs if '[interface]' in (c0 or '').lower()), '')
+                        if cfg:
+                            return self._fix_wg_endpoint(cfg, host), f"{email}.conf", None
+                    return None, None, "کانفیگ وایرگارد از پنل دریافت نشد"
+                return None, None, "نوع پروتکل قابل تشخیص نبود"
+            except Exception as e:
+                return None, None, str(e)
+
+    @staticmethod
+    def _fix_ovpn_host(text, host):
+        """remote <host> <port> <proto> فایل .ovpn را با IP کانفیگِ پنل جایگزین می‌کند.
+
+        پنل در remote آی‌پی سرور می‌گذارد؛ اگر ادمین IP کانفیگ (دامنه) تنظیم کرده،
+        فایل باید همان دامنه را نشان دهد (برای SNI/TLS و عبور از فیلترینگ)."""
+        if not host or not text:
+            return text
+        import re as _re
+        try:
+            # remote <IP> [port [proto]] → remote <host> [port [proto]]
+            return _re.sub(
+                r'(?m)^(\s*remote\s+)\S+',
+                lambda m: m.group(1) + str(host),
+                text,
+                count=0,
+            )
+        except Exception:
+            return text
+
+    @staticmethod
+    def _fix_wg_endpoint(text, host):
+        """Endpoint = <host>:<port> کانفیگ وایرگارد را با IP کانفیگِ پنل جایگزین می‌کند.
+
+        مثل ovpn: پنل آی‌پی خام سرور را می‌گذارد؛ اگر ادمین دامنه ثبت کرده باشد،
+        فایل باید همان دامنه را نشان دهد."""
+        if not host or not text:
+            return text
+        import re as _re
+        try:
+            # آخرین «:پورت» انتهای خط نگه داشته می‌شود؛ فقط هاست عوض می‌شود
+            return _re.sub(
+                r'(?m)^(\s*Endpoint\s*=\s*).+:(\d+)\s*$',
+                lambda m: f"{m.group(1)}{host}:{m.group(2)}",
+                text,
+            )
+        except Exception:
+            return text

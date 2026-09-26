@@ -37,6 +37,10 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS panels (id SERIAL PRIMARY KEY, name TEXT, url TEXT, username TEXT, password TEXT, config_ip TEXT)''')
         # آدرس سرور اشتراک (subscription) برای ساخت لینک ساب؛ اختیاری
         await conn.execute("ALTER TABLE panels ADD COLUMN IF NOT EXISTS sub_url TEXT DEFAULT ''")
+        # نوع پنل: 'xui' (پیش‌فرض) یا 'vpn-ui' (فورک Sir-MmD با API کمی متفاوت)
+        await conn.execute("ALTER TABLE panels ADD COLUMN IF NOT EXISTS panel_type TEXT DEFAULT ''")
+        # پنل‌های مجاز برای هر کاربر (لیست id با کاما؛ خالی = همه‌ی پنل‌ها — دیفالت)
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS allowed_panels TEXT DEFAULT ''")
         # هر پلن و هر سفارش به یک پنل متصل می‌شود
         await conn.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS panel_id INT")
         await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS panel_id INT")
@@ -394,6 +398,46 @@ async def get_user_row(user_id):
         return await conn.fetchrow("SELECT user_id, balance, nickname, role FROM users WHERE user_id = $1", user_id)
 
 
+def _parse_allowed_panels(val):
+    """رشته‌ی ذخیره‌شده (مثل '1,3') را به مجموعه تبدیل می‌کند؛ None یعنی همه‌ی پنل‌ها."""
+    if val is None or not str(val).strip():
+        return None
+    try:
+        ids = {int(x) for x in str(val).split(',') if x.strip().isdigit()}
+    except Exception:
+        return None
+    # لیست نامعتبر/خالی‌یِ صریح به «همه» برنمی‌گردد؛ '' و None یعنی همه، لیست عددی یعنی همان‌ها
+    return ids if ids else None
+
+
+def _allowed_panels_value(panel_ids):
+    """مجموعه/لیست را به رشته‌ی ذخیره‌سازی تبدیل می‌کند؛ خالی یعنی بدون محدودیت."""
+    if not panel_ids:
+        return ''
+    try:
+        return ','.join(str(int(p)) for p in sorted(panel_ids))
+    except (TypeError, ValueError):
+        return ''
+
+
+async def get_user_allowed_panels(user_id):
+    """مجموعه‌ی id پنل‌های مجاز کاربر؛ None یعنی همه‌ی پنل‌ها (محدودیتی ثبت نشده)."""
+    async with db_pool.acquire() as conn:
+        val = await conn.fetchval("SELECT COALESCE(allowed_panels, '') FROM users WHERE user_id = $1", int(user_id))
+    return _parse_allowed_panels(val)
+
+
+async def set_user_allowed_panels(user_id, panel_ids):
+    """ثبت پنل‌های مجاز کاربر. panel_ids خالی/None یعنی همه‌ی پنل‌ها (بدون محدودیت)."""
+    val = _allowed_panels_value(panel_ids)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, allowed_panels) VALUES ($1, $2) "
+            "ON CONFLICT (user_id) DO UPDATE SET allowed_panels = $2",
+            int(user_id), val,
+        )
+
+
 async def save_user(user_id, nickname, role, balance):
     """ساخت یا ویرایش کاربر (upsert) از پنل وب."""
     async with db_pool.acquire() as conn:
@@ -564,10 +608,12 @@ async def set_user_role(user_id, role):
 PLAN_ORDER = "ORDER BY COALESCE(sort_order, id) ASC, id ASC"
 
 
-async def list_plans(panel_id=None, only_active=False):
+async def list_plans(panel_id=None, only_active=False, allowed_panels=None):
     """لیست پلن‌ها به ترتیب نمایش.
 
     panel_id: فقط پلن‌های همان پنل. only_active: فقط پلن‌های فعال (برای منوی فروش).
+    allowed_panels: مجموعه‌ی id پنل‌های مجاز کاربر (None = همه)؛ پلن‌های سایر پنل‌ها
+    حذف می‌شوند تا کاربر فقط بتواند از پنل‌های تعیین‌شده برایش خرید کند.
     """
     where, args = [], []
     if panel_id is not None:
@@ -575,6 +621,9 @@ async def list_plans(panel_id=None, only_active=False):
         where.append(f"panel_id = ${len(args)}")
     if only_active:
         where.append("COALESCE(is_active, TRUE) = TRUE")
+    if allowed_panels is not None:  # مجموعه‌ی خالی یعنی هیچ پنلی مجاز نیست
+        args.append([int(p) for p in allowed_panels])
+        where.append(f"panel_id = ANY(${len(args)})")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     async with db_pool.acquire() as conn:
         return await conn.fetch(f"SELECT * FROM plans {clause} {PLAN_ORDER}", *args)
@@ -647,12 +696,19 @@ async def delete_plan(plan_id):
         await conn.execute("DELETE FROM plans WHERE id = $1", int(plan_id))
 
 
-async def update_panel(panel_id, name, url, username, password, config_ip, sub_url):
+async def update_panel(panel_id, name, url, username, password, config_ip, sub_url, panel_type=None):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE panels SET name=$2, url=$3, username=$4, password=$5, config_ip=$6, sub_url=$7 WHERE id=$1",
-            int(panel_id), name, url, username, password, config_ip, sub_url,
-        )
+        if panel_type is None:
+            # سازگاری با فراخوانی‌های قدیمی: نوع فعلی حفظ می‌شود
+            await conn.execute(
+                "UPDATE panels SET name=$2, url=$3, username=$4, password=$5, config_ip=$6, sub_url=$7 WHERE id=$1",
+                int(panel_id), name, url, username, password, config_ip, sub_url,
+            )
+        else:
+            await conn.execute(
+                "UPDATE panels SET name=$2, url=$3, username=$4, password=$5, config_ip=$6, sub_url=$7, panel_type=$8 WHERE id=$1",
+                int(panel_id), name, url, username, password, config_ip, sub_url, panel_type,
+            )
 
 
 async def get_user_transactions(user_id, limit=15):
@@ -1151,11 +1207,11 @@ async def get_panel(panel_id):
         return await conn.fetchrow("SELECT * FROM panels WHERE id = $1", int(panel_id))
 
 
-async def add_panel(name, url, username, password, config_ip, sub_url=''):
+async def add_panel(name, url, username, password, config_ip, sub_url='', panel_type=''):
     async with db_pool.acquire() as conn:
         return await conn.fetchval(
-            "INSERT INTO panels (name, url, username, password, config_ip, sub_url) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-            name, url, username, password, config_ip, sub_url,
+            "INSERT INTO panels (name, url, username, password, config_ip, sub_url, panel_type) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+            name, url, username, password, config_ip, sub_url, panel_type,
         )
 
 
@@ -1164,7 +1220,7 @@ async def delete_panel(panel_id):
         await conn.execute("DELETE FROM panels WHERE id = $1", int(panel_id))
 
 
-PANEL_COLUMNS = {'name', 'url', 'username', 'password', 'config_ip', 'sub_url'}
+PANEL_COLUMNS = {'name', 'url', 'username', 'password', 'config_ip', 'sub_url', 'panel_type'}
 
 
 async def update_panel_field(panel_id, col, value):
