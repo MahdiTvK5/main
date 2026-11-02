@@ -15,7 +15,7 @@ from telegram.request import HTTPXRequest
 
 from config import (
     TOKEN, PROXY_URL, SUPER_ADMIN_ID, PANEL_URL,
-    SECURITY_WARNING, format_size, clean_num,
+    SECURITY_WARNING, PANEL_UNAVAILABLE_TEXT, format_size, clean_num,
     DB_USER, DB_PASS, DB_NAME, DB_HOST, DB_PORT,
 )
 import db
@@ -25,6 +25,7 @@ from db import (
     get_user_allowed_panels,
 )
 from links import order_email, email_from_link, client_key, new_client_key
+import importer
 import pricing
 from pricing import KIND_BUY, KIND_RENEW
 import rewards
@@ -795,7 +796,8 @@ async def fetch_client_for_order(query, order_id):
     xui, cfg_ip = await get_order_xui(order_id)
     is_logged, login_err = await xui.login()
     if not is_logged:
-        await query.message.reply_text(f"❌ اتصال به پنل ناموفق بود.\n{str(login_err)[:200]}")
+        logging.warning("fetch_client_for_order order=%s: لاگین به پنل ناموفق: %s", order_id, login_err)
+        await query.message.reply_text(PANEL_UNAVAILABLE_TEXT)
         return None
     inbound_id, _port, client_dict = await xui.get_client_exact_info(email)
     if not client_dict:
@@ -838,7 +840,7 @@ async def render_order_details(query, order_id, alert_msg=None):
     is_logged, _ = await xui.login()
 
     if not is_logged:
-        await safe_answer(query, "❌ خطا در اتصال به سرور پنل.", alert=True)
+        await safe_answer(query, "🛠 سرویس موقتاً در دسترس نیست؛ لطفاً بعداً تلاش کنید یا با پشتیبانی در تماس باشید.", alert=True)
         return
 
     stats = await xui.get_client_stats(email)
@@ -1025,14 +1027,17 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             is_logged, _ = await xui.login()
             if not is_logged:
-                return await update.message.reply_text("❌ خطا در اتصال به پنل.", reply_markup=await get_main_keyboard(user_id))
+                return await update.message.reply_text(PANEL_UNAVAILABLE_TEXT, reply_markup=await get_main_keyboard(user_id))
             inbound = await xui.get_inbound(int(inbound_setting))
             if not inbound:
                 return await update.message.reply_text("❌ اینباند اکانت تست پیدا نشد.", reply_markup=await get_main_keyboard(user_id))
             test_name = f"{user_id}_test_{str(uuid.uuid4())[:4]}"
             config_link, err = await xui.add_client(int(inbound_setting), test_name, test_gb, test_days, cfg_ip, inbound=inbound)
             if not config_link:
-                return await update.message.reply_text(f"❌ ساخت اکانت تست ناموفق بود.\n{err}", reply_markup=await get_main_keyboard(user_id))
+                logging.warning("ساخت اکانت تست user=%s ناموفق: %s", user_id, err)
+                return await update.message.reply_text(
+                    "❌ ساخت اکانت تست موقتاً امکان‌پذیر نیست." + PANEL_UNAVAILABLE_TEXT,
+                    reply_markup=await get_main_keyboard(user_id))
             test_order_id = await add_order(user_id, config_link, opid, email=test_name, inbound_id=int(inbound_setting))
             if not admin_status:
                 await db.mark_test_used(user_id)
@@ -1163,126 +1168,29 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ================= ماشین وضعیت ایمپورت گروهی کانفیگ =================
     if state == 'admin_waiting_import' and admin_status:
-        parts = text.split()
-        if len(parts) >= 2 and parts[0].isdigit():
-            target_user_id = int(parts[0])
-            # هر توکن می‌تواند نام کانفیگ (email) یا یک لینک کامل (vless/vmess/trojan) باشد
-            wanted = []
-            for tok in parts[1:]:
-                tok = tok.strip()
-                em = email_from_link(tok) if "://" in tok else tok
-                if em:
-                    wanted.append(em)
-
+        target_user_id, wanted = await importer.parse_import_input(text)
+        if target_user_id is None or not wanted:
+            await update.message.reply_text("❌ فرمت اشتباه! اول آیدی عددی کاربر، سپس نام کانفیگ‌ها یا لینک‌های کامل.")
+        else:
             await update.message.reply_text(f"در حال جستجو و ایمپورت {len(wanted)} کانفیگ در سرور... ⏳")
-            # کانفیگ در تمام پنل‌های موجود جستجو می‌شود
-            panels = await db.get_panels()
-            panel_clients = []  # (panel_row_or_None, xui, config_ip, is_logged)
-            if panels:
-                for prow in panels:
-                    x, ip = build_xui(prow)
-                    ok, _ = await x.login()
-                    panel_clients.append((prow, x, ip, ok))
-            else:
-                x, ip = build_xui(None)
-                ok, _ = await x.login()
-                panel_clients.append((None, x, ip, ok))
-
-            if not any(pc[3] for pc in panel_clients):
+            # کانفیگ در تمام پنل‌های موجود جستجو می‌شود؛ کانفیگِ قبلاً ایمپورت‌شده
+            # برای کاربر دیگر هم مجاز است (اشتراک لینک) و فقط در گزارش علامت می‌خورد.
+            rep = await importer.run_import(target_user_id, wanted)
+            context.user_data['state'] = 'none'
+            if not rep.connection_ok:
                 await update.message.reply_text("❌ خطا در اتصال به پنل X-UI.", reply_markup=await get_main_keyboard(user_id))
             else:
-                await get_user(target_user_id)
-                # ایمیل‌های فعلی کاربر برای جلوگیری از ایمپورت تکراری
-                rows = await db.get_orders_by_user(target_user_id)
-                existing_emails = set()
-                for r in rows:
-                    em = order_email(r)
-                    if em:
-                        existing_emails.add(em.strip().lower())
-
-                # پلن‌های هر پنل برای تشخیص خودکار پلنِ سفارش ایمپورتی (بر اساس حجم)
-                plans_by_panel = {}
-                for prow, _x, _ip, ok in panel_clients:
-                    if ok and prow:
-                        plans_by_panel[prow['id']] = await db.list_plans(panel_id=prow['id'], only_active=True)
-
-                success_count = 0
-                skipped = []        # ایمیل تکراری برای همین کاربر
-                owned_by_other = []  # ایمیل قبلاً به کاربر دیگری تعلق دارد
-                failed_emails = []
-                per_panel = {}
-
-                for email in wanted:
-                    if email.lower() in existing_emails:
-                        skipped.append(email)
-                        continue
-                    # چک سراسری: این email ممکن است قبلاً به کاربر دیگری تعلق گرفته باشد
-                    owner = await db.find_order_by_email(email)
-                    if owner and owner['user_id'] != target_user_id:
-                        owned_by_other.append(f"{email} (کاربر {owner['user_id']})")
-                        existing_emails.add(email.lower())
-                        continue
-                    found = False
-                    for prow, x, ip, ok in panel_clients:
-                        if not ok:
-                            continue
-                        inbound_id, port, client_dict = await x.get_client_exact_info(email)
-                        if client_dict:
-                            real_email_from_panel = client_dict.get('email', email)
-                            pid = prow['id'] if prow else None
-                            pname = prow['name'] if prow else "پیش‌فرض"
-                            # لینک را مطابق پروتکل/تنظیماتِ همان اینباند می‌سازیم
-                            inbound = await x.get_inbound(inbound_id)
-                            if inbound:
-                                config_link = build_share_link(inbound, client_dict, ip)
-                            else:
-                                config_link = build_vless_link(client_dict.get('id', ''), ip, port, real_email_from_panel)
-                            # تشخیص خودکار پلن: حجم کلاینت با پلن‌های همان پنل مقایسه می‌شود
-                            matched_plan_id = None
-                            total_gb = int(client_dict.get('totalGB') or 0) // (1024 ** 3)
-                            if pid and total_gb > 0:
-                                for p in plans_by_panel.get(pid, []):
-                                    if int(p['gb']) == total_gb:
-                                        matched_plan_id = p['id']
-                                        break
-                            await add_order(
-                                target_user_id, config_link, pid, email=real_email_from_panel,
-                                inbound_id=inbound_id, plan_id=matched_plan_id,
-                                user_role=(await db.get_user(target_user_id))[2],
-                            )
-                            existing_emails.add(real_email_from_panel.strip().lower())
-                            per_panel[pname] = per_panel.get(pname, 0) + 1
-                            success_count += 1
-                            found = True
-                            break
-                    if not found:
-                        failed_emails.append(email)
-
-                context.user_data['state'] = 'none'
-                report = f"✅ عملیات ایمپورت پایان یافت.\n\n📦 موفق: {success_count}\n"
-                if per_panel:
-                    report += "🖥 بر اساس پنل: " + "، ".join([f"{k}: {v}" for k, v in per_panel.items()]) + "\n"
-                if skipped:
-                    report += f"↩️ تکراری برای همین کاربر (رد شد): {len(skipped)}\n"
-                if owned_by_other:
-                    report += f"🔒 قبلاً به کاربر دیگری تعلق دارد: {len(owned_by_other)}\n" + "\n".join(f"   • {x}" for x in owned_by_other[:10]) + "\n"
-                if failed_emails:
-                    report += f"❌ روی هیچ پنلی یافت نشد: {', '.join(failed_emails)}"
-                if success_count:
-                    report += "\n💡 حجم کلاینت‌ها با پلن‌های هم‌پنل مقایسه شد و پلنِ هم‌خوان به‌صورت خودکار ثبت شد."
-                await update.message.reply_text(report, reply_markup=await get_main_keyboard(user_id))
+                await update.message.reply_text(rep.as_text(), reply_markup=await get_main_keyboard(user_id))
                 # کاربر مقصد را از ایمپورت جدید خبردار کن
-                if success_count:
+                if rep.imported:
                     try:
                         await context.bot.send_message(
                             target_user_id,
-                            f"📥 {success_count} سرویس جدید توسط پشتیبانی برای شما ثبت شد.\n"
+                            f"📥 {len(rep.imported)} سرویس جدید توسط پشتیبانی برای شما ثبت شد.\n"
                             f"از «سفارشات من 📦» ببینیدشان.",
                         )
                     except Exception as ex:
                         logging.warning("اطلاع ایمپورت به کاربر %s ناموفق: %s", target_user_id, ex)
-        else:
-            await update.message.reply_text("❌ فرمت اشتباه! اول آیدی عددی کاربر، سپس نام کانفیگ‌ها یا لینک‌های کامل.")
         return
 
     # ================= ماشین وضعیت ویرایش پلن (تعاملی) =================
@@ -1888,7 +1796,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'admin_import_config' and admin_status:
         context.user_data['state'] = 'admin_waiting_import'
-        msg = "🔗 **ایمپورت کانفیگ (تکی یا گروهی)**\n\nاول آیدی عددی کاربر، سپس نام کانفیگ‌ها (Email) یا **لینک‌های کامل** را با فاصله/خط‌جدید بفرستید.\nموارد تکراری به‌صورت خودکار رد می‌شوند و کانفیگ در همه‌ی پنل‌ها جستجو می‌شود.\n\nمثال:\n`123456789 ali_1 ali_2`\nیا\n`123456789 vless://...#ali_1`"
+        msg = ("🔗 **ایمپورت کانفیگ (تکی یا گروهی)**\n\n"
+               "اول آیدی عددی کاربر، سپس نام کانفیگ‌ها (Email) یا **لینک‌های کامل** را با فاصله/خط‌جدید بفرستید.\n"
+               "کانفیگ در همه‌ی پنل‌ها جستجو می‌شود و پلن از روی حجم خودکار تشخیص داده می‌شود.\n"
+               "🔁 کانفیگی که قبلاً برای کاربر دیگری ایمپورت شده هم قابل ثبت است (لینک مشترک می‌گیرد)؛ فقط تکراری برای «همان کاربر» خودکار رد می‌شود.\n\n"
+               "مثال:\n`123456789 ali_1 ali_2`\nیا\n`123456789 vless://...#ali_1`")
         await query.message.reply_text(msg, parse_mode='Markdown', reply_markup=CANCEL_MARKUP)
         await query.delete_message()
 
@@ -2604,7 +2516,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_logged, _ = await xui.login()
             if not is_logged:
                 await credit_balance(user_id, price, kind='برگشت وجه')
-                return await render_order_details(query, order_id, "❌ خطا در اتصال به پنل! (وجه بازگشت داده شد)")
+                return await render_order_details(query, order_id, "❌ تمدید موقتاً امکان‌پذیر نیست! (وجه بازگشت داده شد)" + PANEL_UNAVAILABLE_TEXT)
 
             inbound_id, _port, client_dict = await xui.get_client_exact_info(email)
             if not client_dict:
@@ -2631,7 +2543,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await render_order_details(query, order_id, f"✅ تمدید شد: {plan['gb']}GB / {duration_days} روز")
             else:
                 await credit_balance(user_id, price, kind='برگشت وجه')
-                await render_order_details(query, order_id, "❌ خطا: سرور درخواست تمدید را رد کرد! (وجه بازگشت داده شد)")
+                await render_order_details(query, order_id, "❌ تمدید ناموفق بود! (وجه بازگشت داده شد)" + PANEL_UNAVAILABLE_TEXT)
         finally:
             context.user_data['processing'] = False
 
@@ -2721,12 +2633,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not is_logged:
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
-                return await query.edit_message_text(f"❌ خطا در لاگین به پنل سنایی.\nدلیل: {login_err}")
+                logging.warning("خرید user=%s plan=%s: لاگین به پنل ناموفق: %s", user_id, plan_id, login_err)
+                return await query.edit_message_text("❌ خرید موقتاً امکان‌پذیر نیست. (وجه بازگشت داده شد)" + PANEL_UNAVAILABLE_TEXT)
 
             inbound = await xui.get_inbound(plan['inbound_id'])
             if not inbound:
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه
-                return await query.edit_message_text(f"❌ خطای پنل: اینباند با آیدی {plan['inbound_id']} پیدا نشد!")
+                logging.warning("خرید user=%s plan=%s: اینباند %s روی پنل یافت نشد", user_id, plan_id, plan['inbound_id'])
+                return await query.edit_message_text("❌ خرید موقتاً امکان‌پذیر نیست. (وجه بازگشت داده شد)" + PANEL_UNAVAILABLE_TEXT)
 
             # نام سرویس یکتا روی پنل: اسم دلخواه کاربر عیناً می‌ماند؛ فقط در
             # صورت تکرار، پسوند کوتاه خودکار می‌گیرد (مثل username)
@@ -2810,7 +2724,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.warning("ارسال پیام پورتال اشتراک ناموفق بود: %s", ex)
             else:
                 await credit_balance(user_id, price, kind='برگشت وجه')  # برگشت وجه چون ساخت کانفیگ ناموفق بود
-                await query.edit_message_text(f"❌ سرور ساخت کانفیگ را رد کرد!\nارور: `{error_msg}`", parse_mode='Markdown')
+                logging.warning("خرید user=%s plan=%s: سرور ساخت کانفیگ را رد کرد: %s", user_id, plan_id, error_msg)
+                await query.edit_message_text("❌ ساخت سرویس ناموفق بود. (وجه بازگشت داده شد)" + PANEL_UNAVAILABLE_TEXT)
         finally:
             context.user_data['processing'] = False
 
@@ -3147,7 +3062,7 @@ async def _try_auto_renew(context, o, xui):
         if price > 0:
             await credit_balance(o['user_id'], price, kind='برگشت وجه')
         logging.warning("AUTO_RENEW order=%s ناموفق: %s", o['id'], ex)
-        return False, f"خطای پنل: {ex}"
+        return False, "سرور موقتاً در دسترس نیست"
 
 
 async def notify_job(context: ContextTypes.DEFAULT_TYPE):

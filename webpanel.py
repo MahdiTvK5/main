@@ -20,6 +20,7 @@ from urllib.parse import quote
 from aiohttp import web
 
 import db
+import importer
 import pricing
 import rewards
 import subportal
@@ -181,6 +182,7 @@ ICONS = {
     'server': '<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>',
     'gift': '<polyline points="20 12 20 22 4 22 4 12"/><rect x="2" y="7" width="20" height="5"/><line x1="12" y1="22" x2="12" y2="7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/>',
     'link': '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+    'import': '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
     'megaphone': '<path d="M3 11l18-7-4 16-6-4-3 4-1-6z"/>',
     'star': '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
     'settings': '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
@@ -249,6 +251,7 @@ NAV_GROUPS = [
     ]),
     ('سیستم', [
         ('/panels', 'سرورها', 'server'),
+        ('/import', 'ایمپورت کانفیگ', 'import'),
         ('/broadcast', 'پیام همگانی', 'megaphone'),
         ('/settings', 'تنظیمات', 'settings'),
     ]),
@@ -2758,6 +2761,75 @@ async def backup_download(request):
     )
 
 
+# ================= ایمپورت کانفیگ =================
+@require_auth
+async def import_page(request):
+    """فرم ایمپورت: ثبت سفارشِ کانفیگِ موجود روی سرور برای هر کاربر (تکی/گروهی).
+
+    کانفیگی که قبلاً برای کاربر دیگری ایمپورت شده هم قابل ثبت است (لینک مشترک)؛
+    فقط تکراری برای «همان کاربر» رد می‌شود.
+    """
+    panels = await db.get_panels()
+    panel_names = [p['name'] for p in panels] if panels else ['پیش‌فرض']
+    body = (
+        _page_head('ایمپورت کانفیگ',
+                   'ثبت سفارشِ یک کانفیگِ موجود روی سرور برای هر کاربر — تکی یا گروهی.',
+                   crumbs=[('خانه', '/'), ('ایمپورت کانفیگ', None)]),
+        "<div class='box'><form method='post' action='/import/send'>"
+        "<label for='imp-uid'>آیدی عددی کاربر مقصد</label>"
+        "<input id='imp-uid' name='user_id' type='number' min='1' required placeholder='مثلاً 123456789' dir='ltr' style='max-width:320px'>"
+        "<label for='imp-tokens' style='margin-top:12px'>نام کانفیگ‌ها (Email) یا لینک‌های کامل — با فاصله یا هر خط جدا</label>"
+        "<textarea id='imp-tokens' name='tokens' rows='6' required dir='ltr' placeholder='ali_1 ali_2\nیا هر خط: vless://…#ali_1'></textarea>"
+        "<p class='muted'>جستجو در پنل‌ها: " + e("، ".join(panel_names))
+        + " — پلن از روی حجم کلاینت به‌طور خودکار تشخیص داده می‌شود. کانفیگی که قبلاً برای کاربر دیگری ایمپورت شده هم قابل ثبت است؛ فقط تکراری برای «همان کاربر» رد می‌شود.</p>"
+        "<div class='row' style='margin-top:10px'><button type='submit'>" + icon('import') + " ایمپورت</button></div>"
+        "</form></div>",
+    )
+    return layout('ایمپورت کانفیگ', "".join(body), '/import', request)
+
+
+@require_auth
+async def import_send(request):
+    """اجرای ایمپورت و نمایش گزارش — کاربر مقصد هم خبردار می‌شود."""
+    data = await request.post()
+    uid_raw = (data.get("user_id") or "").strip()
+    tokens = (data.get("tokens") or "").strip()
+    if not uid_raw.isdigit() or not tokens:
+        raise _redirect("/import", err="آیدی کاربر نامعتبر است یا لیست کانفیگ‌ها خالی است")
+    target_user_id = int(uid_raw)
+    if not await db.get_user_detail(target_user_id):
+        raise _redirect("/import", err="کاربر یافت نشد")
+    _uid, wanted = await importer.parse_import_input(f"{uid_raw} {tokens}")
+    if not wanted:
+        raise _redirect("/import", err="هیچ نام یا لینک معتبری یافت نشد")
+    rep = await importer.run_import(target_user_id, wanted)
+    logging.info("WEB_IMPORT user=%s imported=%s skipped=%s notfound=%s",
+                 target_user_id, len(rep.imported), len(rep.skipped_same_user), len(rep.not_found))
+    if not rep.connection_ok:
+        raise _redirect("/import", err="خطا در اتصال به پنل‌ها؛ هیچ کانفیگی ایمپورت نشد")
+    if rep.imported and _BOT is not None:
+        try:
+            await _BOT.send_message(
+                target_user_id,
+                f"📥 {len(rep.imported)} سرویس جدید توسط پشتیبانی برای شما ثبت شد.\n"
+                f"از «سفارشات من 📦» ببینیدشان.",
+            )
+        except Exception as ex:
+            logging.warning("اطلاع وب‌ایمپورت به کاربر %s ناموفق: %s", target_user_id, ex)
+    body = (
+        _page_head('نتیجه‌ی ایمپورت',
+                   f"کاربر مقصد: {num(target_user_id)}",
+                   crumbs=[('خانه', '/'), ('ایمپورت کانفیگ', '/import'), ('نتیجه', None)]),
+        "<div class='box'><div style='white-space:pre-wrap;line-height:2.2'>"
+        + e(rep.as_text()) + "</div>"
+        "<div class='head-actions' style='margin-top:14px'>"
+        "<a href='/import'><button>ایمپورت جدید</button></a>"
+        "<a href='/users/view?id=" + e(target_user_id) + "'><button class='btn-ghost'>سفارش‌های کاربر</button></a>"
+        "</div></div>",
+    )
+    return layout('نتیجه‌ی ایمپورت', "".join(body), '/import', request)
+
+
 # ================= راه‌اندازی =================
 def build_app():
     app = web.Application()
@@ -2776,6 +2848,8 @@ def build_app():
         web.post("/users/ban", user_ban),
         web.get("/orders", orders_page),
         web.post("/orders/delete", order_delete),
+        web.get("/import", import_page),
+        web.post("/import/send", import_send),
         web.get("/transactions", transactions_page),
         web.get("/plans", plans_page),
         web.get("/plans/edit", plan_edit_form),
