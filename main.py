@@ -1706,7 +1706,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             # قیمت لحظه‌ی نمایش نگه داشته می‌شود تا مبلغ تاییدشده همان چیزی باشد که کسر می‌شود
             remember_quote(context, plan_id, KIND_BUY, quote)
             body, _spec = pricing.quote_lines(plan, quote)
-            kb = [[InlineKeyboardButton(f"✅ تایید و پرداخت {quote.price:,} تومان", callback_data=f"confirm_buy_{plan_id}_{final_name}")]]
+            shown_price = quote.base_price if quote.admin_free else quote.price
+            suffix = " 👑" if quote.admin_free else ""
+            kb = [[InlineKeyboardButton(f"✅ تایید و پرداخت {shown_price:,} تومان{suffix}", callback_data=f"confirm_buy_{plan_id}_{final_name}")]]
             await update.message.reply_text(
                 f"🏷 نام سرویس: `{final_name}`\n\n{body}\n\n💳 موجودی شما: {balance:,} تومان",
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
@@ -2469,11 +2471,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown',
             )
 
-        price_lines = (
-            f"💰 قیمت اصلی: {quote.base_price:,} تومان\n✅ قیمت تمدید: **{quote.price:,}** تومان\n"
-            f"🎁 سود شما: {quote.discount:,} تومان"
-            if quote.has_discount else f"💳 مبلغ کسر: **{quote.price:,} تومان**"
-        )
+        if quote.admin_free:
+            price_lines = (
+                f"💰 قیمت تمدید: **{quote.base_price:,} تومان**\n"
+                "👑 برای شما رایگان است (پولی کسر نمی‌شود)"
+            )
+        else:
+            price_lines = (
+                f"💰 قیمت اصلی: {quote.base_price:,} تومان\n✅ قیمت تمدید: **{quote.price:,}** تومان\n"
+                f"🎁 سود شما: {quote.discount:,} تومان"
+                if quote.has_discount else f"💳 مبلغ کسر: **{quote.price:,} تومان**"
+            )
         kb = [[InlineKeyboardButton("✅ تایید و اعمال تمدید", callback_data=f'execute_renew_{order_id}_{plan_id}')], [InlineKeyboardButton("❌ انصراف", callback_data=f'renew_menu_{order_id}')]]
         await query.edit_message_text(
             f"{quote.label + chr(10) if quote.label else ''}"

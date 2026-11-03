@@ -130,6 +130,7 @@ class Quote:
     first_offer: bool = False  # آیا آفر خرید اول اعمال شده
     tier_discount: int = 0     # درصد تخفیف پله‌ی نمایندگی
     available: bool = True     # آیا این پلن برای سطح کاربر قیمت دارد
+    admin_free: bool = False   # خرید رایگان مدیر کل؛ قیمت واقعی فقط برای نمایش نگه داشته می‌شود
 
     @property
     def discount(self):
@@ -247,13 +248,13 @@ def resolve_quote(plan, buyer, kind=KIND_BUY, config=None, offers=(), now=None):
     plan_id = _int(_plan_get(plan, 'id'))
     base = base_price_for(plan, role, kind, config)
 
-    # ادمین رایگان: قیمت خرید و تمدید برای ادمین صفر می‌شود اما پلن باید برای
-    # سطح او در دسترس باشد؛ کانفیگ عادی ساخته می‌شود فقط پولی کسر نمی‌شود.
+    # ادمین رایگان: پرداختی صفر است اما قیمت واقعی در base_price می‌ماند تا ادمین
+    # قیمت اصلی را در منو و صفحات تأیید ببیند (فقط پولی کسر نمی‌شود).
     if buyer.admin and base > 0:
         return Quote(
             plan_id=plan_id, kind=kind, base_price=base, price=0,
             label='👑 رایگان برای ادمین', offer_id=None,
-            first_offer=False, tier_discount=0,
+            first_offer=False, tier_discount=0, admin_free=True,
         )
 
     # تمدید: قیمتِ ستونِ همین سطح مرجع است؛ هیچ کاندیدای دیگری وارد نمی‌شود.
@@ -343,6 +344,8 @@ def button_text(plan, quote):
     title, spec = plan_title(plan)
     if not quote.available:
         return f"{title} | {spec} - {UNAVAILABLE_LABEL}"
+    if quote.admin_free:
+        return f"{title} | {spec} - 👑 رایگان ({money(quote.base_price)} تومان)"
     if quote.price == 0:
         return f"{title} | {spec} - 👑 رایگان"
     if quote.has_discount:
@@ -362,6 +365,10 @@ def quote_lines(plan, quote):
     lines.append(f"🛍 {title}")
     lines.append(f"💾 حجم: {_plan_get(plan, 'gb', 0)}GB")
     lines.append(f"📅 مدت: {days} روز")
+    if quote.admin_free:
+        lines.append(f"💰 قیمت: **{money(quote.base_price)} تومان**")
+        lines.append("👑 برای شما رایگان است (پولی کسر نمی‌شود)")
+        return "\n".join(lines), spec
     if quote.price == 0:
         lines.append("💰 قیمت: **رایگان** 👑")
         return "\n".join(lines), spec
