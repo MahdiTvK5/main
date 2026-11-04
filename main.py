@@ -702,7 +702,7 @@ async def _send_file_config(context, user_id, row, email, config_link):
         if kind == 'l2tp':
             # L2TP فایل کانفیگ قابل ایمپورت ندارد؛ کارت اطلاعات اتصال را می‌فرستیم
             hint = ("این فایل اطلاعات اتصال است؛ آن را باز کنید و روی دستگاه یک اتصال"
-                    " L2TP/IPsec (با PSK) با همان مقادیر بسازید.")
+                    " L2TP/IPsec با Secret (Shared Secret) همان مقادیر بسازید.")
         elif kind == 'openvpn':
             hint = "فایل را دانلود و در اپ OpenVPN Connect ایمپورت کنید."
         else:

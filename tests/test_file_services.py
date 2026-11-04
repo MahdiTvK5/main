@@ -275,7 +275,8 @@ def test_download_config_l2tp_card(monkeypatch):
     assert 'Port: 1701' in text
     assert 'Username: fardin' in text
     assert 'Password: secret' in text
-    assert 'PSK: sh4r3d-psk' in text
+    assert 'Secret: sh4r3d-psk' in text
+    assert 'PSK:' not in text
     assert filename == 'fardin-l2tp.txt'
 
 
@@ -290,7 +291,7 @@ def test_download_config_l2tp_raw_no_psk(monkeypatch):
     api = _make(monkeypatch, inbound)
     api._config_host = 'vpn.example.com'
     text, _fn, err = _run(api.download_config(11, 'fardin', 'l2tp'))
-    assert err is None and 'PSK:' not in text   # خط مقدار PSK ] راست راهنماهای رشته‌ای مجاز است
+    assert err is None and 'Secret:' not in text   # خط مقدار Secret نباید باشد (راهنماهای متنی مجازاند)
 
 
 def test_download_config_l2tp_ipsec_without_psk_fails(monkeypatch):

@@ -750,7 +750,7 @@ class AsyncVpnUiAPI(AsyncXuiAPI):
                     ipsec_on = bool(st.get('ipsecEnable'))
                     psk = str(st.get('ipsecPsk') or '')
                     if ipsec_on and not psk:
-                        return None, None, "IPsec روشن است ولی PSK در اینباند تنظیم نشده — پنل را چک کنید"
+                        return None, None, "IPsec روشن است ولی Secret (PSK) در اینباند تنظیم نشده — پنل را چک کنید"
                     host = self._config_host or _host_from_url(self.url)
                     try:
                         port = int((inbound or {}).get('port') or 1701)
@@ -765,7 +765,7 @@ class AsyncVpnUiAPI(AsyncXuiAPI):
                         f"Password: {pwd}",
                     ]
                     if psk:
-                        lines.append(f"PSK: {psk}")
+                        lines.append(f"Secret: {psk}")
                     lines += [
                         "",
                         "iOS: Settings > VPN > Add VPN Configuration > Type: L2TP/IPsec",

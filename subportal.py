@@ -652,7 +652,7 @@ def render_portal(sub):
     file_guide = ''
     if fkind:
         app_name = {'openvpn': 'OpenVPN Connect', 'wireguard': 'WireGuard',
-                    'l2tp': 'تنظیمات دستگاه (L2TP/IPsec PSK)'}[fkind]
+                    'l2tp': 'تنظیمات دستگاه (L2TP/IPsec با Secret)'}[fkind]
         _known = {'openvpn': 'OpenVPN', 'wireguard': 'WireGuard', 'l2tp': 'L2TP/IPsec'}[fkind]
         file_guide = (
             "<section class='card glass'><h2>📥 دریافت کانفیگ</h2>"
