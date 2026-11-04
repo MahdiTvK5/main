@@ -259,8 +259,8 @@ def test_add_client_l2tp_returns_marker(monkeypatch):
     assert link == 'l2tp://fardin'
 
 
-def test_download_config_l2tp_card(monkeypatch):
-    """کارت اتصال: سرور/پورت/یوزر/پسورد/PSK از روی اینباند ساخته می‌شود."""
+def test_get_l2tp_info_card(monkeypatch):
+    """کارت پیام: سرور/پورت/یوزر/پسورد/Secret از روی اینباند خوانده می‌شود."""
     inbound = _file_inbound('l2tp')
     inbound['port'] = 1701
     inbound['settings'] = json.dumps({
@@ -269,19 +269,18 @@ def test_download_config_l2tp_card(monkeypatch):
     })
     api = _make(monkeypatch, inbound)
     api._config_host = 'vpn.example.com'
-    text, filename, err = _run(api.download_config(11, 'fardin', 'l2tp'))
+    info, err = _run(api.get_l2tp_info(11, 'fardin'))
     assert err is None
-    assert 'Server: vpn.example.com' in text
-    assert 'Port: 1701' in text
-    assert 'Username: fardin' in text
-    assert 'Password: secret' in text
-    assert 'Secret: sh4r3d-psk' in text
-    assert 'PSK:' not in text
-    assert filename == 'fardin-l2tp.txt'
+    assert info['server'] == 'vpn.example.com'
+    assert info['port'] == 1701
+    assert info['username'] == 'fardin'
+    assert info['password'] == 'secret'
+    assert info['secret'] == 'sh4r3d-psk'
+    assert info['ipsec'] is True
 
 
-def test_download_config_l2tp_raw_no_psk(monkeypatch):
-    """اینباند RAW (بدون IPsec): کارتْ PSK ندارد."""
+def test_get_l2tp_info_raw_has_no_secret(monkeypatch):
+    """اینباند RAW (بدون IPsec): Secret خالی است ولی مقادیر بقیه سالم می‌آید."""
     inbound = _file_inbound('l2tp')
     inbound['port'] = 1701
     inbound['settings'] = json.dumps({
@@ -290,12 +289,12 @@ def test_download_config_l2tp_raw_no_psk(monkeypatch):
     })
     api = _make(monkeypatch, inbound)
     api._config_host = 'vpn.example.com'
-    text, _fn, err = _run(api.download_config(11, 'fardin', 'l2tp'))
-    assert err is None and 'Secret:' not in text   # خط مقدار Secret نباید باشد (راهنماهای متنی مجازاند)
+    info, err = _run(api.get_l2tp_info(11, 'fardin'))
+    assert err is None and info['secret'] == '' and info['ipsec'] is False
 
 
-def test_download_config_l2tp_ipsec_without_psk_fails(monkeypatch):
-    """ipsecEnable روشن ولی PSK خالی → خطای شفاف به‌جای کارت ناقص."""
+def test_get_l2tp_info_ipsec_without_secret_fails(monkeypatch):
+    """ipsecEnable روشن ولی Secret خالی → خطای شفاف به‌جای کارت ناقص."""
     inbound = _file_inbound('l2tp')
     inbound['port'] = 1701
     inbound['settings'] = json.dumps({
@@ -303,8 +302,8 @@ def test_download_config_l2tp_ipsec_without_psk_fails(monkeypatch):
         'ipsecEnable': True, 'ipsecPsk': '',
     })
     api = _make(monkeypatch, inbound)
-    text, _fn, err = _run(api.download_config(11, 'fardin', 'l2tp'))
-    assert text is None and 'PSK' in err
+    info, err = _run(api.get_l2tp_info(11, 'fardin'))
+    assert info is None and 'Secret' in err
 
 
 def _run(coro):

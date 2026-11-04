@@ -685,6 +685,27 @@ async def _send_file_config(context, user_id, row, email, config_link):
             inbound_id, _p, _c = await xui.get_client_exact_info(email)
             if not inbound_id:
                 return False
+        if kind == 'l2tp':
+            # L2TP فایل کانفیگ ندارد؛ اطلاعات اتصال را مستقیم در پیام می‌فرستیم
+            info, info_err = await xui.get_l2tp_info(inbound_id, email)
+            if not info:
+                logging.warning("get_l2tp_info failed order=%s: %s", row['id'], info_err)
+                return False
+            label = 'L2TP/IPsec' if info.get('ipsec') else 'L2TP (RAW)'
+            secret_line = f"🗝️ Secret: `{info['secret']}`\n" if info.get('secret') else ""
+            msg = (
+                f"🔐 اطلاعات اتصال {label}\n"
+                f"🆔 سرویس: `{email}`\n\n"
+                f"🌍 سرور: `{info['server']}`\n"
+                f"🔌 پورت: `{info['port']}`\n"
+                f"👤 یوزرنیم: `{info['username']}`\n"
+                f"🔑 پسورد: `{info['password']}`\n"
+                + secret_line
+                + "\n📱 روی دستگاه (iOS/Android/Windows) یک اتصال L2TP/IPsec بسازید و همین مقادیر را وارد کنید.\n"
+                + SECURITY_WARNING
+            )
+            await context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+            return True
         creds = ''
         if kind == 'openvpn':
             # اکانت OpenVPN با یوزر (email) و پسورد RADIUS وارد می‌شود؛ پسورد از پنل خوانده می‌شود

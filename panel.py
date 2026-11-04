@@ -732,52 +732,44 @@ class AsyncVpnUiAPI(AsyncXuiAPI):
                             return self._fix_wg_endpoint(cfg, host), f"{email}.conf", None
                     return None, None, "کانفیگ وایرگارد از پنل دریافت نشد"
                 if protocol == 'l2tp':
-                    # vpn-ui برای L2TP فایل کانفیگ ندارد؛ مشخصات اتصال از خود اینباند
-                    # خوانده و به‌صورت «کارتِ اطلاعات اتصال» (متن) ساخته می‌شود.
-                    # (العنوان زیر + per-account PPP creds در settings؛ psk درbând-level است.)
-                    inbound = await self.get_inbound(int(inbound_id)) if inbound_id else None
-                    try:
-                        st = json.loads((inbound or {}).get('settings') or '{}')
-                    except Exception:
-                        st = {}
-                    acct = next((c for c in (st.get('clients') or [])
-                                 if str(c.get('email', '')).strip().lower() == str(email).strip().lower()), None)
-                    if not acct:
-                        return None, None, f"اکانت {email} روی اینباند L2TP یافت نشد"
-                    pwd = str(acct.get('password') or '')
-                    if not pwd:
-                        return None, None, "پسورد اکانت L2TP روی پنل ثبت نشده است"
-                    ipsec_on = bool(st.get('ipsecEnable'))
-                    psk = str(st.get('ipsecPsk') or '')
-                    if ipsec_on and not psk:
-                        return None, None, "IPsec روشن است ولی Secret (PSK) در اینباند تنظیم نشده — پنل را چک کنید"
-                    host = self._config_host or _host_from_url(self.url)
-                    try:
-                        port = int((inbound or {}).get('port') or 1701)
-                    except (TypeError, ValueError):
-                        port = 1701
-                    head = 'L2TP/IPsec' if ipsec_on else 'L2TP (RAW)'
-                    lines = [
-                        f"# {head} — OverWall",
-                        f"Server: {host}",
-                        f"Port: {port}",
-                        f"Username: {email}",
-                        f"Password: {pwd}",
-                    ]
-                    if psk:
-                        lines.append(f"Secret: {psk}")
-                    lines += [
-                        "",
-                        "iOS: Settings > VPN > Add VPN Configuration > Type: L2TP/IPsec",
-                        "Android: Settings > VPN > + > VPN type: L2TP/IPsec PSK",
-                        "Windows: Settings > VPN > Add VPN > Windows (built-in) > L2TP/IPsec with pre-shared key",
-                        "",
-                        "Credentials are private — do not share this file.",
-                    ]
-                    return "\n".join(lines), f"{email}-l2tp.txt", None
+                    # vpn-ui برای L2TP فایل کانفیگ ندارد؛ مقادیر از get_l2tp_info
+                    # گرفته و به‌صورت پیام (نه فایل) برای کاربر فرستاده می‌شود.
+                    return None, None, "برای L2TP فایل کانفیگ نداریم؛ اطلاعات اتصال در پیام ربات است"
                 return None, None, "نوع پروتکل قابل تشخیص نبود"
             except Exception as e:
                 return None, None, str(e)
+
+    async def get_l2tp_info(self, inbound_id, email):
+        """مقادیر اتصال L2TP برای «کارت پیام» ربات: (dict, None) یا (None, خطا).
+
+        یوزر/پسورد RADIUS از clients داخل تنظیمات اینباند و Secret از ipsecPsk
+        سطح اینباند خوانده می‌شود؛ مسیر/پورت هر دو از رکورد اینباند."""
+        try:
+            inbound = await self.get_inbound(int(inbound_id)) if inbound_id else None
+            try:
+                st = json.loads((inbound or {}).get('settings') or '{}')
+            except Exception:
+                st = {}
+            acct = next((c for c in (st.get('clients') or [])
+                         if str(c.get('email', '')).strip().lower() == str(email).strip().lower()), None)
+            if not acct:
+                return None, f"اکانت {email} روی اینباند L2TP یافت نشد"
+            pwd = str(acct.get('password') or '')
+            if not pwd:
+                return None, "پسورد اکانت L2TP روی پنل ثبت نشده است"
+            ipsec_on = bool(st.get('ipsecEnable'))
+            psk = str(st.get('ipsecPsk') or '')
+            if ipsec_on and not psk:
+                return None, "IPsec روشن است ولی Secret (PSK) در اینباند تنظیم نشده — پنل را چک کنید"
+            host = self._config_host or _host_from_url(self.url)
+            try:
+                port = int((inbound or {}).get('port') or 1701)
+            except (TypeError, ValueError):
+                port = 1701
+            return ({'server': host, 'port': port, 'username': email, 'password': pwd,
+                     'secret': psk, 'ipsec': ipsec_on}, None)
+        except Exception as e:
+            return None, str(e)
 
     @staticmethod
     def _fix_ovpn_host(text, host):
