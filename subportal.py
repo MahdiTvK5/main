@@ -586,8 +586,9 @@ def render_portal(sub):
     if fkind:
         # سرویس فایلی (OpenVPN/WireGuard): مشخصات پروتکلی معمولی ندارد
         spec = (
-            _spec_cell('پروتکل', 'OpenVPN' if fkind == 'openvpn' else 'WireGuard')
-            + _spec_cell('نوع کانفیگ', 'فایل')
+            _spec_cell('پروتکل', {'openvpn': 'OpenVPN', 'wireguard': 'WireGuard',
+                                  'l2tp': 'L2TP/IPsec'}.get(fkind, fkind))
+            + _spec_cell('نوع کانفیگ', 'کارت اتصال' if fkind == 'l2tp' else 'فایل')
             + _spec_cell('دریافت', 'از داخل ربات')
         )
     else:
@@ -650,13 +651,20 @@ def render_portal(sub):
     # کارت راهنمای دریافت فایل از ربات جای آن‌ها می‌نشیند.
     file_guide = ''
     if fkind:
-        app_name = 'OpenVPN Connect' if fkind == 'openvpn' else 'WireGuard'
+        app_name = {'openvpn': 'OpenVPN Connect', 'wireguard': 'WireGuard',
+                    'l2tp': 'تنظیمات دستگاه (L2TP/IPsec PSK)'}[fkind]
+        _known = {'openvpn': 'OpenVPN', 'wireguard': 'WireGuard', 'l2tp': 'L2TP/IPsec'}[fkind]
         file_guide = (
             "<section class='card glass'><h2>📥 دریافت کانفیگ</h2>"
             f"<p style='font-size:13.5px;color:var(--mut);line-height:2'>این سرویس از نوع "
-            f"<b style='color:var(--txt)'>{'OpenVPN' if fkind == 'openvpn' else 'WireGuard'}</b> است؛ "
-            "فایل کانفیگ را از ربات (سفارشات من → دریافت کانفیگ) دانلود کنید و در اپ "
-            f"<b style='color:var(--txt)'>{app_name}</b> ایمپورت کنید.</p></section>"
+            f"<b style='color:var(--txt)'>{_known}</b> است؛ "
+            + ("فایل اطلاعات اتصال (Server/Username/Password/PSK) را از ربات"
+               " (سفارشات من → دریافت کانفیگ) دانلود کنید و روی دستگاه یک اتصال"
+               " L2TP/IPsec با همان مقادیر بسازید."
+               if fkind == 'l2tp' else
+               "فایل کانفیگ را از ربات (سفارشات من → دریافت کانفیگ) دانلود کنید و در اپ ")
+            + ("" if fkind == 'l2tp' else f"<b style='color:var(--txt)'>{app_name}</b> ایمپورت کنید.")
+            + "</p></section>"
         )
         qc = ''
         sub_section = ''

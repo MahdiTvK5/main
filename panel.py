@@ -57,11 +57,11 @@ def is_vpnui_panel(panel):
 
 
 def file_link_kind(link):
-    """نوع «لینک نشانگرِ فایل» را برمی‌گرداند: openvpn / wireguard / '' (لینک معمولی).
+    """نوع «لینک نشانگرِ فایل» را برمی‌گرداند: openvpn / wireguard / l2tp / '' (لینک معمولی).
 
-    اینباندهای OpenVPN/WireGuard در vpn-ui فایل کانفیگ می‌دهند نه URI؛ پس ربات در
-    config_link سفارش یک نشانگر ذخیره می‌کند (ovpn://udp/name یا wg://name) و فایل
-    واقعی هنگام «دریافت کانفیگ» از پنل دانلود می‌شود."""
+    اینباندهای OpenVPN/WireGuard/L2TP در vpn-ui URI اشتراکی به‌معنای معمول ندارند؛ پس ربات در
+    config_link سفارش یک نشانگر ذخیره می‌کند (ovpn://udp/name یا wg://name یا l2tp://name) و
+    فایل/اطلاعات اتصال هنگام «دریافت کانفیگ» از پنل ساخته می‌شود."""
     if not link:
         return ""
     s = str(link).strip()
@@ -69,11 +69,13 @@ def file_link_kind(link):
         return "openvpn"
     if s.startswith("wg://"):
         return "wireguard"
+    if s.startswith("l2tp://"):
+        return "l2tp"
     return ""
 
 
 def parse_file_link(link):
-    """ovpn://udp/name یا wg://name را باز می‌کند: (نوع، ترنسپورت، نام سرویس)."""
+    """ovpn://udp/name یا wg://name یا l2tp://name را باز می‌کند: (نوع، ترنسپورت، نام سرویس)."""
     kind = file_link_kind(link)
     if not kind:
         return "", "", ""
@@ -82,6 +84,8 @@ def parse_file_link(link):
         rest = s[len("ovpn://"):]
         transport, _, name = rest.partition('/')
         return kind, (transport or 'udp'), name
+    if kind == "l2tp":
+        return kind, "", s[len("l2tp://"):]
     return kind, "udp", s[len("wg://"):]
 
 
@@ -606,7 +610,7 @@ class AsyncVpnUiAPI(AsyncXuiAPI):
     # ---- اینباندهای فایلی (OpenVPN / WireGuard) -------------------------
 
     async def add_client(self, inbound_id, client_email, total_gb, expire_days, host, limit_ip=1, inbound=None):
-        """ساخت اکانت روی اینباند فایلی (openvpn/wg-c/awg/…).
+        """ساخت اکانت روی اینباند فایلی (openvpn/wg-c/awg/l2tp).
 
         در vpn-ui اکانت این پروتکل‌ها از جفت «email + password» تشکیل می‌شود
         (email = نام سرویس، password = رمز RADIUS) و totalGB/expiryTime هم روی
@@ -618,7 +622,7 @@ class AsyncVpnUiAPI(AsyncXuiAPI):
         if not inbound:
             return None, f"اینباند با آیدی {inbound_id} یافت نشد"
         protocol = (inbound.get('protocol') or '').lower()
-        if protocol not in ('openvpn', 'wg-c', 'awg'):
+        if protocol not in ('openvpn', 'wg-c', 'awg', 'l2tp'):
             return None, f"پروتکل {protocol} به‌صورت فایلی پشتیبانی نمی‌شود"
         try:
             settings = json.loads(inbound.get('settings') or '{}')
@@ -663,6 +667,10 @@ class AsyncVpnUiAPI(AsyncXuiAPI):
                 if res.status_code == 200 and data.get('success', False):
                     self._invalidate_cache()
                     scheme = 'wg' if protocol in ('wg-c', 'awg') else 'ovpn'
+                    if protocol == 'l2tp':
+                        # L2TP فایل کانفیگ ندارد؛ نشانگرِ سفارش فقط نام اکانت است و
+                        # «دریافت کانفیگ» کارتِ اطلاعات اتصال (یوزر/پسورد/PSK) می‌سازد.
+                        return f"l2tp://{client_email}", None
                     if protocol == 'openvpn':
                         # در vpn-ui هر ترنسپورت (udp/tcp) اینباندِ خودش را دارد؛
                         # ترنسپورت از روی نام اینباند تشخیص داده می‌شود (پورت‌های رایج + udp/tcp در remark)
@@ -723,6 +731,50 @@ class AsyncVpnUiAPI(AsyncXuiAPI):
                         if cfg:
                             return self._fix_wg_endpoint(cfg, host), f"{email}.conf", None
                     return None, None, "کانفیگ وایرگارد از پنل دریافت نشد"
+                if protocol == 'l2tp':
+                    # vpn-ui برای L2TP فایل کانفیگ ندارد؛ مشخصات اتصال از خود اینباند
+                    # خوانده و به‌صورت «کارتِ اطلاعات اتصال» (متن) ساخته می‌شود.
+                    # (العنوان زیر + per-account PPP creds در settings؛ psk درbând-level است.)
+                    inbound = await self.get_inbound(int(inbound_id)) if inbound_id else None
+                    try:
+                        st = json.loads((inbound or {}).get('settings') or '{}')
+                    except Exception:
+                        st = {}
+                    acct = next((c for c in (st.get('clients') or [])
+                                 if str(c.get('email', '')).strip().lower() == str(email).strip().lower()), None)
+                    if not acct:
+                        return None, None, f"اکانت {email} روی اینباند L2TP یافت نشد"
+                    pwd = str(acct.get('password') or '')
+                    if not pwd:
+                        return None, None, "پسورد اکانت L2TP روی پنل ثبت نشده است"
+                    ipsec_on = bool(st.get('ipsecEnable'))
+                    psk = str(st.get('ipsecPsk') or '')
+                    if ipsec_on and not psk:
+                        return None, None, "IPsec روشن است ولی PSK در اینباند تنظیم نشده — پنل را چک کنید"
+                    host = self._config_host or _host_from_url(self.url)
+                    try:
+                        port = int((inbound or {}).get('port') or 1701)
+                    except (TypeError, ValueError):
+                        port = 1701
+                    head = 'L2TP/IPsec' if ipsec_on else 'L2TP (RAW)'
+                    lines = [
+                        f"# {head} — OverWall",
+                        f"Server: {host}",
+                        f"Port: {port}",
+                        f"Username: {email}",
+                        f"Password: {pwd}",
+                    ]
+                    if psk:
+                        lines.append(f"PSK: {psk}")
+                    lines += [
+                        "",
+                        "iOS: Settings > VPN > Add VPN Configuration > Type: L2TP/IPsec",
+                        "Android: Settings > VPN > + > VPN type: L2TP/IPsec PSK",
+                        "Windows: Settings > VPN > Add VPN > Windows (built-in) > L2TP/IPsec with pre-shared key",
+                        "",
+                        "Credentials are private — do not share this file.",
+                    ]
+                    return "\n".join(lines), f"{email}-l2tp.txt", None
                 return None, None, "نوع پروتکل قابل تشخیص نبود"
             except Exception as e:
                 return None, None, str(e)

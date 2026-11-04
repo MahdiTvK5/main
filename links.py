@@ -26,6 +26,8 @@ def email_from_link(link):
         return (name or transport).strip()
     if link.startswith("wg://"):
         return link[len("wg://"):].strip()
+    if link.startswith("l2tp://"):
+        return link[len("l2tp://"):].strip()
     if link.startswith("vmess://"):
         payload = link[len("vmess://"):].split("#")[0].strip()
         try:

@@ -1,4 +1,4 @@
-"""تست‌های سرویس‌های فایلی (OpenVPN / WireGuard) روی پنل vpn-ui."""
+"""تست‌های سرویس‌های فایلی (OpenVPN / WireGuard / L2TP) روی پنل vpn-ui."""
 import asyncio
 import json
 
@@ -26,12 +26,14 @@ def test_parse_file_link():
     assert parse_file_link('ovpn://udp/fardin') == ('openvpn', 'udp', 'fardin')
     assert parse_file_link('ovpn://tcp/fardin') == ('openvpn', 'tcp', 'fardin')
     assert parse_file_link('wg://fardin') == ('wireguard', 'udp', 'fardin')
+    assert parse_file_link('l2tp://fardin') == ('l2tp', '', 'fardin')
 
 
 def test_order_email_reads_file_link_fragment():
     # email باید حتی از نشانگر فایل هم استخراج شود (fallback برای رکوردهای بدون ستون email)
     assert order_email({'config_link': 'ovpn://udp/fardin'}) == 'fardin'
     assert order_email({'config_link': 'wg://fardin'}) == 'fardin'
+    assert order_email({'config_link': 'l2tp://fardin'}) == 'fardin'
     assert order_email({'config_link': 'vless://u@h:1?x#ali'}) == 'ali'
 
 
@@ -241,6 +243,67 @@ def test_download_config_wg_endpoint_rewritten(monkeypatch):
     assert err is None
     assert 'Endpoint = vpn.example.com:51820' in text
     assert '1.2.3.4' not in text
+
+
+# ================= L2TP =================
+
+def test_file_link_l2tp_kind():
+    assert file_link_kind('l2tp://fardin') == 'l2tp'
+    assert file_link_kind('vless://uuid@host:443?x#fardin') == ''
+
+
+def test_add_client_l2tp_returns_marker(monkeypatch):
+    api = _make(monkeypatch, _file_inbound('l2tp'))
+    link, err = _run(api.add_client(11, 'fardin', 50, 30, '1.2.3.4'))
+    assert err is None
+    assert link == 'l2tp://fardin'
+
+
+def test_download_config_l2tp_card(monkeypatch):
+    """کارت اتصال: سرور/پورت/یوزر/پسورد/PSK از روی اینباند ساخته می‌شود."""
+    inbound = _file_inbound('l2tp')
+    inbound['port'] = 1701
+    inbound['settings'] = json.dumps({
+        'clients': [{'email': 'fardin', 'id': 'fardin', 'password': 'secret'}],
+        'ipsecEnable': True, 'ipsecPsk': 'sh4r3d-psk',
+    })
+    api = _make(monkeypatch, inbound)
+    api._config_host = 'vpn.example.com'
+    text, filename, err = _run(api.download_config(11, 'fardin', 'l2tp'))
+    assert err is None
+    assert 'Server: vpn.example.com' in text
+    assert 'Port: 1701' in text
+    assert 'Username: fardin' in text
+    assert 'Password: secret' in text
+    assert 'PSK: sh4r3d-psk' in text
+    assert filename == 'fardin-l2tp.txt'
+
+
+def test_download_config_l2tp_raw_no_psk(monkeypatch):
+    """اینباند RAW (بدون IPsec): کارتْ PSK ندارد."""
+    inbound = _file_inbound('l2tp')
+    inbound['port'] = 1701
+    inbound['settings'] = json.dumps({
+        'clients': [{'email': 'fardin', 'id': 'fardin', 'password': 'secret'}],
+        'ipsecEnable': False, 'allowRaw': True,
+    })
+    api = _make(monkeypatch, inbound)
+    api._config_host = 'vpn.example.com'
+    text, _fn, err = _run(api.download_config(11, 'fardin', 'l2tp'))
+    assert err is None and 'PSK:' not in text   # خط مقدار PSK ] راست راهنماهای رشته‌ای مجاز است
+
+
+def test_download_config_l2tp_ipsec_without_psk_fails(monkeypatch):
+    """ipsecEnable روشن ولی PSK خالی → خطای شفاف به‌جای کارت ناقص."""
+    inbound = _file_inbound('l2tp')
+    inbound['port'] = 1701
+    inbound['settings'] = json.dumps({
+        'clients': [{'email': 'fardin', 'id': 'fardin', 'password': 'secret'}],
+        'ipsecEnable': True, 'ipsecPsk': '',
+    })
+    api = _make(monkeypatch, inbound)
+    text, _fn, err = _run(api.download_config(11, 'fardin', 'l2tp'))
+    assert text is None and 'PSK' in err
 
 
 def _run(coro):

@@ -696,12 +696,21 @@ async def _send_file_config(context, user_id, row, email, config_link):
         if not text:
             logging.warning("download_config failed order=%s kind=%s: %s", row['id'], kind, err)
             return False
-        label = 'OpenVPN' if kind == 'openvpn' else 'WireGuard'
-        ext = 'ovpn' if kind == 'openvpn' else 'conf'
+        label, ext = {'openvpn': ('OpenVPN', 'ovpn'),
+                      'wireguard': ('WireGuard', 'conf'),
+                      'l2tp': ('L2TP/IPsec', 'txt')}[kind]
+        if kind == 'l2tp':
+            # L2TP فایل کانفیگ قابل ایمپورت ندارد؛ کارت اطلاعات اتصال را می‌فرستیم
+            hint = ("این فایل اطلاعات اتصال است؛ آن را باز کنید و روی دستگاه یک اتصال"
+                    " L2TP/IPsec (با PSK) با همان مقادیر بسازید.")
+        elif kind == 'openvpn':
+            hint = "فایل را دانلود و در اپ OpenVPN Connect ایمپورت کنید."
+        else:
+            hint = "فایل را دانلود و در اپ WireGuard ایمپورت کنید."
         caption = (
-            f"📁 کانفیگ {label} — سرویس: `{email}`\n"
+            f"📁 {'اطلاعات اتصال' if kind == 'l2tp' else 'کانفیگ'} {label} — سرویس: `{email}`\n"
             + creds
-            + f"فایل را دانلود و در اپ ({'OpenVPN Connect' if kind == 'openvpn' else 'WireGuard'}) ایمپورت کنید.{SECURITY_WARNING}"
+            + hint + SECURITY_WARNING
         )
         import io
         doc = io.BytesIO(text.encode())
@@ -2318,7 +2327,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row, _email = await load_order_service(order_id)
         panel = await db.get_panel(row['panel_id']) if row else None
         if is_vpnui_panel(panel) and file_link_kind(row['config_link'] if row else ''):
-            return await safe_answer(query, "⛔️ این سرویس OpenVPN/WireGuard است و UUID ندارد.", alert=True)
+            return await safe_answer(query, "⛔️ این سرویس OpenVPN/WireGuard/L2TP است و UUID ندارد.", alert=True)
         found = await fetch_client_for_order(query, order_id)
         if not found: return
         xui, cfg_ip, inbound_id, client_dict = found
