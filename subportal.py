@@ -546,7 +546,10 @@ AUTO_REFRESH_JS = """<script>
 PAGE_JS = """<script>
 (function(){
   var root=document.documentElement;
-  try{var saved=localStorage.getItem('ow-theme');if(saved)root.setAttribute('data-theme',saved);}catch(e){}
+  var saved=null;
+  try{saved=localStorage.getItem('ow-theme');}catch(e){}
+  /* تم دیفالت شب است؛ فقط اگر کاربر خودش روشن را انتخاب کرده باشد روشن می‌ماند. */
+  root.setAttribute('data-theme',saved==='light'?'light':'dark');
   var tb=document.getElementById('theme');
   if(tb)tb.addEventListener('click',function(){
     var dark=root.getAttribute('data-theme')==='dark';
@@ -743,7 +746,7 @@ def render_portal(sub):
             f"{_GLYPH['link']}<span>Get sharing link</span></button>"
         )
 
-    doc = f"""<!doctype html><html lang="fa" dir="rtl"><head>
+    doc = f"""<!doctype html><html lang="fa" dir="rtl" data-theme="dark"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer"><meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://cdn.jsdelivr.net">
@@ -806,7 +809,7 @@ _ERROR_PAGES = {
 def render_error_page(kind):
     ico, title, text = _ERROR_PAGES.get(kind, _ERROR_PAGES['not_found'])
     return (
-        f"<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'>"
+        f"<!doctype html><html lang='fa' dir='rtl' data-theme='dark'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>{BRAND}</title>{PAGE_CSS}</head><body><div class='wrap'>"
         f"<div class='err glass'><div class='ico'>{ico}</div><h1>{title}</h1><p>{text}</p></div>"
