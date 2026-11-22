@@ -412,6 +412,11 @@ margin-top:8px;direction:ltr;word-break:break-all}
 box-shadow:4px 4px 0 var(--line);background:var(--card);cursor:pointer;padding:0;text-decoration:none}
 .ic svg{width:22px;height:22px;stroke:#111;fill:none;stroke-width:2;stroke-linecap:round}
 .ic-y{background:var(--yellow)}.ic-r{background:var(--red)}.ic-b{background:var(--blue)}
+/* آیکون دکمه‌ی تم: در شب خورشید (برو به روشن)، در روز ماه (برو به شب). */
+#theme span{display:flex;align-items:center;justify-content:center}
+#theme .g-sun{display:none}
+[data-theme="dark"] #theme .g-moon{display:none}
+[data-theme="dark"] #theme .g-sun{display:flex}
 .ic-r svg,.ic-b svg{stroke:#F3EFE5}
 .ic:active{transform:translate(2px,2px);box-shadow:2px 2px 0 var(--line)}
 .card{background:var(--card);border:2.5px solid var(--line);box-shadow:var(--sh);padding:22px 18px;margin-bottom:22px;
@@ -596,6 +601,9 @@ _GLYPH = {
     'globe': "<svg viewBox='0 0 24 24'><circle cx='12' cy='12' r='9'/>"
              "<path d='M3 12h18M12 3c2.6 3 2.6 15 0 18M12 3c-2.6 3-2.6 15 0 18'/></svg>",
     'moon': "<svg viewBox='0 0 24 24'><path d='M20 14.5A8.5 8.5 0 019.5 4 8.5 8.5 0 1020 14.5z'/></svg>",
+    'sun': "<svg viewBox='0 0 24 24'><circle cx='12' cy='12' r='4.2'/>"
+           "<path d='M12 2.5v2.6M12 18.9v2.6M2.5 12h2.6M18.9 12h2.6M5.2 5.2l1.9 1.9"
+           "M16.9 16.9l1.9 1.9M18.8 5.2l-1.9 1.9M7.1 16.9l-1.9 1.9'/></svg>",
     'qr': "<svg viewBox='0 0 24 24'><path d='M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z'/>"
           "<path d='M14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z'/></svg>",
     'bolt': "<svg viewBox='0 0 24 24' fill='#F3EFE5' stroke='none'><path d='M13 2L4 14h6l-1 8 9-12h-6z'/></svg>",
@@ -758,7 +766,7 @@ def render_portal(sub):
 <div class="handle">{esc(name)}</div>
 <div class="icons">
 <button class="ic ic-b" type="button" id="qrbtn" title="qr">{_GLYPH['qr']}</button>
-<button class="ic ic-r" type="button" id="theme" title="theme">{_GLYPH['moon']}</button>
+<button class="ic ic-r" type="button" id="theme" title="theme" aria-label="theme"><span class="g-moon">{_GLYPH['moon']}</span><span class="g-sun">{_GLYPH['sun']}</span></button>
 <a class="ic ic-y" href="{esc(raw)}" target="_blank" rel="noreferrer" title="open link">{_GLYPH['globe']}</a>
 </div>
 </header>
