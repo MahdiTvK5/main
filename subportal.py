@@ -23,6 +23,7 @@ from urllib.parse import quote
 
 import db
 from config import PORTAL_PUBLIC_URL, format_size
+from portal_logos import APP_LOGOS, logo_key
 from links import order_email
 from panel import _stream_params, build_share_link, build_xui, file_link_kind
 
@@ -477,6 +478,7 @@ padding:14px 14px;margin-bottom:16px}
 .app summary::-webkit-details-marker{display:none}
 .app-ico{width:44px;height:44px;border:2px solid #111;display:flex;align-items:center;justify-content:center;
 font-weight:800;font-size:18px;color:#fff;flex:none;font-family:'Courier New',monospace}
+.app-ico img{width:100%;height:100%;display:block;object-fit:contain}
 .app-t{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
 .app-name{font-size:17px;font-weight:800;direction:ltr;text-align:right;line-height:1.25}
 .app-sub{font-size:12px;color:var(--muted);text-align:right;line-height:1.6}
@@ -656,9 +658,15 @@ def render_portal(sub):
         for app in pdata['apps']:
             sub_t, dl = APP_META.get(app['id'], ('', ''))
             subline = esc(sub_t or ('پیشنهادی' if app.get('recommended') else ''))
-            a1, a2 = app.get('accent') or ('#111111', '#3B3B3B')
-            ico = (f"<span class='app-ico' style='background:linear-gradient(135deg,{esc(a1)},{esc(a2)})'>"
-                   f"{esc(app.get('initial') or '')}</span>")
+            if logo_key(app['id']):
+                # لوگوی رسمی خود اپ (از /sub/applogo/... با کش یک‌هفته‌ای).
+                ico = ("<span class='app-ico logo'>"
+                       f"<img src='/sub/applogo/{esc(app['id'])}.png' alt='' "
+                       "width='40' height='40' loading='lazy'></span>")
+            else:
+                a1, a2 = app.get('accent') or ('#111111', '#3B3B3B')
+                ico = (f"<span class='app-ico' style='background:linear-gradient(135deg,{esc(a1)},{esc(a2)})'>"
+                       f"{esc(app.get('initial') or '')}</span>")
             if app.get('import_url'):
                 add_btn = f"<a class='sbtn g' href='{esc(app['import_url'])}'>افزودن</a>"
             else:
@@ -917,6 +925,17 @@ def _html(text, status=200):
     return web.Response(
         text=text, status=status, content_type='text/html', charset='utf-8',
         headers={'Cache-Control': 'no-store'},
+    )
+
+
+async def logo_asset(request):
+    """/sub/applogo/{app}.png — لوگوی رسمی اپ کارت «اتصال دستگاه‌ها»."""
+    key = logo_key(request.match_info.get('app', ''))
+    if not key:
+        raise web.HTTPNotFound()
+    return web.Response(
+        body=base64.b64decode(APP_LOGOS[key]), content_type='image/png',
+        headers={'Cache-Control': 'public, max-age=604800'},
     )
 
 

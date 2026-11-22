@@ -2986,6 +2986,7 @@ def build_app():
         web.get("/sub/{token}", subportal.portal_page),
         web.get("/sub/{token}/raw", subportal.raw_subscription),
         web.get("/sub/{token}/clash", subportal.clash_subscription),
+        web.get("/sub/applogo/{app}.png", subportal.logo_asset),
     ])
     return app
 
