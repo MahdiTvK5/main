@@ -510,9 +510,22 @@ font-family:inherit;background:var(--card)}
 [data-theme="dark"] .sbtn{box-shadow:3px 3px 0 #F3EFE5;color:#111}
 [data-theme="dark"] .stepn{background:#F3EFE5;color:#111}
 .card.direct{padding:0}
-.card.direct summary{list-style:none;cursor:pointer;padding:16px 18px;font-size:14px;font-weight:700;
-display:flex;align-items:center;gap:8px}
+.card.direct summary{list-style:none;cursor:pointer;padding:14px 18px;font-size:14px;font-weight:700;
+display:flex;align-items:center;gap:10px;transition:background .15s}
 .card.direct summary::-webkit-details-marker{display:none}
+.dsum-t{flex:1;min-width:0;font-weight:800;font-size:13.5px;line-height:1.6}
+.dsum-h{font-size:11px;font-weight:700;color:var(--muted);flex:none;white-space:nowrap;
+text-decoration:underline;text-underline-offset:3px}
+.dsum-h .h-close{display:none}
+.card.direct[open] .dsum-h .h-open{display:none}
+.card.direct[open] .dsum-h .h-close{display:inline}
+.dsum-c{width:30px;height:30px;flex:none;display:flex;align-items:center;justify-content:center;
+border:2.5px solid var(--line);background:var(--yellow);box-shadow:2px 2px 0 var(--line);
+transition:transform .18s}
+.dsum-c svg{width:16px;height:16px;stroke:#111;fill:none;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.card.direct summary:hover .dsum-c{transform:translateY(2px)}
+.card.direct[open] .dsum-c{transform:rotate(180deg)}
+.card.direct summary:active .dsum-c{box-shadow:1px 1px 0 var(--line)}
 .card.direct .subbox{padding:0 18px 18px;display:flex;flex-direction:column;gap:10px}
 .card.direct code{background:var(--paper);border:2px solid var(--line);padding:12px;font-size:11px;
 font-family:ui-monospace,Consolas,monospace;direction:ltr;text-align:left;word-break:break-all;line-height:1.8}
@@ -604,6 +617,7 @@ _GLYPH = {
     'sun': "<svg viewBox='0 0 24 24'><circle cx='12' cy='12' r='4.2'/>"
            "<path d='M12 2.5v2.6M12 18.9v2.6M2.5 12h2.6M18.9 12h2.6M5.2 5.2l1.9 1.9"
            "M16.9 16.9l1.9 1.9M18.8 5.2l-1.9 1.9M7.1 16.9l-1.9 1.9'/></svg>",
+    'chev': "<svg viewBox='0 0 24 24'><path d='M6 9l6 6 6-6'/></svg>",
     'qr': "<svg viewBox='0 0 24 24'><path d='M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z'/>"
           "<path d='M14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z'/></svg>",
     'bolt': "<svg viewBox='0 0 24 24' fill='#F3EFE5' stroke='none'><path d='M13 2L4 14h6l-1 8 9-12h-6z'/></svg>",
@@ -721,7 +735,12 @@ def render_portal(sub):
     direct = ''
     if sub.get('config_link') and not fkind:
         direct = (
-            "<details class='card direct'><summary>کانفیگ مستقیم (VLESS / VMess / Trojan)</summary>"
+            "<details class='card direct'><summary>"
+            "<span class='dsum-t'>کانفیگ مستقیم (VLESS / VMess / Trojan)</span>"
+            "<span class='dsum-h'><span class='h-open'>نمایش لینک</span>"
+            "<span class='h-close'>بستن</span></span>"
+            f"<span class='dsum-c' aria-hidden='true'>{_GLYPH['chev']}</span>"
+            "</summary>"
             "<div class='subbox'><code>" + esc(sub['config_link']) + "</code>"
             f"<button class='sbtn y' type='button' data-copy='{esc(sub['config_link'])}' "
             "onclick='owCopy(this)'>کپی</button></div></details>"
