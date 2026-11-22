@@ -23,7 +23,7 @@ from urllib.parse import quote
 
 import db
 from config import PORTAL_PUBLIC_URL, format_size
-from portal_logos import APP_LOGOS, logo_key
+from portal_logos import APP_LOGOS, logo_key, logo_ver
 from links import order_email
 from panel import _stream_params, build_share_link, build_xui, file_link_kind
 
@@ -658,10 +658,11 @@ def render_portal(sub):
         for app in pdata['apps']:
             sub_t, dl = APP_META.get(app['id'], ('', ''))
             subline = esc(sub_t or ('پیشنهادی' if app.get('recommended') else ''))
-            if logo_key(app['id']):
-                # لوگوی رسمی خود اپ (از /sub/applogo/... با کش یک‌هفته‌ای).
+            logo = logo_key(app['id'])
+            if logo:
+                # لوگوی رسمی خود اپ؛ ?v=<hash> تا عوض شدن آیکون از کش رد نشه.
                 ico = ("<span class='app-ico logo'>"
-                       f"<img src='/sub/applogo/{esc(app['id'])}.png' alt='' "
+                       f"<img src='/sub/applogo/{esc(app['id'])}.png?v={logo_ver(logo)}' alt='' "
                        "width='40' height='40' loading='lazy'></span>")
             else:
                 a1, a2 = app.get('accent') or ('#111111', '#3B3B3B')
