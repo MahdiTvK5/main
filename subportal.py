@@ -635,9 +635,9 @@ padding:0 10px;display:inline-flex;align-items:flex-start;gap:1px;direction:ltr}
 .metaline{font-family:'Courier New',ui-monospace,Consolas,monospace;font-size:11px;color:var(--muted);
 margin-top:14px;letter-spacing:.5px;direction:ltr;text-align:right;word-break:break-word}
 /* ---------- QR + actions ---------- */
-.qrgrid{display:grid;grid-template-columns:118px 1fr;gap:12px;align-items:start}
+.qrgrid{display:grid;grid-template-columns:132px 1fr;gap:12px;align-items:start}
 .qrgrid .qimg{background:#fff;padding:6px;border:2.5px solid var(--line);box-shadow:3px 3px 0 var(--line)}
-.qrgrid .qimg img{width:100%;display:block}
+.qrgrid .qimg img{width:100%;height:auto;aspect-ratio:1/1;display:block}
 .acts{display:flex;flex-direction:column;gap:9px}
 .acts .sbtn{width:100%;justify-content:center;padding:11px 8px;font-size:12.5px}
 .btn-black{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;background:#141414;
