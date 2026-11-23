@@ -438,12 +438,19 @@ direction:ltr;color:var(--muted)}
 /* تیتر کارت وضعیت کنار ربع دایره بماند و زیرش نرود. */
 .statuscard .lbl.top{margin-right:92px}
 .big{font-size:27px;font-weight:800;line-height:1.2;margin:6px 0 12px;letter-spacing:-.2px;
-display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;direction:rtl;justify-content:flex-start}
-.big .en{font-family:'Courier New',ui-monospace,Consolas,monospace;font-size:19px;font-weight:700;
-direction:ltr;color:var(--muted)}
+display:flex;align-items:baseline;gap:5px;flex-wrap:wrap;direction:rtl;justify-content:flex-start}
+.big .fa{unicode-bidi:isolate}
+.big .en{font-family:'Courier New',ui-monospace,Consolas,monospace;font-size:18px;font-weight:700;
+direction:ltr;unicode-bidi:isolate;color:var(--muted);letter-spacing:0}
+.big .sep{font-family:'Courier New',ui-monospace,Consolas,monospace;font-size:18px;color:var(--muted);
+opacity:.8}
 .pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:800;
 background:var(--green);color:#141414;border:2px solid var(--line);padding:5px 11px;box-shadow:3px 3px 0 var(--line)}
-.pill .en{font-family:'Courier New',ui-monospace,Consolas,monospace;font-size:11px;font-weight:700;direction:ltr}
+.pill .fa{unicode-bidi:isolate}
+.pill .en{font-family:'Courier New',ui-monospace,Consolas,monospace;font-size:11px;font-weight:700;
+direction:ltr;unicode-bidi:isolate;letter-spacing:0}
+.pill .sep{font-family:'Courier New',ui-monospace,Consolas,monospace;font-size:11px;opacity:.7;
+margin:0 1px}
 .pill i{width:7px;height:7px;background:#141414;border-radius:50%;display:inline-block;flex:none}
 .pill.bad{background:var(--red);color:#F7F2E4}
 .pill.bad i{background:#F7F2E4}
@@ -852,8 +859,8 @@ def render_portal(sub):
 <section class="card statuscard">
 <div class="quarter"></div>
 <div class="lbl top"><b>Subscription status</b><span>/ وضعیت اشتراک</span></div>
-<div class="big"><span>{esc(big_fa)}</span><span class="en">/ {esc(big_en)}</span></div>
-<div class="pill {esc(pill_cls)}"><i></i><span>{esc(pill_fa)}</span><span class="en">/ {esc(pill_txt)}</span></div>
+<div class="big"><span class="fa">{esc(big_fa)}</span><span class="sep">/</span><span class="en" dir="ltr">{esc(big_en)}</span></div>
+<div class="pill {esc(pill_cls)}"><i></i><span class="fa">{esc(pill_fa)}</span><span class="sep">/</span><span class="en" dir="ltr">{esc(pill_txt)}</span></div>
 <div class="hr"></div>
 <div class="grid2">
 <div><div class="lbl"><b>Total data</b><span>/ حجم کل</span></div><div class="gv">{esc(tv['total_text'])}</div></div>
