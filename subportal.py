@@ -15,8 +15,10 @@
 import base64
 import datetime
 import html
+import io
 import json
 import logging
+import os
 import secrets
 import time
 from urllib.parse import quote
@@ -30,6 +32,162 @@ from panel import _stream_params, build_share_link, build_xui, file_link_kind
 log = logging.getLogger("subportal")
 
 BRAND = "OverWall"
+
+try:  # QR روی همین سرور ساخته می‌شود؛ سرویس خارجی لازم نیست.
+    import segno
+except Exception:  # pragma: no cover - فقط اگر وابستگی نصب نشده باشد
+    segno = None
+
+# ================= متن‌های دوزبانه =================
+# هر کلید: (انگلیسی، فارسی). آدرس `?lang=en` نسخه‌ی انگلیسی‌تنها را می‌دهد.
+_STR = {
+    'status': ('Subscription status', 'وضعیت اشتراک'),
+    'total_data': ('Total data', 'حجم کل'),
+    'used': ('Used', 'مصرف شده'),
+    'remaining': ('Remaining', 'باقی‌مانده'),
+    'expires': ('Expires', 'تاریخ انقضا'),
+    'traffic_used': ('Traffic used', 'ترافیک مصرفی'),
+    'days_left': ('days left', 'روز باقی‌مانده'),
+    'scan_qr': ('Scan QR', 'اسکن سریع'),
+    'copy_link': ('Copy subscription link', 'کپی لینک اشتراک'),
+    'download_configs': ('Download configs', 'دانلود کانفیگ‌ها'),
+    'get_link': ('Get subscription link', 'دریافت لینک اشتراک'),
+    'support': ('Contact support', 'ارتباط با پشتیبانی'),
+    'devices': ('Connect devices', 'اتصال دستگاه‌ها'),
+    'devices_lead': ('Pick your app. Our recommendation is highlighted.',
+                     'برنامه مورد نظر خود را انتخاب کنید.<br>پیشنهاد ما مشخص شده است.'),
+    'apps': ('APPS', 'اپ‌ها'),
+    'usage_chart': ('Usage chart', 'نمودار مصرف'),
+    'chart_hint': ('Daily usage from the days the portal was opened.',
+                   'مصرف روزانه بر اساس روزهایی که پورتال باز شده است.'),
+    'chart_empty': ('Not enough data for the chart yet; it fills up as the portal is opened.',
+                    'داده‌ی کافی برای نمودار ثبت نشده؛ به‌مرور و با باز شدن پورتال پر می‌شود.'),
+    'total_in_range': ('Total', 'مجموع'),
+    'avg_day': ('Daily average', 'میانگین روزانه'),
+    'chart_day': ('day', 'روز'),
+    'no_usage_range': ('No usage recorded in this range yet.',
+                       'در این بازه هنوز مصرفی ثبت نشده است.'),
+    'online': ('Connected now', 'همین حالا متصل'),
+    'offline': ('Not connected', 'بدون اتصال'),
+    'ip_limit': ('Device limit', 'سقف دستگاه'),
+    'direct_title': ('Direct config (VLESS / VMess / Trojan)', 'کانفیگ مستقیم'),
+    'show_link': ('Show link', 'نمایش لینک'),
+    'close': ('Close', 'بستن'),
+    'copy': ('Copy', 'کپی'),
+    'download': ('Download', 'دانلود'),
+    'download_app': ('Download the app', 'دانلود برنامه'),
+    'add_config': ('Add the config', 'افزودن کانفیگ'),
+    'add': ('Add', 'افزودن'),
+    'recommended': ('Recommended', 'پیشنهادی'),
+    'file_config': ('Config file', 'فایل کانفیگ'),
+    'file_help': ('This service is file-based; download the file and import it in your app.',
+                  'این سرویس فایلی است؛ فایل را دانلود و در برنامه‌ی خود ایمپورت کنید.'),
+    'file_download': ('Download config file', 'دانلود فایل کانفیگ'),
+    'file_from_bot': ('This service is file-based; get the file from the bot (My orders → get config).',
+                      'این سرویس فایلی است؛ فایل/اطلاعات اتصال را از ربات (سفارشات من ← دریافت کانفیگ) بگیرید.'),
+    'expiring_soon': ('Your service expires in a few days; renew it to avoid interruption.',
+                      'سرویس شما تا چند روز دیگر منقضی می‌شود؛ برای جلوگیری از قطعی تمدید کنید.'),
+    'near_limit': ('More than 80% of your volume is used.',
+                   'بیش از ۸۰٪ حجم سرویس مصرف شده است.'),
+    'near_limit_hard': ('Almost out of volume; renew or upgrade now.',
+                        'حجم سرویس تقریباً تمام شده؛ همین حالا تمدید کنید.'),
+    'unlimited': ('Unlimited', 'نامحدود'),
+    'no_expiry': ('No expiry', 'بدون انقضا'),
+    'first_use': ('Starts on first connection', 'با اولین اتصال'),
+    'toast_copied': ('✓ Copied', '✓ کپی شد'),
+}
+
+
+def L(key, lang='fa'):
+    """متن یک کلید در زبان جاری."""
+    en, fa = _STR.get(key, (key, key))
+    return en if lang == 'en' else fa
+
+
+# نام پلتفرم‌ها در حالت انگلیسی صفحه
+_PLAT_EN = {'ویندوز': 'Windows', 'اندروید': 'Android', 'iOS': 'iOS', 'macOS': 'macOS'}
+
+_QR_CACHE = {}
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
+_FONT_NAMES = ('vazirmatn-400.woff2', 'vazirmatn-700.woff2')
+_FONT_CACHE = {}
+
+
+def qr_png(data, scale=6, border=2):
+    """PNG کد QR برای یک متن (کش‌شده). None اگر segno نصب نباشد."""
+    if segno is None or not data:
+        return None
+    key = (data, scale, border)
+    hit = _QR_CACHE.get(key)
+    if hit:
+        return hit
+    buf = io.BytesIO()
+    segno.make(data, error='m').save(buf, kind='png', scale=scale, border=border)
+    png = buf.getvalue()
+    if len(_QR_CACHE) > 512:
+        _QR_CACHE.clear()
+    _QR_CACHE[key] = png
+    return png
+
+
+def daily_series(history, days, today=None):
+    """سری روزانه‌ی مصرف: [(روز, مصرف آن روز یا None), ...] از قدیم به جدید.
+
+    هر روز مصرفِ تجمعی را نگه می‌داریم؛ مصرفِ آن روز = اختلاف با روز قبل. اگر روزی
+    داده نداشته باشیم (پورتال باز نشده) مقدار None می‌ماند و ستونی رسم نمی‌شود،
+    پس نمودار هیچ‌وقت عددِ ساختگی نشان نمی‌دهد.
+    """
+    today = today or datetime.date.today()
+    rows = {}
+    for h in history or []:
+        day, used = h.get('day'), h.get('used')
+        if day is None or used is None:
+            continue
+        base = h.get('base')
+        rows[day] = (int(used), (int(base) if base is not None else None))
+    series = []
+    prev_day, prev_used = None, None
+    start = today - datetime.timedelta(days=max(1, days) - 1)
+    for i in range(max(1, days)):
+        d = start + datetime.timedelta(days=i)
+        if d not in rows:
+            series.append((d, None))
+            prev_day, prev_used = None, None
+            continue
+        used, base = rows[d]
+        if base is not None:
+            # مقدار دقیق: مصرف این روز از اولین مشاهده‌ی همان روز تا الان.
+            delta = max(0, used - base)
+        elif prev_used is not None and (d - prev_day).days == 1:
+            delta = max(0, used - prev_used)
+        else:
+            delta = None
+        series.append((d, delta))
+        prev_day, prev_used = d, used
+    return series
+
+
+def chart_svg(series):
+    """نمودار ستونیِ SVG از سری روزانه (بدون جاوااسکریپت و بدون کتابخانه)."""
+    vals = [v for _, v in series if v]
+    peak = max(vals) if vals else 0
+    n = max(1, len(series))
+    w, top, base = 320.0, 6.0, 96.0
+    slot = w / n
+    bw = slot * 0.62
+    parts = ["<svg class='bars' viewBox='0 0 320 104' role='img' aria-hidden='true'>"]
+    today = datetime.date.today()
+    for i, (d, v) in enumerate(series):
+        if not v or peak <= 0:
+            continue
+        h = max(2.0, (base - top) * v / peak)
+        x = i * slot + (slot - bw) / 2
+        cls = 'b today' if d == today else 'b'
+        parts.append(f"<rect class='{cls}' x='{x:.1f}' y='{base - h:.1f}' "
+                     f"width='{bw:.1f}' height='{h:.1f}' rx='1'/>")
+    parts.append(f"<line class='ax' x1='0' y1='{base}' x2='320' y2='{base}'/>")
+    parts.append('</svg>')
+    return ''.join(parts)
 
 # ================= اتصال سریع (فهرست اپ‌ها کاملاً قابل‌تغییر است) =================
 # هر اپ: id یکتا، نام نمایشی، و قالبِ URI ایمپورت. placeholder ها:
@@ -393,6 +551,11 @@ def subscription_headers(name, traffic, expiry_ms):
 # ================= قالب HTML/CSS پورتال =================
 PAGE_CSS = """
 <style>
+/* فونت محلی: وابستگی به CDN حذف شد (در ایران کند/مسدود می‌شود). */
+@font-face{font-family:'Vazirmatn';font-style:normal;font-weight:400;font-display:swap;
+src:url('/sub/fonts/vazirmatn-400.woff2') format('woff2')}
+@font-face{font-family:'Vazirmatn';font-style:normal;font-weight:700 900;font-display:swap;
+src:url('/sub/fonts/vazirmatn-700.woff2') format('woff2')}
 :root{--paper:#F0EAD8;--ink:#141414;--card:#F7F2E4;--muted:#6F6A5C;--line:#141414;
 --amber:#E9A13B;--teal:#1F7A78;--green:#2E9E5B;--red:#C8402F;--sh:5px 5px 0 #141414;
 --on-a:#141414;--on-t:#F7F2E4;--q:#1F7A78}
@@ -543,6 +706,7 @@ margin-top:12px;text-align:center}
 display:flex;align-items:center;gap:9px;transition:background .15s}
 .card.direct summary::-webkit-details-marker{display:none}
 .dsum-t{flex:1;min-width:0;font-weight:800;font-size:13px;line-height:1.6}
+.dsum-t span[dir="ltr"]{white-space:nowrap}
 .dsum-h{font-size:11px;font-weight:700;color:var(--muted);flex:none;white-space:nowrap;
 text-decoration:underline;text-underline-offset:3px}
 .dsum-h .h-close{display:none}
@@ -573,6 +737,42 @@ border:2.5px solid var(--line);box-shadow:var(--sh)}
 border:2.5px solid var(--line);box-shadow:4px 4px 0 var(--muted);padding:10px 20px;font-size:12.5px;
 font-weight:700;transition:.3s;z-index:9;pointer-events:none;opacity:0}
 .toast.show{transform:translate(-50%,0);opacity:1}
+/* ---------- نشان اتصال زنده / سقف دستگاه ---------- */
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.online{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:800;
+border:2px solid var(--line);padding:4px 9px;background:var(--card)}
+.online i{width:7px;height:7px;border-radius:50%;background:var(--green);flex:none;
+animation:pulse 1.8s infinite}
+.online.off i{background:var(--muted);animation:none}
+.chip{display:inline-flex;align-items:center;font-size:11px;font-weight:800;
+border:2px solid var(--line);padding:4px 9px;background:var(--card);color:var(--muted)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(46,158,91,.55)}
+70%{box-shadow:0 0 0 7px rgba(46,158,91,0)}100%{box-shadow:0 0 0 0 rgba(46,158,91,0)}}
+/* ---------- نمودار مصرف ---------- */
+.ranges{display:flex;gap:6px;margin:8px 0 10px}
+.ranges input{position:absolute;opacity:0;pointer-events:none}
+.ranges label{padding:6px 12px;border:2.5px solid var(--line);font-size:11.5px;font-weight:800;
+cursor:pointer;background:var(--card);font-family:'Courier New',monospace;direction:ltr}
+.ranges input:checked+label{background:var(--amber);color:#141414;box-shadow:2px 2px 0 var(--line)}
+.ranges input:focus-visible+label{outline:3px solid var(--teal);outline-offset:2px}
+.chs{display:none}.chs.on{display:block}
+svg.bars{width:100%;height:132px;display:block;direction:ltr}
+svg.bars .b{fill:var(--amber)}
+svg.bars .b.today{fill:var(--teal)}
+svg.bars .ax{stroke:var(--line);stroke-width:1.4}
+.chstat{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--muted);
+margin-top:6px;font-weight:700}
+.num{direction:ltr;unicode-bidi:isolate;font-weight:800;color:var(--ink)}
+.hint{font-size:12px;line-height:1.9;color:var(--muted);margin-top:8px}
+[dir="rtl"] .statuscard .hint{text-align:right}
+/* ---------- دسترس‌پذیری: فوکوس ديدنی ---------- */
+.ic:focus-visible,.sbtn:focus-visible,.btn-black:focus-visible,.support:focus-visible,
+summary:focus-visible,a:focus-visible,label:focus-visible,button:focus-visible{
+outline:3px solid var(--teal);outline-offset:2px}
+html[lang="en"] .big{direction:ltr;flex-direction:row;justify-content:flex-start}
+html[lang="en"] .pill{flex-direction:row}
+html[lang="en"] .lbl.top{margin-right:0}
+html[lang="en"] .chips,html[lang="en"] .grid2,html[lang="en"] .chstat{text-align:left}
 @media (max-width:430px){.title{font-size:26px}.big{font-size:23px}.dtitle{font-size:20px}
 .gv{font-size:19px}.pctbox .n{font-size:26px}.bar{height:40px}.qrgrid{grid-template-columns:106px 1fr}}
 </style>
@@ -581,15 +781,45 @@ font-weight:700;transition:.3s;z-index:9;pointer-events:none;opacity:0}
 # ================= رندر صفحات =================
 # به‌روزرسانی زنده: هر ۳۰ ثانیه وضعیت دوباره خوانده می‌شود (رفرش کامل صفحه؛
 # کش سمت سرور ۱۰ ثانیه‌ای است پس داده تازه برمی‌گردد).
-AUTO_REFRESH_JS = """<script>
+# به‌روزرسانی زنده: هر ۳۰ ثانیه فقط اعداد از /sub/{token}/live خوانده می‌شود؛
+# صفحه ریلود نمی‌شود (اسکرول/آکاردئون/کپی حفظ می‌شود) و تب مخفی درخواست نمی‌فرستد.
+# (دفعات قبلی کل صفحه رفرش می‌شد که آزاردهنده بود.)
+LIVE_JS = r"""<script>
 (function(){
-  var pill = document.querySelector('.live-pill');
-  setInterval(function(){
-    if(pill) pill.classList.add('refreshing');
-    setTimeout(function(){ location.reload(); }, 700);
-  }, 30000);
+  var path = location.pathname.replace(/\/+$/, '');
+  function byId(id){ return document.getElementById(id); }
+  function setText(id, val){
+    var el = byId(id);
+    if(el && val != null && el.textContent !== String(val)) el.textContent = val;
+  }
+  function apply(d){
+    setText('lv-total', d.total_text);
+    setText('lv-used', d.used_text);
+    setText('lv-remain', d.remaining_text);
+    if(d.percent != null) setText('lv-pct', d.percent);
+    var bar = byId('lv-bar');
+    if(bar && d.percent != null) bar.style.width = d.percent + '%';
+    var on = byId('lv-online');
+    if(on && d.online != null) on.classList.toggle('off', !d.online);
+  }
+  function poll(){
+    if(document.hidden) return;
+    var x = new XMLHttpRequest();
+    x.open('GET', path + '/live', true);
+    x.setRequestHeader('Accept', 'application/json');
+    x.onload = function(){
+      if(x.status !== 200) return;
+      try{ apply(JSON.parse(x.responseText)); }catch(e){}
+    };
+    x.send();
+  }
+  setInterval(poll, 30000);
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden) poll(); });
 })();
 </script>"""
+
+# سازگاری با کد قبلی (در صورت استفاده‌ی خارجی)
+AUTO_REFRESH_JS = LIVE_JS
 
 PAGE_JS = """<script>
 (function(){
@@ -599,10 +829,15 @@ PAGE_JS = """<script>
   /* تم دیفالت شب است؛ فقط اگر کاربر خودش روشن را انتخاب کرده باشد روشن می‌ماند. */
   root.setAttribute('data-theme',saved==='light'?'light':'dark');
   var tb=document.getElementById('theme');
+  function syncPressed(){
+    if(tb)tb.setAttribute('aria-pressed',root.getAttribute('data-theme')==='dark'?'true':'false');
+  }
+  syncPressed();
   if(tb)tb.addEventListener('click',function(){
     var dark=root.getAttribute('data-theme')==='dark';
     root.setAttribute('data-theme',dark?'light':'dark');
     try{localStorage.setItem('ow-theme',dark?'light':'dark');}catch(e){}
+    syncPressed();
   });
   var qb=document.getElementById('qrbtn'),qw=document.getElementById('qrwrap');
   if(qb&&qw)qb.addEventListener('click',function(){qw.scrollIntoView({behavior:'smooth',block:'center'});});
@@ -619,6 +854,8 @@ t._h=setTimeout(function(){t.classList.remove('show')},1600);}
 function fb(){var ta=document.createElement('textarea');ta.value=v;ta.style.position='fixed';ta.style.opacity='0';
 document.body.appendChild(ta);ta.select();try{document.execCommand('copy');ok();}catch(e){}ta.remove();}
 if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(v).then(ok,fb);}else fb();}
+function owRange(n){var a=document.getElementById('ch7'),b=document.getElementById('ch30');
+if(a&&b){a.classList.toggle('on',n===7);b.classList.toggle('on',n===30);}}
 function owPlat(r){var p=document.querySelectorAll('.qc .pane');
 for(var i=0;i<p.length;i++)p[i].classList.remove('on');
 var el=document.getElementById('pane-'+r.value);if(el){el.classList.add('on');
@@ -673,8 +910,9 @@ _STATUS_FA = {
     'exhausted': ('پایان حجم', 'حجم تمام شده'),
 }
 
-def render_portal(sub):
+def render_portal(sub, lang='fa'):
     """ساخت صفحه‌ی پورتال از دیتای واقعیِ آماده‌شده در load_subscription."""
+    en = lang == 'en'
     name = sub.get('name') or ''
     st_key = sub['status']['key']
     big, pill_cls, pill_txt, warn_text = _STATUS_EN.get(st_key, _STATUS_EN['active'])
@@ -684,11 +922,39 @@ def render_portal(sub):
     raw = sub.get('raw_url') or ''
     qr = sub.get('qr_url') or ''
     fkind = sub.get('file_kind')
+    online = sub.get('online')
+    ip_limit = int(sub.get('ip_limit') or 0)
+    history = sub.get('history') or []
 
-    banner = ''
+    def lab(key):
+        """برچسب دوزبانه (یا انگلیسی‌تنها در حالت ?lang=en)."""
+        en_t, fa_t = _STR.get(key, (key, key))
+        if en:
+            return f"<div class='lbl'><b>{esc(en_t)}</b></div>"
+        return f"<div class='lbl'><b>{esc(en_t)}</b><span>/ {esc(fa_t)}</span></div>"
+
+    def pair(fa_t, en_t):
+        """متن دوزبانه‌ی هم‌خط با جداکننده‌ی ایزوله (اصلاح bidi)."""
+        if en:
+            return f"<span class='en' dir='ltr'>{esc(en_t)}</span>"
+        return (f"<span class='fa'>{esc(fa_t)}</span><span class='sep'>/</span>"
+                f"<span class='en' dir='ltr'>{esc(en_t)}</span>")
+
+    # ---------- بنر هشدار (وضعیت + آستانه‌ها) ----------
+    banners = []
     if warn_text:
         cls = 'warn' if st_key == 'expired' else 'bad'
-        banner = f"<div class='banner {cls}'>{esc(warn_text)}</div>"
+        banners.append(f"<div class='banner {cls}'>{esc(warn_text)}</div>")
+    elif st_key == 'active':
+        days = ex.get('remain_days')
+        pct_now = tv['percent']
+        if days is not None and 0 < days <= 3:
+            banners.append(f"<div class='banner warn'>⏳ {esc(L('expiring_soon', lang))}</div>")
+        elif pct_now is not None and pct_now >= 95:
+            banners.append(f"<div class='banner bad'>⚠ {esc(L('near_limit_hard', lang))}</div>")
+        elif pct_now is not None and pct_now >= 80:
+            banners.append(f"<div class='banner warn'>⚠ {esc(L('near_limit', lang))}</div>")
+    banner = ''.join(banners)
 
     if fkind:
         metaline = {'openvpn': 'OpenVPN', 'wireguard': 'WireGuard',
@@ -699,21 +965,87 @@ def render_portal(sub):
             (':' + str(sub['port'])) if sub.get('port') else '',
         ] if x)
 
+    # ---------- نوار مصرف ----------
     pct = tv['percent']
     slot = 'red' if (pct is not None and pct >= 90) else 'yellow'
     if tv['unlimited']:
         slot = 'green'
         pct_html = "<span class='n'>&#8734;</span>"
         bar_w = 100
+        pct_text = '∞'
     else:
-        pct_html = f"<span class='n'>{pct or 0}</span><span class='s'>%</span>"
+        pct_html = f"<span class='n' id='lv-pct'>{pct or 0}</span><span class='s'>%</span>"
         bar_w = pct or 0
+        pct_text = f"{pct or 0}%"
     bar_cls = '' if slot == 'red' else (' yellow' if slot == 'yellow' else ' green')
 
     if ex.get('ms'):
-        exp_html = f"<div class='gv' data-exp-ms='{ex['ms']}'>{esc(ex['date_text'])}</div>"
+        exp_html = (f"<div class='gv' id='lv-exp' data-exp-ms='{ex['ms']}'>"
+                    f"{esc(ex['date_text'])}</div>")
     else:
-        exp_html = f"<div class='gv'>{esc(ex['date_text'])}</div>"
+        exp_html = f"<div class='gv' id='lv-exp'>{esc(ex['date_text'])}</div>"
+
+    # ---------- نشان اتصال زنده + سقف دستگاه ----------
+    state_bits = []
+    if online is not None:
+        cls = '' if online else ' off'
+        txt = L('online', lang) if online else L('offline', lang)
+        state_bits.append(
+            f"<span class='online{cls}' id='lv-online'><i></i>{esc(txt)}</span>")
+    if ip_limit > 0:
+        state_bits.append(
+            f"<span class='chip'>{esc(L('ip_limit', lang))}: {ip_limit}</span>")
+    if sub.get('plan'):
+        state_bits.append(f"<span class='chip' dir='auto'>{esc(sub['plan'])}</span>")
+
+    # متن «زمان باقی‌مانده» هم با زبان صفحه هماهنگ می‌شود.
+    if en:
+        if ex.get('unlimited'):
+            remain_show = L('no_expiry', 'en')
+        elif ex.get('remain_days') is not None:
+            d = int(ex['remain_days'])
+            remain_show = f"{d} day{'s' if d != 1 else ''} left"
+        else:
+            remain_show = L('first_use', 'en')
+    else:
+        remain_show = ex.get('remain_text') or ''
+    status_meta = f"<div class='chips'>{''.join(state_bits)}</div>" if state_bits else ''
+
+    # ---------- نمودار مصرف ----------
+    series7 = daily_series(history, 7)
+    series30 = daily_series(history, 30)
+    # اگر روزی با مصرف صفر هم داده داشته باشد، نمودار معنا دارد؛ فقط روزهای
+    # «بدون داده» (None) نباید باعث ساخت کارت شوند.
+    has_chart = any(v is not None for _, v in series30)
+
+    def chart_block(key, series):
+        known = [v for _, v in series if v is not None]
+        total = sum(known) if known else 0
+        avg = int(total / max(1, len(series)))
+        if total <= 0:
+            body = f"<p class='hint'>{esc(L('no_usage_range', lang))}</p>"
+        else:
+            body = (f"{chart_svg(series)}"
+                    f"<div class='chstat'><span>{esc(L('total_in_range', lang))}: "
+                    f"<b class='num' dir='ltr'>{esc(format_size(total))}</b></span>"
+                    f"<span>{esc(L('avg_day', lang))}: "
+                    f"<b class='num' dir='ltr'>{esc(format_size(avg))}</b></span></div>")
+        return f"<div class='chs{' on' if key == 7 else ''}' id='ch{key}'>{body}</div>"
+
+    if has_chart:
+        chart = (
+            "<section class='card'>"
+            f"{lab('usage_chart')}"
+            "<div class='ranges'>"
+            "<input type='radio' name='rng' id='r7' checked onchange='owRange(7)'>"
+            "<label for='r7'>7D</label>"
+            "<input type='radio' name='rng' id='r30' onchange='owRange(30)'>"
+            "<label for='r30'>30D</label></div>"
+            f"{chart_block(7, series7)}{chart_block(30, series30)}"
+            f"<p class='hint'>{esc(L('chart_hint', lang))}</p></section>"
+        )
+    else:
+        chart = ''
 
     # ---------- اتصال دستگاه‌ها ----------
     apps_data = sub.get('apps') or {}
@@ -723,17 +1055,19 @@ def render_portal(sub):
     for i, pid in enumerate(pids):
         pdata = apps_data[pid]
         chk = ' checked' if i == 0 else ''
+        plat_label = pdata['label']
+        if en:
+            plat_label = _PLAT_EN.get(plat_label, plat_label)
         tabs.append(
             f"<input type='radio' name='plat' id='pt-{esc(pid)}' value='{esc(pid)}'{chk} "
-            f"onchange='owPlat(this)'><label for='pt-{esc(pid)}'>{esc(pdata['label'])}</label>"
+            f"onchange='owPlat(this)'><label for='pt-{esc(pid)}'>{esc(plat_label)}</label>"
         )
         rows = []
         for app in pdata['apps']:
             sub_t, dl = APP_META.get(app['id'], ('', ''))
-            subline = esc(sub_t or ('پیشنهادی' if app.get('recommended') else ''))
+            subline = esc(sub_t or (L('recommended', lang) if app.get('recommended') else ''))
             logo = logo_key(app['id'])
             if logo:
-                # لوگوی رسمی خود اپ؛ ?v=<hash> تا عوض شدن آیکون از کش رد نشه.
                 ico = ("<span class='app-ico logo'>"
                        f"<img src='/sub/applogo/{esc(app['id'])}.png?v={logo_ver(logo)}' alt='' "
                        "width='40' height='40' loading='lazy'></span>")
@@ -742,26 +1076,27 @@ def render_portal(sub):
                 ico = (f"<span class='app-ico' style='background:linear-gradient(135deg,{esc(a1)},{esc(a2)})'>"
                        f"{esc(app.get('initial') or '')}</span>")
             if app.get('import_url'):
-                add_btn = f"<a class='sbtn g' href='{esc(app['import_url'])}'>افزودن</a>"
+                add_btn = f"<a class='sbtn g' href='{esc(app['import_url'])}'>{esc(L('add', lang))}</a>"
             else:
                 add_btn = (f"<button class='sbtn g' type='button' data-copy='{esc(raw)}' "
-                           "onclick='owCopy(this)'>افزودن</button>")
+                           f"onclick='owCopy(this)'>{esc(L('add', lang))}</button>")
             step_dl = ''
             if dl:
                 step_dl = (
                     "<div class='step'><span class='stepn'>1</span>"
-                    "<span class='stepl'>دانلود برنامه</span>"
-                    f"<a class='sbtn y' href='{esc(dl)}' target='_blank' rel='noreferrer'>دانلود</a></div>"
+                    f"<span class='stepl'>{esc(L('download_app', lang))}</span>"
+                    f"<a class='sbtn y' href='{esc(dl)}' target='_blank' rel='noreferrer'>"
+                    f"{esc(L('download', lang))}</a></div>"
                     "<div class='dash'></div>"
                 )
-            note = esc(app.get('note') or 'یک کلاینت برای مسیریابی امن ترافیک فراهم می‌کند.')
+            note = esc(app.get('note') or '')
             rows.append(
                 f"<details class='app'><summary>{ico}<span class='app-t'>"
                 f"<span class='app-name'>{esc(app['name'])}</span>"
                 f"<span class='app-sub'>{subline}</span></span>{_GLYPH['chev']}</summary>"
                 f"<div class='steps'>{step_dl}"
                 f"<div class='step'><span class='stepn'>{'2' if dl else '1'}</span>"
-                f"<span class='stepl'>افزودن کانفیگ</span>{add_btn}</div>"
+                f"<span class='stepl'>{esc(L('add_config', lang))}</span>{add_btn}</div>"
                 f"<div class='note'>{note}</div></div></details>"
             )
         panes.append(
@@ -774,76 +1109,86 @@ def render_portal(sub):
         devices = (
             "<section class='card qc'><div class='dev-head'>"
             f"<span class='bolt'>{_GLYPH['bolt']}</span>"
-            "<span class='dtitle'>اتصال دستگاه‌ها</span>"
+            f"<span class='dtitle'>{esc(L('devices', lang))}</span>"
             f"<span class='acount'>APPS <span id='appcount'>{first_count}</span></span></div>"
-            "<p class='lead'>برنامه مورد نظر خود را انتخاب کنید.<br>پیشنهاد ما مشخص شده است.</p>"
+            f"<p class='lead'>{L('devices_lead', lang)}</p>"
             f"<div class='plats'>{''.join(tabs)}</div>{''.join(panes)}</section>"
-        )
-
-    direct = ''
-    if sub.get('config_link') and not fkind:
-        direct = (
-            "<details class='card direct'><summary>"
-            "<span class='dsum-t'>کانفیگ مستقیم (VLESS / VMess / Trojan)</span>"
-            "<span class='dsum-h'><span class='h-open'>نمایش لینک</span>"
-            "<span class='h-close'>بستن</span></span>"
-            f"<span class='dsum-c' aria-hidden='true'>{_GLYPH['chev']}</span>"
-            "</summary>"
-            "<div class='subbox'><code>" + esc(sub['config_link']) + "</code>"
-            f"<button class='sbtn y' type='button' data-copy='{esc(sub['config_link'])}' "
-            "onclick='owCopy(this)'>کپی</button></div></details>"
-        )
-
-    file_guide = ''
-    if fkind:
-        known = {'openvpn': 'OpenVPN', 'wireguard': 'WireGuard', 'l2tp': 'L2TP/IPsec'}.get(fkind, fkind)
-        file_guide = (
-            "<section class='card'><div class='lbl'><b>Config file</b><span>/ فایل کانفیگ</span></div>"
-            f"<div class='big' style='font-size:21px;margin:6px 0 8px'>{esc(known)}</div>"
-            "<p style='font-size:13.5px;line-height:2;color:var(--muted)'>"
-            "این سرویس فایلی است؛ فایل/اطلاعات اتصال را از ربات (سفارشات من ← دریافت کانفیگ) بگیرید."
-            "</p></section>"
         )
 
     # ---------- کارت QR + دکمه‌های لینک ----------
     qr_card = ''
     if raw:
-        acts = (
-            f"<button class='sbtn y' type='button' data-copy='{esc(raw)}' onclick='owCopy(this)'>"
-            "کپی لینک اشتراک</button>"
-        )
+        acts = (f"<button class='sbtn y' type='button' data-copy='{esc(raw)}' onclick='owCopy(this)'>"
+                f"{esc(L('copy_link', lang))}</button>")
         if not fkind:
-            acts += (
-                f"<a class='sbtn t' href='{esc(raw)}' download='{esc(name)}.txt'>"
-                f"{_GLYPH['dl']}<span>دانلود کانفیگ‌ها</span></a>"
-            )
+            acts += (f"<a class='sbtn t' href='{esc(raw)}' download='{esc(name)}.txt'>"
+                     f"{_GLYPH['dl']}<span>{esc(L('download_configs', lang))}</span></a>")
         if qr:
             body = (f"<div class='qrgrid'><div class='qimg'>"
-                    f"<img src='{esc(qr)}' alt='QR' loading='lazy'></div>"
-                    f"<div class='acts'>{acts}</div></div>")
+                    f"<img src='{esc(qr)}' alt='QR' loading='lazy' width='300' height='300'>"
+                    f"</div><div class='acts'>{acts}</div></div>")
         else:
             body = f"<div class='acts'>{acts}</div>"
         qr_card = (
             "<section class='card' id='qrwrap'>"
-            "<div class='lbl' style='margin-bottom:10px'><b>Scan QR</b>"
-            "<span>/ اسکن سریع</span></div>"
-            f"{body}"
+            f"{lab('scan_qr')}"
+            f"<div style='margin-top:10px'>{body}</div>"
             f"<a class='btn-black' href='{esc(raw)}' target='_blank' rel='noreferrer'>"
-            f"{_GLYPH['link']}<span>دریافت لینک اشتراک</span></a></section>"
+            f"{_GLYPH['link']}<span>{esc(L('get_link', lang))}</span></a></section>"
         )
 
+    # ---------- کانفیگ مستقیم ----------
+    direct_en = '' if en else " <span dir='ltr'>(VLESS / VMess / Trojan)</span>"
+    direct = ''
+    if sub.get('config_link') and not fkind:
+        direct = (
+            "<details class='card direct'><summary>"
+            f"<span class='dsum-t'>{esc(L('direct_title', lang))}{direct_en}</span>"
+            f"<span class='dsum-h'><span class='h-open'>{esc(L('show_link', lang))}</span>"
+            f"<span class='h-close'>{esc(L('close', lang))}</span></span>"
+            f"<span class='dsum-c' aria-hidden='true'>{_GLYPH['chev']}</span>"
+            "</summary>"
+            "<div class='subbox'><code>" + esc(sub['config_link']) + "</code>"
+            f"<button class='sbtn y' type='button' data-copy='{esc(sub['config_link'])}' "
+            f"onclick='owCopy(this)'>{esc(L('copy', lang))}</button></div></details>"
+        )
+
+    # ---------- سرویس فایلی ----------
+    file_guide = ''
+    if fkind:
+        known = {'openvpn': 'OpenVPN', 'wireguard': 'WireGuard',
+                 'l2tp': 'L2TP/IPsec'}.get(fkind, fkind)
+        link = (sub.get('config_link') or '').strip()
+        extra = ''
+        if link.lower().startswith('http'):
+            extra = (f"<a class='sbtn t' href='{esc(link)}' target='_blank' rel='noreferrer' "
+                     f"download>{_GLYPH['dl']}<span>{esc(L('file_download', lang))}</span></a>")
+            help_text = L('file_help', lang)
+        else:
+            help_text = L('file_from_bot', lang)
+        file_guide = (
+            f"<section class='card'>{lab('file_config')}"
+            f"<div class='big' style='font-size:21px;margin:6px 0 8px'>{esc(known)}</div>"
+            f"<p class='hint'>{esc(help_text)}</p>{extra}</section>"
+        )
+
+    # ---------- پشتیبانی ----------
     support = ''
     if sub.get('support_url'):
         support = (
             f"<a class='support' href='{esc(sub['support_url'])}' target='_blank' rel='noreferrer'>"
-            f"{_GLYPH['send']}<span>ارتباط با پشتیبانی</span></a>"
+            f"{_GLYPH['send']}<span>{esc(L('support', lang))}</span></a>"
         )
 
-    doc = f"""<!doctype html><html lang="fa" dir="rtl" data-theme="dark"><head>
+    st_lab = (f"<div class='lbl top'><b>{esc(_STR['status'][0])}</b></div>" if en else
+              f"<div class='lbl top'><b>{esc(_STR['status'][0])}</b>"
+              f"<span>/ {esc(_STR['status'][1])}</span></div>")
+    lang_attr = 'en' if en else 'fa'
+    dir_attr = 'ltr' if en else 'rtl'
+    doc = f"""<!doctype html><html lang="{lang_attr}" dir="{dir_attr}" data-theme="dark"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer"><meta name="color-scheme" content="light dark">
-<link rel="preconnect" href="https://cdn.jsdelivr.net">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
+<meta name="robots" content="noindex,nofollow">
 <title>{esc(name)} | {BRAND}</title>{PAGE_CSS}</head><body>
 <div class="wrap">
 <header class="hdr">
@@ -851,40 +1196,43 @@ def render_portal(sub):
 <div class="handle">{esc(name)}</div>
 <div class="icons">
 <a class="ic ic-a" href="{esc(raw)}" target="_blank" rel="noreferrer" title="open link">{_GLYPH['globe']}</a>
-<button class="ic ic-t" type="button" id="theme" title="theme" aria-label="theme"><span class="g-moon">{_GLYPH['moon']}</span><span class="g-sun">{_GLYPH['sun']}</span></button>
+<button class="ic ic-t" type="button" id="theme" title="theme" aria-label="theme" aria-pressed="true"><span class="g-moon">{_GLYPH['moon']}</span><span class="g-sun">{_GLYPH['sun']}</span></button>
 <button class="ic ic-g" type="button" id="qrbtn" title="qr" aria-label="qr">{_GLYPH['qr']}</button>
 </div>
 </header>
 {banner}
 <section class="card statuscard">
 <div class="quarter"></div>
-<div class="lbl top"><b>Subscription status</b><span>/ وضعیت اشتراک</span></div>
-<div class="big"><span class="fa">{esc(big_fa)}</span><span class="sep">/</span><span class="en" dir="ltr">{esc(big_en)}</span></div>
-<div class="pill {esc(pill_cls)}"><i></i><span class="fa">{esc(pill_fa)}</span><span class="sep">/</span><span class="en" dir="ltr">{esc(pill_txt)}</span></div>
+{st_lab}
+<div class="big">{pair(big_fa, big_en)}</div>
+<div class="pill {esc(pill_cls)}"><i></i>{pair(pill_fa, pill_txt)}</div>
+{status_meta}
 <div class="hr"></div>
 <div class="grid2">
-<div><div class="lbl"><b>Total data</b><span>/ حجم کل</span></div><div class="gv">{esc(tv['total_text'])}</div></div>
-<div><div class="lbl"><b>Used</b><span>/ مصرف شده</span></div><div class="gv">{esc(tv['used_text'])}</div></div>
-<div><div class="lbl"><b>Remaining</b><span>/ باقی‌مانده</span></div><div class="gv">{esc(tv['remaining_text'])}</div></div>
-<div><div class="lbl"><b>Expires</b><span>/ تاریخ انقضا</span></div>{exp_html}</div>
+<div>{lab('total_data')}<div class="gv" id="lv-total">{esc(tv['total_text'])}</div></div>
+<div>{lab('used')}<div class="gv" id="lv-used">{esc(tv['used_text'])}</div></div>
+<div>{lab('remaining')}<div class="gv" id="lv-remain">{esc(tv['remaining_text'])}</div></div>
+<div>{lab('expires')}{exp_html}
+<div class='hint' style='margin-top:1px'>{esc(remain_show)}</div></div>
 </div>
 <div class="hr"></div>
 <div class="traf">
-<div class="trow"><div class="lbl"><b>Traffic used</b><span>/ ترافیک مصرفی</span></div>
+<div class="trow">{lab('traffic_used')}
 <div class="pctbox {esc(slot)}">{pct_html}</div></div>
-<div class="bar"><div class="fill{bar_cls}" style="width:{bar_w}%"></div></div>
+<div class="bar"><div class="fill{bar_cls}" id="lv-bar" style="width:{bar_w}%"></div></div>
 <div class="metaline">{esc(metaline)}</div>
 </div>
 </section>
 {qr_card}
+{chart}
 {devices}
 {direct}
 {file_guide}
 {support}
 <footer class="foot">{BRAND} · SUBSCRIPTION PORTAL</footer>
 </div>
-<div class="toast" id="toast">✓ کپی شد</div>
-{PAGE_JS}{AUTO_REFRESH_JS}</body></html>"""
+<div class="toast" id="toast">{esc(L('toast_copied', lang))}</div>
+{PAGE_JS}{LIVE_JS}</body></html>"""
     return doc
 
 
@@ -915,6 +1263,7 @@ def render_error_page(kind):
 # هیچ‌وقت جلوی کارکرد را نگیرد. پنل 3x-UI همچنان منبعِ حقیقت است.
 _CACHE_TTL = 10.0
 _cache = {}  # token -> (monotonic_ts, data)
+_point_sent = {}  # email -> timestamp آخرین ثبتِ نقطه‌ی نمودار (ضدِ فشار به DB)
 
 
 def _cache_get(token):
@@ -997,8 +1346,41 @@ async def load_subscription(token):
     if support_id and not support_id.startswith('http'):
         support_id = 'https://t.me/' + support_id.lstrip('@')
 
+    # ---------- تاریخچه‌ی مصرف (نمودار) ----------
+    # نقطه‌ی امروز فقط هر ۵ دقیقه یک‌بار نوشته می‌شود تا هر رفرش پورتال
+    # تبدیل به یک نوشتن در دیتابیس نشود.
+    now_ts = time.time()
+    last_point = _point_sent.get(email)
+    if last_point is None or (now_ts - last_point) > 300:
+        _point_sent[email] = now_ts
+        try:
+            await db.save_traffic_point(email, used)
+        except Exception:
+            log.debug("ثبت نقطه‌ی ترافیک ناموفق بود", exc_info=True)
+    try:
+        history = await db.get_traffic_history(email, 31)
+    except Exception:
+        history = []
+
+    # ---------- آنلاین بودن + سقف دستگاه ----------
+    online = None
+    try:
+        onlines = await xui.get_onlines()
+    except Exception:
+        onlines = None
+    if onlines is not None:
+        low = str(email).strip().lower()
+        online = any(str(o).strip().lower() == low for o in onlines)
+    try:
+        ip_limit = int(client.get('limitIp') or 0)
+    except (TypeError, ValueError, AttributeError):
+        ip_limit = 0
+
     data = {
         'token': token,
+        'online': online,
+        'ip_limit': ip_limit,
+        'history': history,
         'support_url': support_id,
         'order_id': int(order['id']),
         'name': email,
@@ -1028,10 +1410,16 @@ def _public_base(request):
 
 
 def _html(text, status=200):
-    return web.Response(
+    resp = web.Response(
         text=text, status=status, content_type='text/html', charset='utf-8',
-        headers={'Cache-Control': 'no-store'},
+        headers={'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow'},
     )
+    # فشرده‌سازی: صفحه‌ی پورتال ~۲۰KB است؛ برای موبایل تفاوت محسوسی دارد.
+    try:
+        resp.enable_compression()
+    except Exception:
+        pass
+    return resp
 
 
 async def logo_asset(request):
@@ -1043,6 +1431,66 @@ async def logo_asset(request):
         body=base64.b64decode(APP_LOGOS[key]), content_type='image/png',
         headers={'Cache-Control': 'public, max-age=604800'},
     )
+
+
+async def qr_asset(request):
+    """/sub/{token}/qr.png — کد QR لینک اشتراک، ساخته‌شده روی همین سرور.
+
+    قبلاً تصویر از api.qrserver.com گرفته می‌شد؛ یعنی لینک اشتراک کاربر به یک
+    سرویس خارجی میرفت و در ایران هم کند/مسدود بود.
+    """
+    token = (request.match_info.get('token') or '').strip()
+    if not token or len(token) > 128:
+        raise web.HTTPNotFound()
+    png = qr_png(raw_url(token, _public_base(request)), scale=7, border=3)
+    if not png:
+        raise web.HTTPServiceUnavailable(text='qr unavailable')
+    return web.Response(
+        body=png, content_type='image/png',
+        headers={'Cache-Control': 'public, max-age=86400', 'X-Robots-Tag': 'noindex'},
+    )
+
+
+async def font_asset(request):
+    """/sub/fonts/{name} — فونت وزیرمتنِ خودمیزبان (بدون CDN خارجی)."""
+    name = request.match_info.get('name', '')
+    if name not in _FONT_NAMES:
+        raise web.HTTPNotFound()
+    body = _FONT_CACHE.get(name)
+    if body is None:
+        try:
+            with open(os.path.join(_FONTS_DIR, name), 'rb') as f:
+                body = f.read()
+        except OSError:
+            raise web.HTTPNotFound()
+        _FONT_CACHE[name] = body
+    return web.Response(
+        body=body, content_type='font/woff2',
+        headers={'Cache-Control': 'public, max-age=604800', 'X-Robots-Tag': 'noindex'},
+    )
+
+
+async def live_status(request):
+    """/sub/{token}/live — وضعیت کوتاه برای به‌روزرسانی بدون رفرش صفحه."""
+    sub = await load_subscription(request.match_info.get('token', ''))
+    if sub is None:
+        return web.json_response({'error': 'not_found'}, status=404,
+                                 headers={'Cache-Control': 'no-store'})
+    if sub.get('error'):
+        return web.json_response({'error': 'panel'}, status=503,
+                                 headers={'Cache-Control': 'no-store'})
+    tv = sub['traffic']
+    payload = {
+        'status': sub['status']['key'],
+        'used_text': tv['used_text'],
+        'total_text': tv['total_text'],
+        'remaining_text': tv['remaining_text'],
+        'percent': tv['percent'],
+        'online': sub.get('online'),
+        'expires_ms': sub['expiry'].get('ms') or 0,
+    }
+    return web.json_response(payload, headers={
+        'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex'})
 
 
 async def portal_page(request):
@@ -1057,12 +1505,10 @@ async def portal_page(request):
     base = _public_base(request)
     sub['raw_url'] = raw_url(token, base)
     sub['clash_url'] = clash_url(token, base)
-    sub['qr_url'] = (
-        'https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data='
-        + quote(sub['raw_url'], safe='')
-    )
+    sub['qr_url'] = f"/sub/{quote(token, safe='')}/qr.png"
     sub['apps'] = quick_connect_apps(sub['raw_url'], sub['clash_url'], sub['name'])
-    return _html(render_portal(sub))
+    lang = 'en' if (request.query.get('lang') or '').strip().lower().startswith('en') else 'fa'
+    return _html(render_portal(sub, lang))
 
 
 async def raw_subscription(request):

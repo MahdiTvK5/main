@@ -9,7 +9,8 @@ import io
 import urllib.parse
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
+                      InputFile)
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, PreCheckoutQueryHandler
 from telegram.request import HTTPXRequest
 
@@ -1082,10 +1083,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                     msg2 = f"🎁 اکانت تست شما ساخته شد ({test_gb}GB / {test_days} روز).\n\n📥 فایل کانفیگ را از «سفارشات من 📦» دریافت کنید."
                     await update.message.reply_text(msg2, reply_markup=await get_main_keyboard(user_id))
                 return
-            encoded_url = urllib.parse.quote(config_link)
-            qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
+            qr_img = subportal.qr_png(config_link, scale=8, border=4)
             try:
-                await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown', reply_markup=await get_main_keyboard(user_id))
+                await context.bot.send_photo(chat_id=user_id, photo=InputFile(qr_img, filename='qr.png'), caption=caption, parse_mode='Markdown', reply_markup=await get_main_keyboard(user_id))
             except Exception:
                 await update.message.reply_text(caption, parse_mode='Markdown', reply_markup=await get_main_keyboard(user_id))
         finally:
@@ -2607,10 +2607,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sub:
                 caption += f"\n\n🔗 *لینک ساب با تغییر UUID همچنان معتبر می‌ماند.*\n\nکانفیگ مستقیم:\n`{config_link}`"
             caption += f"\n\n*(برای کپی، روی لینک ضربه بزنید)*{SECURITY_WARNING}"
-            encoded_url = urllib.parse.quote(primary)
-            qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
+            qr_img = subportal.qr_png(primary, scale=8, border=4)
             try:
-                await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown')
+                await context.bot.send_photo(chat_id=user_id, photo=InputFile(qr_img, filename='qr.png'), caption=caption, parse_mode='Markdown')
             except Exception:
                 await context.bot.send_message(chat_id=user_id, text=caption, parse_mode='Markdown')
 
@@ -2716,10 +2715,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         cap2 = "✅ خرید موفق! سرویس شما ساخته شد.\n\n📥 فایل کانفیگ را از «سفارشات من 📦 → دریافت کانفیگ» دریافت کنید."
                         await query.edit_message_text(cap2)
                 else:
-                    encoded_url = urllib.parse.quote(primary)
-                    qr_api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_url}&margin=20"
+                    qr_img = subportal.qr_png(primary, scale=8, border=4)
                     try:
-                        await context.bot.send_photo(chat_id=user_id, photo=qr_api_url, caption=caption, parse_mode='Markdown')
+                        await context.bot.send_photo(chat_id=user_id, photo=InputFile(qr_img, filename='qr.png'), caption=caption, parse_mode='Markdown')
                         await query.delete_message()
                     except Exception:
                         await query.edit_message_text(caption, parse_mode='Markdown')

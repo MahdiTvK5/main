@@ -2927,9 +2927,33 @@ async def import_send(request):
     return layout('نتیجه‌ی ایمپورت', "".join(body), '/import', request)
 
 
+async def robots_txt(request):
+    """ربات‌های موتور جست‌وجو نباید لینک‌های اشتراک را ذخیره کنند."""
+    return web.Response(
+        text="User-agent: *\nDisallow: /sub/\nDisallow: /login\n",
+        content_type='text/plain',
+        headers={'Cache-Control': 'public, max-age=86400'},
+    )
+
+
+@web.middleware
+async def _compress_middleware(request, handler):
+    """فشرده‌سازی پاسخ‌های متنی + noindex برای مسیرهای پورتال."""
+    resp = await handler(request)
+    try:
+        if isinstance(resp, web.Response) and resp.content_type in (
+                'text/html', 'text/plain', 'application/json', 'text/css'):
+            resp.enable_compression()
+    except Exception:
+        pass
+    if request.path.startswith('/sub/'):
+        resp.headers.setdefault('X-Robots-Tag', 'noindex, nofollow')
+    return resp
+
+
 # ================= راه‌اندازی =================
 def build_app():
-    app = web.Application()
+    app = web.Application(middlewares=[_compress_middleware])
     app.add_routes([
         web.get("/login", login_get),
         web.post("/login", login_post),
@@ -2987,6 +3011,10 @@ def build_app():
         web.get("/sub/{token}/raw", subportal.raw_subscription),
         web.get("/sub/{token}/clash", subportal.clash_subscription),
         web.get("/sub/applogo/{app}.png", subportal.logo_asset),
+        web.get("/sub/{token}/qr.png", subportal.qr_asset),
+        web.get("/sub/{token}/live", subportal.live_status),
+        web.get("/sub/fonts/{name}", subportal.font_asset),
+        web.get("/robots.txt", robots_txt),
     ])
     return app
 

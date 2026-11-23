@@ -200,9 +200,9 @@ def _sample_sub(**overrides):
 class TestPortalRendering:
     def test_rtl_and_real_data(self):
         html_out = subportal.render_portal(_sample_sub())
-        assert '<html lang="fa" dir="rtl">' in html_out
+        assert '<html lang="fa" dir="rtl"' in html_out  # data-theme هم روی همین تگ است
         assert '12345_mahdi' in html_out and 'فعال' in html_out
-        assert 'پلن ۲۰ گیگ' in html_out and 'اتصال سریع' in html_out
+        assert 'پلن ۲۰ گیگ' in html_out and 'اتصال دستگاه‌ها' in html_out
         assert 'https://x.io/sub/tok123/raw' in html_out
 
     def test_no_secrets_in_page(self):

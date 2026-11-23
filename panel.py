@@ -429,6 +429,23 @@ class AsyncXuiAPI:
                 logging.warning("get_client_stats failed: %s", e)
         return None
 
+    async def get_onlines(self):
+        """ایمیل کلاینت‌هایی که همین حالا وصل‌اند، یا None اگر پنل جواب نداد.
+
+        3x-UI این‌ها را در /panel/api/inbounds/onlines نگه می‌دارد؛ خروجی فقط
+        ایمیل است (IP در نسخه‌های قدیمی موجود نیست).
+        """
+        async with httpx.AsyncClient(verify=False, cookies=self.cookies, timeout=8.0, trust_env=False) as client:
+            try:
+                res = await client.post(f"{self.url}/panel/api/inbounds/onlines")
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get('success'):
+                        return [str(x) for x in (data.get('obj') or [])]
+            except Exception as e:
+                logging.warning("get_onlines failed: %s", e)
+        return None
+
     async def get_all_client_stats(self):
         """با یک درخواست، آمار تمام کلاینت‌ها را برمی‌گرداند.
         خروجی: dict با کلید ایمیلِ lowercase و مقدارِ دیکشنری آمار (مشابه get_client_stats)."""

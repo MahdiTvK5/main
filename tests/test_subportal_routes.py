@@ -109,7 +109,7 @@ def _get(factory, path):
 def test_portal_page_renders_live_data(client_factory):
     status, html_out, _h = _get(client_factory, "/sub/tok-valid")
     assert status == 200
-    assert '<html lang="fa" dir="rtl">' in html_out
+    assert '<html lang="fa" dir="rtl"' in html_out  # data-theme هم روی همین تگ است
     assert '201_svc' in html_out
     assert '/sub/tok-valid/raw' in html_out
     assert 'روز باقی‌مانده' in html_out

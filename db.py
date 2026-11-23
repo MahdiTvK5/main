@@ -83,6 +83,19 @@ async def init_db():
         await conn.execute("INSERT INTO settings (key, value) VALUES ('ref_bonus', '0') ON CONFLICT DO NOTHING")
 
         # ===== کدهای هدیه =====
+        # تاریخچه‌ی مصرف روزانه برای نمودار پورتال اشتراک.
+        # base = مصرفِ تجمعی در اولین مشاهده‌ی آن روز؛ مصرف همان روز = used - base.
+        await conn.execute('''CREATE TABLE IF NOT EXISTS traffic_history (
+            email TEXT NOT NULL,
+            day DATE NOT NULL,
+            used BIGINT NOT NULL DEFAULT 0,
+            base BIGINT,
+            PRIMARY KEY (email, day)
+        )''')
+        # سازگاری با نسخه‌ی اول (جدول بدون ستون base) + پر کردن base امروز.
+        await conn.execute('''ALTER TABLE traffic_history ADD COLUMN IF NOT EXISTS base BIGINT''')
+        await conn.execute('''UPDATE traffic_history SET base = used
+                              WHERE base IS NULL AND day = CURRENT_DATE''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS gift_codes (code TEXT PRIMARY KEY, amount BIGINT, max_uses INT DEFAULT 1, used_count INT DEFAULT 0)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS gift_redemptions (code TEXT, user_id BIGINT, PRIMARY KEY (code, user_id))''')
 
@@ -779,6 +792,45 @@ async def ensure_sub_token(order_id):
             # مسابقه‌ی هم‌زمانی: توکنی که تازه ساخته شده را برمی‌گردانیم
             row = await conn.fetchrow("SELECT sub_token FROM orders WHERE id = $1", int(order_id))
             return row['sub_token'] if row else None
+
+
+async def save_traffic_point(email, used, day=None):
+    """ثبت سقف مصرفِ یک روز برای یک کلاینت (idempotent؛ فقط عدد بزرگ‌تر می‌ماند).
+
+    چون مصرفِ تجمعی کلاینت فقط زیاد می‌شود، اگر همین روز چند بار ثبت شود سقفش
+    درست‌ترین مقدار آن روز است و نمودار به‌هم نمی‌ریزد.
+    """
+    if db_pool is None or not email:
+        return False
+    day = day or datetime.date.today()
+    try:
+        await db_pool.execute(
+            '''INSERT INTO traffic_history (email, day, used, base) VALUES ($1, $2, $3, $3)
+               ON CONFLICT (email, day)
+               DO UPDATE SET used = GREATEST(traffic_history.used, EXCLUDED.used)''',
+            str(email), day, int(used or 0),
+        )
+        return True
+    except Exception:
+        logging.exception("save_traffic_point failed for %s", email)
+        return False
+
+
+async def get_traffic_history(email, days=31):
+    """آخرین نقاطِ روزانه‌ی مصرف (نزولی؛ جدیدترین اول)."""
+    if db_pool is None or not email:
+        return []
+    try:
+        rows = await db_pool.fetch(
+            '''SELECT day, used, base FROM traffic_history
+               WHERE email = $1 ORDER BY day DESC LIMIT $2''',
+            str(email), int(days),
+        )
+        return [{'day': r['day'], 'used': int(r['used']),
+                 'base': (int(r['base']) if r['base'] is not None else None)} for r in rows]
+    except Exception:
+        logging.exception("get_traffic_history failed for %s", email)
+        return []
 
 
 async def get_order_by_token(token):
