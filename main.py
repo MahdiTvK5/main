@@ -28,6 +28,7 @@ from db import (
 from links import order_email, email_from_link, client_key, new_client_key
 import importer
 import pricing
+import webcomponents
 from pricing import KIND_BUY, KIND_RENEW
 import rewards
 from panel import (build_xui, sub_link_for, build_vless_link, build_share_link,
@@ -744,6 +745,44 @@ async def _send_file_config(context, user_id, row, email, config_link):
         return False
 
 
+def _short_fail_reason(ex):
+    """خطای تلگرام را به یک برچسب کوتاه فارسی تبدیل می‌کند تا گزارش پایانی خوانا باشد."""
+    return webcomponents.short_fail_reason(ex)
+
+
+async def _send_broadcast_report(bot, chat_id, sent, failures):
+    """گزارش پایانی پیام همگانی: تعداد موفق/ناموفق + شناسه و نام کاربران ناموفق.
+
+    اگر لیست بلند باشد (بیش از سقف پیام تلگرام) به‌صورت فایل متنی فرستاده می‌شود
+    تا هیچ شناسه‌ای برای پیگیری جا نیفتد.
+    """
+    if chat_id is None:
+        return
+    head = f"✅ پیام به {sent} کاربر ارسال شد."
+    if not failures:
+        try:
+            await bot.send_message(chat_id=chat_id, text=head)
+        except Exception:
+            pass
+        return
+    names = await db.get_nicknames([uid for uid, _ in failures])
+    lines = []
+    for idx, (uid, reason) in enumerate(failures, 1):
+        name = (names.get(int(uid)) or '').strip()
+        lines.append(f"{idx}. {uid}" + (f" — {name}" if name else "") + f" — {reason}")
+    body = f"❌ کاربرانی که پیام به آن‌ها نرسید ({len(failures)} نفر):\n\n" + "\n".join(lines)
+    try:
+        if len(body) <= 3800:
+            await bot.send_message(chat_id=chat_id, text=body)
+        else:
+            doc = io.BytesIO(body.encode())
+            doc.name = 'broadcast_failures.txt'
+            await bot.send_document(chat_id=chat_id, document=doc,
+                                    caption=f"❌ {len(failures)} کاربر پیام را دریافت نکردند.")
+    except Exception as ex:
+        logging.warning("BROADCAST report failed: %s", ex)
+
+
 async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_msg=None, forward=False):
     """ارسال پیام همگانی با کنترل نرخ و گزارش پیشرفت (خارج از مسیر پردازش آپدیت‌ها).
 
@@ -752,6 +791,7 @@ async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_m
     ساده degrade می‌کند).
     """
     sent = failed = 0
+    failures = []  # (user_id، دلیل) — برای گزارش پایانی به ادمین
     for i, uid in enumerate(user_ids, 1):
         try:
             if forward:
@@ -761,6 +801,7 @@ async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_m
             sent += 1
         except Exception as ex:
             failed += 1
+            failures.append((uid, _short_fail_reason(ex)))
             retry_after = getattr(ex, 'retry_after', None)
             if retry_after:  # محدودیت نرخ تلگرام
                 await asyncio.sleep(float(retry_after) + 1)
@@ -770,12 +811,14 @@ async def _run_broadcast(context, user_ids, from_chat_id, message_id, progress_m
                 await progress_msg.edit_text(f"📢 در حال ارسال... {i} از {len(user_ids)}")
             except Exception:
                 pass
-    logging.info("BROADCAST sent=%s failed=%s total=%s", sent, failed, len(user_ids))
+    logging.info("BROADCAST sent=%s failed=%s total=%s failed_ids=%s",
+                 sent, failed, len(user_ids), [uid for uid, _ in failures])
     if progress_msg:
         try:
-            await progress_msg.edit_text(f"✅ پیام به {sent} کاربر ارسال شد." + (f"\n⚠️ ناموفق: {failed}" if failed else ""))
+            await progress_msg.edit_text(f"✅ پیام به {sent} کاربر ارسال شد." + (f"\n⚠️ ناموفق: {failed} (لیست در پیام بعدی)" if failed else ""))
         except Exception:
             pass
+    await _send_broadcast_report(context.bot, progress_msg.chat_id if progress_msg else None, sent, failures)
 
 
 async def find_stale_orders(orders):

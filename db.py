@@ -609,6 +609,19 @@ async def all_user_ids():
         return [r['user_id'] for r in await conn.fetch("SELECT user_id FROM users")]
 
 
+async def get_nicknames(user_ids):
+    """نگاشت user_id → نام نمایشی برای گزارش‌ها؛ فقط شناسه‌های خواسته‌شده خوانده می‌شوند."""
+    try:
+        ids = [int(u) for u in user_ids]
+    except (TypeError, ValueError):
+        return {}
+    if not ids:
+        return {}
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, nickname FROM users WHERE user_id = ANY($1)", ids)
+    return {r['user_id']: (r['nickname'] or '') for r in rows}
+
+
 async def set_user_role(user_id, role):
     """نقش کاربر را تنظیم می‌کند (normal/vip) و در صورت نبود، کاربر را می‌سازد."""
     async with db_pool.acquire() as conn:

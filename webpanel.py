@@ -24,6 +24,7 @@ import importer
 import pricing
 import rewards
 import subportal
+import webcomponents
 from links import order_email
 from config import (
     WEB_ADMIN_PASSWORD, WEB_PORT, WEB_HOST, WEB_SESSION_TTL,
@@ -63,6 +64,9 @@ PER_PAGE = 20
 
 # تسک‌های پس‌زمینه (مثل پیام همگانی) نگه داشته می‌شوند تا زودتر از موعد جمع نشوند
 _TASKS = set()
+
+# گزارش آخرین ارسال همگانی (در حافظه‌ی همین پروسه)؛ در صفحه‌ی /broadcast نمایش داده می‌شود
+_BROADCAST_REPORT = None
 
 # سطوح کاربر و مخاطب آفرها از موتور قیمت‌گذاری می‌آیند تا یک منبع واحد داشته باشیم
 ROLE_LABELS = {pricing.NORMAL: 'عادی', pricing.VIP: 'VIP', pricing.RESELLER: 'نماینده'}
@@ -2501,11 +2505,46 @@ async def referrals_save(request):
 
 
 # ================= پیام همگانی =================
+def _broadcast_report_box():
+    """باکس گزارش آخرین ارسال همگانی: تعداد موفق/ناموفق و لیست شناسه‌های ناموفق با دلیل."""
+    rep = _BROADCAST_REPORT
+    if not rep:
+        return ""
+
+    def _ts(dt):
+        return dt.strftime('%Y-%m-%d %H:%M') if dt else '—'
+
+    out = ["<div class='box'><h3 style='margin-top:0'>📊 گزارش آخرین ارسال</h3>",
+           f"<p class='muted'>آغاز: {_ts(rep.get('started'))}"
+           + (f" — پایان: {_ts(rep.get('finished'))}" if rep.get('finished') else "")
+           + f" | کل: {rep.get('total', 0)} | موفق: {rep.get('sent', 0)}</p>"]
+    if rep.get('running'):
+        out.append("<p>⏳ ارسال در جریان است؛ بعد از پایان، لیست ناموفق‌ها همین‌جا می‌آید.")
+        out.append("<p><a href='/broadcast'>به‌روزرسانی</a></p></div>")
+        out.append("<script>setTimeout(function(){location.reload()},5000)</script>")
+        return "".join(out)
+    fails = rep.get('failures') or []
+    if not fails:
+        out.append("<p>✅ همه‌ی کاربران پیام را دریافت کردند.</p></div>")
+        return "".join(out)
+    rows = "".join(
+        f"<tr><td>{i}</td><td>{e(uid)}</td><td>{e(name or '—')}</td><td>{e(reason)}</td></tr>"
+        for i, (uid, name, reason) in enumerate(fails[:300], 1)
+    )
+    out.append(f"<p>⚠️ ناموفق: {len(fails)} نفر"
+               + (" (۳۰۰ مورد اول نمایش داده شده)" if len(fails) > 300 else "") + "</p>")
+    out.append("<div class='tbl-scroll'><table data-enhance><thead><tr><th>#</th><th>شناسه</th>"
+               "<th>نام</th><th>دلیل</th></tr></thead><tbody>" + rows + "</tbody></table></div>")
+    out.append("</div>")
+    return "".join(out)
+
+
 @require_auth
 async def broadcast_page(request):
     body = (
         _page_head('پیام همگانی', 'متن برای همه‌ی کاربران ربات ارسال می‌شود.',
                    crumbs=[('خانه', '/'), ('پیام همگانی', None)]),
+        _broadcast_report_box(),
         "<div class='box'><form method='post' action='/broadcast/send'"
         + _confirm('پیام برای «همه‌ی کاربران» ارسال شود؟') + ">"
         "<label for='bc-text'>متن پیام</label>"
@@ -2520,6 +2559,7 @@ async def broadcast_page(request):
 
 @require_auth
 async def broadcast_send(request):
+    global _BROADCAST_REPORT
     data = await request.post()
     text = (data.get("text") or "").strip()
     if not text:
@@ -2527,21 +2567,37 @@ async def broadcast_send(request):
     if _BOT is None:
         raise _redirect("/broadcast", err="بات در دسترس نیست")
     ids = await db.all_user_ids()
+    started = datetime.datetime.now()
+    _BROADCAST_REPORT = {'running': True, 'started': started, 'total': len(ids),
+                         'sent': 0, 'failures': []}
 
     async def _run():
+        global _BROADCAST_REPORT
         sent, failed = 0, 0
+        failures = []  # (user_id، دلیل) — برای گزارش پایانی
         for uid in ids:
             try:
                 await _BOT.send_message(chat_id=uid, text=text)
                 sent += 1
             except Exception as ex:
                 failed += 1
+                failures.append((uid, webcomponents.short_fail_reason(ex)))
                 # محدودیت نرخ تلگرام: به مدت خواسته‌شده صبر می‌کنیم
                 retry_after = getattr(ex, "retry_after", None)
                 if retry_after:
                     await asyncio.sleep(float(retry_after) + 1)
             await asyncio.sleep(0.05)  # حدود ۲۰ پیام در ثانیه، زیر سقف تلگرام
-        logging.info("WEB_BROADCAST sent=%s failed=%s total=%s", sent, failed, len(ids))
+        names = await db.get_nicknames([u for u, _ in failures])
+        _BROADCAST_REPORT = {
+            'running': False,
+            'started': started,
+            'finished': datetime.datetime.now(),
+            'total': len(ids),
+            'sent': sent,
+            'failures': [(u, names.get(int(u), ''), reason) for u, reason in failures],
+        }
+        logging.info("WEB_BROADCAST sent=%s failed=%s total=%s failed_ids=%s",
+                     sent, failed, len(ids), [u for u, _ in failures])
 
     # نگه‌داشتن مرجع تسک لازم است؛ وگرنه ممکن است وسط کار توسط GC جمع شود
     task = asyncio.create_task(_run())

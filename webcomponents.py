@@ -22,6 +22,27 @@ def e(v):
 # ============================================================
 # StatsCard — کارت KPI با مقدار اصلی، رشد درصدی و میکرو-چارت
 # ============================================================
+def short_fail_reason(ex):
+    """خطای تلگرام را به یک برچسب کوتاه فارسی تبدیل می‌کند (مشترک بین ربات و پنل وب)."""
+    raw = (str(ex) or ex.__class__.__name__).strip()
+    low = raw.lower()
+    if 'blocked' in low:
+        return 'ربات را بلاک کرده'
+    if 'deactivated' in low:
+        return 'اکانت غیرفعال یا حذف‌شده'
+    if 'chat not found' in low or 'user not found' in low:
+        return 'چت پیدا نشد'
+    if 'kicked' in low:
+        return 'ربات از چت اخراج شده'
+    if 'not enough rights' in low or 'no rights' in low:
+        return 'دسترسی ندارد'
+    if 'too many requests' in low or 'retry after' in low or 'flood' in low:
+        return 'محدودیت نرخ تلگرام'
+    if 'timeout' in low or 'timed out' in low:
+        return 'تایم‌اوت'
+    return raw.splitlines()[0][:70]
+
+
 def _sparkline(values, color='#7C5CFF', w=92, h=30):
     """نمودار خطی مینیاتوری داخل کارت KPI (SVG خالص، بدون کتابخانه)."""
     vals = [max(0, int(v or 0)) for v in (values or [])]
